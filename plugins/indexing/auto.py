@@ -2,26 +2,19 @@
 # 🏨 DOWNTOWN VILLA — AUTO-INDEXING HANDLER
 # ============================================================
 #
-# Runs whenever a new media message arrives in any
-# DATABASE_CHANNEL_IDS channel.
+# Runs when new messages arrive in watched channels.
 #
 # RULE (LOCKED):
-#   • Only skip if SAME file_id already exists
+#   • Only skip if SAME file_id exists
 #   • Everything else is imported silently
 #
-# SILENCE:
-#   • No user-facing messages
-#   • No group notifications
-#   • Only logs (stdout + memory ring)
-#
-# TOGGLE:
-#   • /index → [🎯 AUTO MODE] button
-#   • Or env AUTO_INDEXING_ENABLED
+# Metadata source is read from bot_settings.indexing_default.
 #
 # ============================================================
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -36,12 +29,8 @@ from utils import format as FM
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# SECTION 1 — STATE
-# ============================================================
-
 STATE: Dict[str, Any] = {
-    "enabled": True,          # overridden by DB check
+    "enabled": True,
     "processed": 0,
     "saved": 0,
     "duplicate_id": 0,
@@ -55,21 +44,15 @@ STATE: Dict[str, Any] = {
     "started_at": time.time(),
 }
 
-# Simple per-message debounce (ignore duplicate tg message ids)
 _recent_msg_ids: Dict[int, float] = {}
 _RECENT_TTL = 60.0
 
 
 # ============================================================
-# SECTION 2 — ENABLE / DISABLE
+# ENABLE / DISABLE
 # ============================================================
 
 async def is_auto_enabled() -> bool:
-    """
-    Read the auto_mode flag:
-      1. Check DB bot_settings.indexing.auto_mode
-      2. Fall back to env AUTO_INDEXING_ENABLED
-    """
     try:
         from database import db_registry
         db = db_registry.get_system_db()
@@ -83,7 +66,6 @@ async def is_auto_enabled() -> bool:
 
 
 async def set_auto_enabled(value: bool) -> bool:
-    """Set auto_mode flag in DB."""
     try:
         from database import db_registry
         db = db_registry.get_system_db()
@@ -91,26 +73,35 @@ async def set_auto_enabled(value: bool) -> bool:
             return False
         await db["bot_settings"].update_one(
             {"_id": "indexing"},
-            {"$set": {
-                "auto_mode": bool(value),
-                "updated_at": datetime.utcnow(),
-            }},
+            {"$set": {"auto_mode": bool(value),
+                      "updated_at": datetime.utcnow()}},
             upsert=True,
         )
         STATE["enabled"] = bool(value)
-        logger.info(f"[AUTO-INDEX] toggled → {value}")
         return True
     except Exception as e:
         logger.warning(f"[AUTO-INDEX] toggle: {e}")
         return False
 
 
+async def _get_default_metadata_source() -> str:
+    try:
+        from database import db_registry
+        db = db_registry.get_system_db()
+        if db is not None:
+            doc = await db["bot_settings"].find_one({"_id": "indexing_default"})
+            if doc and "metadata_source" in doc:
+                return str(doc["metadata_source"])
+    except Exception:
+        pass
+    return "both"
+
+
 # ============================================================
-# SECTION 3 — CHANNEL FILTER
+# CHANNEL FILTER
 # ============================================================
 
 def _get_channels() -> List[int]:
-    """Return the list of database channels to watch."""
     try:
         chans = list(getattr(config, "DATABASE_CHANNEL_IDS", []) or [])
         if chans:
@@ -124,7 +115,6 @@ def _get_channels() -> List[int]:
 
 
 def _build_filter():
-    """Build a Pyrogram filter for the watched channels."""
     chans = _get_channels()
     if not chans:
         return None
@@ -135,28 +125,22 @@ _CHANNEL_FILTER = _build_filter()
 
 
 # ============================================================
-# SECTION 4 — REGISTER HANDLER
+# HANDLER
 # ============================================================
 
 if _CHANNEL_FILTER is not None:
 
     @Client.on_message(_CHANNEL_FILTER, group=-300)
     async def auto_index_handler(client: Client, message):
-        """
-        Silent auto-index for new messages in database channels.
-        """
         try:
-            # Debounce duplicate tg message ids
             if _is_recent(message):
                 return
 
-            # Check enabled
             enabled = await is_auto_enabled()
             STATE["enabled"] = enabled
             if not enabled:
                 return
 
-            # Media gate
             if not _has_media(message):
                 STATE["skipped_no_media"] += 1
                 return
@@ -176,32 +160,26 @@ if _CHANNEL_FILTER is not None:
             STATE["last_error"] = str(e)[:200]
 
 
-# ============================================================
-# SECTION 5 — CORE HANDLER
-# ============================================================
-
 async def _handle(client: Client, message) -> None:
-    """Process one message via the shared pipeline."""
     try:
-        # Get file_id early
         file_id = _extract_file_id(message)
         if not file_id:
             STATE["skipped_no_file_id"] += 1
             return
 
-        # Exact duplicate check — the ONLY skip reason
-        is_dup = await _is_exact_duplicate(file_id)
-        if is_dup:
+        if await _is_exact_duplicate(file_id):
             STATE["duplicate_id"] += 1
-            logger.debug(
-                f"[AUTO-INDEX] ♻️ duplicate file_id={file_id[:20]}…"
-            )
             return
 
-        # Process via pipeline
+        metadata_source = await _get_default_metadata_source()
+
         try:
             from indexing.pipeline import process_message
-            result = await process_message(message, mode="auto")
+            result = await process_message(
+                message,
+                mode="auto",
+                metadata_source=metadata_source,
+            )
         except Exception as e:
             logger.exception(f"[AUTO-INDEX] pipeline: {e}")
             STATE["failed"] += 1
@@ -218,43 +196,35 @@ async def _handle(client: Client, message) -> None:
                 STATE["movies"] += 1
             elif rtype == "series":
                 STATE["series"] += 1
-
             logger.info(
-                f"[AUTO-INDEX] ✅ saved msg={getattr(message, 'id', '?')} "
+                f"[AUTO-INDEX] ✅ msg={getattr(message, 'id', '?')} "
                 f"title='{rec.get('title') or rec.get('series_title') or '?'}'"
             )
-
         elif status == "duplicate":
             STATE["duplicate_id"] += 1
-            logger.debug(f"[AUTO-INDEX] ♻️ duplicate msg={getattr(message, 'id', '?')}")
-
         elif status == "skipped":
             reason = str(result.get("reason") or "")
             if "file_id" in reason:
                 STATE["skipped_no_file_id"] += 1
             else:
                 STATE["skipped_no_media"] += 1
-
         else:
             STATE["failed"] += 1
-            STATE["last_error"] = str(result.get("reason") or "unknown")[:200]
-
+            STATE["last_error"] = str(result.get("reason") or "?")[:200]
     except Exception as e:
         logger.exception(f"[AUTO-INDEX] _handle: {e}")
 
 
 # ============================================================
-# SECTION 6 — HELPERS
+# HELPERS
 # ============================================================
 
 def _is_recent(message) -> bool:
-    """Return True if this tg message id was seen in last N sec."""
     try:
         mid = getattr(message, "id", 0)
         if not mid:
             return False
         now = time.time()
-        # cleanup
         for k in list(_recent_msg_ids.keys()):
             if now - _recent_msg_ids[k] > _RECENT_TTL:
                 _recent_msg_ids.pop(k, None)
@@ -267,7 +237,6 @@ def _is_recent(message) -> bool:
 
 
 def _has_media(message) -> bool:
-    """Return True if message has video / document / audio / animation."""
     try:
         return bool(
             getattr(message, "video", None)
@@ -280,7 +249,6 @@ def _has_media(message) -> bool:
 
 
 def _extract_file_id(message) -> Optional[str]:
-    """Extract file_id from any media type."""
     try:
         if getattr(message, "video", None):
             return message.video.file_id
@@ -296,41 +264,29 @@ def _extract_file_id(message) -> Optional[str]:
 
 
 async def _is_exact_duplicate(file_id: str) -> bool:
-    """
-    Return True ONLY if SAME file_id exists in DB.
-    Never returns True for similar names / metadata.
-    """
-    # Fast bloom path
+    fp = None
     try:
         from services.duplicate import compute_fingerprint, _bloom_check
         fp = compute_fingerprint(file_id)
         if _bloom_check(fp):
             return True
     except Exception:
-        fp = None
+        pass
 
-    # DB check
     try:
         from database import db_registry
         for entry in db_registry.media_entries():
             try:
-                query = {"_id": fp} if fp else {"file_id": file_id}
-                exists = await entry.db["media_files"].find_one(
-                    query, {"_id": 1}
-                )
+                q = {"_id": fp} if fp else {"file_id": file_id}
+                exists = await entry.db["media_files"].find_one(q, {"_id": 1})
                 if exists:
                     return True
             except Exception:
                 continue
     except Exception:
         pass
-
     return False
 
-
-# ============================================================
-# SECTION 7 — SNAPSHOT
-# ============================================================
 
 def snapshot() -> Dict[str, Any]:
     uptime = time.time() - STATE.get("started_at", time.time())
@@ -348,7 +304,6 @@ def snapshot() -> Dict[str, Any]:
         "failed": STATE["failed"],
         "movies": STATE["movies"],
         "series": STATE["series"],
-        "uptime": uptime,
         "uptime_text": FM.duration_short(uptime),
         "last_message_age": last_age,
         "last_error": STATE["last_error"],
@@ -356,19 +311,4 @@ def snapshot() -> Dict[str, Any]:
     }
 
 
-# ============================================================
-# SECTION 8 — IMPORTS AT END
-# ============================================================
-
-import asyncio  # noqa: E402
-
-
-# ============================================================
-# PUBLIC EXPORTS
-# ============================================================
-
-__all__ = [
-    "is_auto_enabled",
-    "set_auto_enabled",
-    "snapshot",
-]
+__all__ = ["is_auto_enabled", "set_auto_enabled", "snapshot"]
