@@ -5,7 +5,7 @@
 # ONE command: /admin
 # Everything else is buttons inside.
 
-Menu:
+#Menu:
 #   📊 Dashboard        → live metrics
 #   🗄️ Databases        → browse / clear / delete
 #   🖥️ Server           → CPU / RAM / disk / net
