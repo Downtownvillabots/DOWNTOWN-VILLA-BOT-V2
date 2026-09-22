@@ -198,9 +198,24 @@ GROUP_FILTER = (
 
 @Client.on_message(GROUP_FILTER, group=-9999)
 async def series_group_search(client: Client, message: Message):
-    """Entry — any group text triggers series search."""
+    """
+    Entry — ONLY fires inside the designated SERIES group.
+
+    Set SERIES_GROUP_ID in your Render env vars.
+    Other groups fall through to plugins/search/group_search.py.
+    """
     try:
         if not message.from_user:
+            return
+
+        # ── GROUP GATE ──
+        # Only run inside the configured series group.
+        series_gid = getattr(config, "SERIES_GROUP_ID", None)
+        if not series_gid:
+            # No series group configured → this handler does nothing
+            return
+        if int(message.chat.id) != int(series_gid):
+            # Not the series group → let group_search.py handle it
             return
 
         txt = (message.text or "").strip()
@@ -233,7 +248,7 @@ async def series_group_search(client: Client, message: Message):
             await _premium_redirect(client, message, status, txt, hits)
             return
 
-        # 3. Regular flow — start with suggestions
+        # 3. Regular series flow — suggestions → lang → season → ep → quality
         await _handle_search(client, message, status, txt, hits)
 
     except Exception as e:
