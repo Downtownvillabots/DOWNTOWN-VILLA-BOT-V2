@@ -4,24 +4,6 @@
 #
 # THE single source of truth for every fancy font + emoji in the bot.
 #
-# Previously copied in 8+ files. Now ONE place.
-#
-# Provides:
-#   • fb(text)  → 𝗕𝗼𝗹𝗱 𝗦𝗮𝗻𝘀
-#   • sc(text)  → ꜱᴍᴀʟʟ ᴄᴀᴘꜱ
-#   • fm(text)  → 𝙼𝚘𝚗𝚘𝚜𝚙𝚊𝚌𝚎
-#   • fi(text)  → 𝘐𝘵𝘢𝘭𝘪𝘤
-#   • fr(text)  → 𝗦𝗲𝗿𝗶𝗳 𝗕𝗼𝗹𝗱
-#   • fu(text)  → 𝕌𝕟𝕕𝕖𝕣
-#   • FANCY     → shortcut dict for common labels
-#   • EMO       → every emoji used in the bot
-#
-# Every function is:
-#   • safe on None / numbers / any input
-#   • no dependencies
-#   • no side effects
-#   • caches nothing (pure)
-#
 # ============================================================
 
 from __future__ import annotations
@@ -203,11 +185,7 @@ def fu(text: Any) -> str:
 # ============================================================
 
 def _apply(text: Any, mapping: Dict[str, str]) -> str:
-    """
-    Map every char through a font dictionary.
-    Unknown chars pass through untouched.
-    Safe on None / int / float / any object.
-    """
+    """Map every char through a font dictionary."""
     if text is None:
         return ""
     try:
@@ -223,7 +201,6 @@ def _apply(text: Any, mapping: Dict[str, str]) -> str:
 # SECTION 9 — FANCY SHORTCUTS
 # ============================================================
 
-# Common labels used across the bot. Applied once, reused everywhere.
 FANCY: Dict[str, str] = {
     # Core
     "downtown_villa":  "𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔",
@@ -340,10 +317,7 @@ FANCY: Dict[str, str] = {
 
 
 def f(key: str) -> str:
-    """
-    Lookup a shortcut label from FANCY.
-    Falls back to sc() on miss.
-    """
+    """Lookup a shortcut label from FANCY. Falls back to sc() on miss."""
     if not key:
         return ""
     k = str(key).strip().lower()
@@ -356,7 +330,6 @@ def f(key: str) -> str:
 # SECTION 10 — EMOJI MAP
 # ============================================================
 
-# Every emoji used across the bot. One place to change them all.
 EMO: Dict[str, str] = {
     # Brand / status
     "brand":       "🏨",
@@ -461,9 +434,38 @@ EMO: Dict[str, str] = {
 }
 
 
+# ============================================================
+# SECTION 10B — SAFE EMOJI WRAPPER (Fix B)
+# ============================================================
+#
+# Any missing key returns a fallback (🔹) instead of raising
+# KeyError. This makes F.EMO['anything'] safe everywhere.
+# ============================================================
+
+class _EmojiMap(dict):
+    """Emoji dict that returns a fallback for missing keys."""
+
+    _FALLBACK = "🔹"
+
+    def __missing__(self, key):
+        try:
+            import logging
+            logging.getLogger("downtown.fonts").debug(
+                f"[EMO] missing key: {key!r}"
+            )
+        except Exception:
+            pass
+        return self._FALLBACK
+
+
+EMO = _EmojiMap(EMO)
+
+
 def e(key: str, default: str = "") -> str:
     """Shortcut for EMO lookup."""
-    return EMO.get(key, default)
+    if default:
+        return EMO.get(key, default)
+    return EMO.get(key, _EmojiMap._FALLBACK)
 
 
 # ============================================================
@@ -525,6 +527,14 @@ def _self_check() -> bool:
     if e("crown") != "👑":
         ok = False
 
+    # Fix B check — unknown key must not raise
+    try:
+        _ = EMO["this_key_does_not_exist"]
+    except KeyError:
+        ok = False
+    except Exception:
+        ok = False
+
     return ok
 
 
@@ -547,8 +557,3 @@ __all__ = [
     "DIV", "DIV_S", "DIV_L", "DIV_DOT",
     "header", "divider", "title_line", "row",
 ]
-
-
-# ============================================================
-# END OF utils/fonts.py
-# ============================================================
