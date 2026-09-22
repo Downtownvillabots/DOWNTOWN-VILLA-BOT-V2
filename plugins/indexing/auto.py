@@ -10,6 +10,10 @@
 #
 # Metadata source is read from bot_settings.indexing_default.
 #
+# WATCH LIST SOURCE:
+#   1. DB collection `indexing_channels` (enabled=True)
+#   2. Fallback: config.DATABASE_CHANNEL_IDS / DATABASE_CHANNEL_ID
+#
 # ============================================================
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
@@ -44,8 +48,14 @@ STATE: Dict[str, Any] = {
     "started_at": time.time(),
 }
 
-_recent_msg_ids: Dict[int, float] = {}
+# recent-id dedup — keyed by (chat_id, msg_id)
+_recent_keys: Dict[Tuple[int, int], float] = {}
 _RECENT_TTL = 60.0
+
+# watch-list cache
+_WATCH_CACHE: Set[int] = set()
+_cache_loaded_at: float = 0.0
+_CACHE_TTL = 30.0
 
 
 # ============================================================
@@ -98,10 +108,10 @@ async def _get_default_metadata_source() -> str:
 
 
 # ============================================================
-# CHANNEL FILTER
+# CONFIG FALLBACK CHANNELS
 # ============================================================
 
-def _get_channels() -> List[int]:
+def _get_config_channels() -> List[int]:
     try:
         chans = list(getattr(config, "DATABASE_CHANNEL_IDS", []) or [])
         if chans:
@@ -114,50 +124,126 @@ def _get_channels() -> List[int]:
     return []
 
 
-def _build_filter():
-    chans = _get_channels()
-    if not chans:
-        return None
-    return filters.chat(chans) & ~filters.service
+# ============================================================
+# WATCH CACHE (dynamic)
+# ============================================================
+
+async def _refresh_watch_cache(force: bool = False) -> None:
+    """
+    Reload the set of watched channel IDs.
+    Priority:
+        1. DB `indexing_channels` (enabled=True)
+        2. config fallback
+    """
+    global _cache_loaded_at
+    now = time.time()
+    if not force and (now - _cache_loaded_at) < _CACHE_TTL:
+        return
+
+    new_set: Set[int] = set()
+
+    # 1. DB
+    try:
+        from plugins.indexing import backward as BW
+        ids = await BW.list_enabled_channel_ids()
+        for x in (ids or []):
+            try:
+                new_set.add(int(x))
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"[AUTO-INDEX] DB watch list: {e}")
+
+    # 2. config fallback
+    if not new_set:
+        for x in _get_config_channels():
+            try:
+                new_set.add(int(x))
+            except Exception:
+                continue
+
+    if new_set != _WATCH_CACHE:
+        logger.info(
+            f"[AUTO-INDEX] watch list updated → "
+            f"{sorted(new_set)}"
+        )
+
+    _WATCH_CACHE.clear()
+    _WATCH_CACHE.update(new_set)
+    _cache_loaded_at = now
 
 
-_CHANNEL_FILTER = _build_filter()
+def _watched_channel_ids() -> Set[int]:
+    return set(_WATCH_CACHE)
+
+
+async def force_refresh() -> None:
+    """Public — call from backward.py after register/toggle/remove."""
+    await _refresh_watch_cache(force=True)
+
+
+# ============================================================
+# DYNAMIC FILTER
+# ============================================================
+
+async def _filter_func(_, __, message) -> bool:
+    try:
+        chat = getattr(message, "chat", None)
+        if chat is None:
+            return False
+        cid = int(getattr(chat, "id", 0) or 0)
+        if not cid:
+            return False
+
+        await _refresh_watch_cache()
+
+        if cid not in _WATCH_CACHE:
+            return False
+
+        # service messages never carry media we care about
+        if getattr(message, "service", None):
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
+_CHANNEL_FILTER = filters.create(_filter_func)
 
 
 # ============================================================
 # HANDLER
 # ============================================================
 
-if _CHANNEL_FILTER is not None:
+@Client.on_message(_CHANNEL_FILTER, group=-300)
+async def auto_index_handler(client: Client, message):
+    try:
+        if _is_recent(message):
+            return
 
-    @Client.on_message(_CHANNEL_FILTER, group=-300)
-    async def auto_index_handler(client: Client, message):
-        try:
-            if _is_recent(message):
-                return
+        enabled = await is_auto_enabled()
+        STATE["enabled"] = enabled
+        if not enabled:
+            return
 
-            enabled = await is_auto_enabled()
-            STATE["enabled"] = enabled
-            if not enabled:
-                return
+        if not _has_media(message):
+            STATE["skipped_no_media"] += 1
+            return
 
-            if not _has_media(message):
-                STATE["skipped_no_media"] += 1
-                return
+        STATE["processed"] += 1
+        STATE["last_message_at"] = time.time()
 
-            STATE["processed"] += 1
-            STATE["last_message_at"] = time.time()
+        await _handle(client, message)
 
-            await _handle(client, message)
-
-        except FloodWait as e:
-            wait = int(getattr(e, "value", 30) or 30)
-            logger.warning(f"[AUTO-INDEX] flood {wait}s")
-            await asyncio.sleep(wait + 2)
-        except Exception as e:
-            logger.exception(f"[AUTO-INDEX] handler: {e}")
-            STATE["failed"] += 1
-            STATE["last_error"] = str(e)[:200]
+    except FloodWait as e:
+        wait = int(getattr(e, "value", 30) or 30)
+        logger.warning(f"[AUTO-INDEX] flood {wait}s")
+        await asyncio.sleep(wait + 2)
+    except Exception as e:
+        logger.exception(f"[AUTO-INDEX] handler: {e}")
+        STATE["failed"] += 1
+        STATE["last_error"] = str(e)[:200]
 
 
 async def _handle(client: Client, message) -> None:
@@ -220,17 +306,25 @@ async def _handle(client: Client, message) -> None:
 # ============================================================
 
 def _is_recent(message) -> bool:
+    """Dedup by (chat_id, message_id) — cross-channel safe."""
     try:
-        mid = getattr(message, "id", 0)
-        if not mid:
+        mid = int(getattr(message, "id", 0) or 0)
+        chat = getattr(message, "chat", None)
+        cid = int(getattr(chat, "id", 0) or 0) if chat else 0
+        if not mid or not cid:
             return False
+
+        key = (cid, mid)
         now = time.time()
-        for k in list(_recent_msg_ids.keys()):
-            if now - _recent_msg_ids[k] > _RECENT_TTL:
-                _recent_msg_ids.pop(k, None)
-        if mid in _recent_msg_ids:
+
+        # cleanup
+        for k in list(_recent_keys.keys()):
+            if now - _recent_keys[k] > _RECENT_TTL:
+                _recent_keys.pop(k, None)
+
+        if key in _recent_keys:
             return True
-        _recent_msg_ids[mid] = now
+        _recent_keys[key] = now
         return False
     except Exception:
         return False
@@ -307,8 +401,11 @@ def snapshot() -> Dict[str, Any]:
         "uptime_text": FM.duration_short(uptime),
         "last_message_age": last_age,
         "last_error": STATE["last_error"],
-        "channels": _get_channels(),
+        "channels": sorted(_WATCH_CACHE) or _get_config_channels(),
     }
 
 
-__all__ = ["is_auto_enabled", "set_auto_enabled", "snapshot"]
+__all__ = [
+    "is_auto_enabled", "set_auto_enabled",
+    "snapshot", "force_refresh",
+]
