@@ -6,6 +6,10 @@
 #
 # Storage: SYSTEM DB → indexing_jobs
 #
+# NOTE: All DB errors are now logged at WARNING+ level with
+# full traceback. Previously they were swallowed silently,
+# which made "history empty" impossible to diagnose.
+#
 # ============================================================
 
 from __future__ import annotations
@@ -24,10 +28,11 @@ def _coll():
         from database import db_registry
         db = db_registry.get_system_db()
         if db is None:
+            logger.warning("[IDX-STATE] system DB is None")
             return None
         return db[COLLECTION]
     except Exception as e:
-        logger.debug(f"[IDX-STATE] coll: {e}")
+        logger.exception(f"[IDX-STATE] coll resolve failed: {e}")
         return None
 
 
@@ -47,6 +52,7 @@ def _empty_stats() -> Dict[str, int]:
 async def create_job(job: Dict[str, Any]) -> Optional[str]:
     c = _coll()
     if c is None:
+        logger.warning("[IDX-STATE] create_job: no collection")
         return None
     try:
         now = datetime.utcnow()
@@ -55,9 +61,14 @@ async def create_job(job: Dict[str, Any]) -> Optional[str]:
         doc["updated_at"] = now
         doc.setdefault("stats", _empty_stats())
         r = await c.insert_one(doc)
-        return str(r.inserted_id)
+        job_id = str(r.inserted_id)
+        logger.info(
+            f"[IDX-STATE] job created id={job_id} "
+            f"job_key={doc.get('job_id')}"
+        )
+        return job_id
     except Exception as e:
-        logger.warning(f"[IDX-STATE] create: {e}")
+        logger.exception(f"[IDX-STATE] create FAILED: {e}")
         return None
 
 
@@ -75,7 +86,7 @@ async def update_job(job_id: str, patch: Dict[str, Any]) -> bool:
         )
         return r.matched_count > 0
     except Exception as e:
-        logger.debug(f"[IDX-STATE] update: {e}")
+        logger.warning(f"[IDX-STATE] update_job({job_id}) failed: {e}")
         return False
 
 
@@ -93,7 +104,7 @@ async def update_stats(job_id: str, delta: Dict[str, int]) -> bool:
         )
         return r.matched_count > 0
     except Exception as e:
-        logger.debug(f"[IDX-STATE] stats: {e}")
+        logger.warning(f"[IDX-STATE] update_stats({job_id}) failed: {e}")
         return False
 
 
@@ -117,18 +128,23 @@ async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     try:
         from bson import ObjectId
         return await c.find_one({"_id": ObjectId(job_id)})
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[IDX-STATE] get_job({job_id}) failed: {e}")
         return None
 
 
 async def list_recent(limit: int = 20) -> List[Dict[str, Any]]:
     c = _coll()
     if c is None:
+        logger.warning("[IDX-STATE] list_recent: no collection")
         return []
     try:
         cursor = c.find({}).sort("created_at", -1).limit(int(limit))
-        return await cursor.to_list(length=int(limit))
-    except Exception:
+        docs = await cursor.to_list(length=int(limit))
+        logger.info(f"[IDX-STATE] list_recent → {len(docs)} jobs")
+        return docs
+    except Exception as e:
+        logger.exception(f"[IDX-STATE] list_recent FAILED: {e}")
         return []
 
 
@@ -138,8 +154,11 @@ async def list_active() -> List[Dict[str, Any]]:
         return []
     try:
         cursor = c.find({"status": {"$in": ["running", "paused"]}})
-        return await cursor.to_list(length=50)
-    except Exception:
+        docs = await cursor.to_list(length=50)
+        logger.info(f"[IDX-STATE] list_active → {len(docs)} jobs")
+        return docs
+    except Exception as e:
+        logger.exception(f"[IDX-STATE] list_active FAILED: {e}")
         return []
 
 
@@ -151,7 +170,8 @@ async def delete_job(job_id: str) -> bool:
         from bson import ObjectId
         r = await c.delete_one({"_id": ObjectId(job_id)})
         return r.deleted_count > 0
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[IDX-STATE] delete_job({job_id}) failed: {e}")
         return False
 
 
@@ -163,8 +183,10 @@ async def clear_completed() -> int:
         r = await c.delete_many({
             "status": {"$in": ["completed", "stopped", "error", "cancelled"]}
         })
+        logger.info(f"[IDX-STATE] clear_completed → {r.deleted_count}")
         return r.deleted_count
-    except Exception:
+    except Exception as e:
+        logger.exception(f"[IDX-STATE] clear_completed FAILED: {e}")
         return 0
 
 
@@ -174,8 +196,10 @@ async def clear_all() -> int:
         return 0
     try:
         r = await c.delete_many({})
+        logger.info(f"[IDX-STATE] clear_all → {r.deleted_count}")
         return r.deleted_count
-    except Exception:
+    except Exception as e:
+        logger.exception(f"[IDX-STATE] clear_all FAILED: {e}")
         return 0
 
 
