@@ -10,41 +10,6 @@
 #   watch_ratings     — one doc per rating
 #   premium_settings  — singleton
 #
-# SCHEMA premium_users:
-#   {
-#     "user_id": 123,
-#     "username": "john",
-#     "plan_months": 3,
-#     "added_at": ISODate,
-#     "added_by": 456,
-#     "expires_at": 1234567890,   # unix ts
-#     "status": "active",
-#     "reminders_sent": ["10d", "5d"],
-#     "notes": "",
-#   }
-#
-# SCHEMA watch_sessions:
-#   {
-#     "user_id": 123,
-#     "series_slug": "breaking_bad",
-#     "series_title": "Breaking Bad",
-#     "tmdb_id": 1396,
-#     "poster": "/path.jpg",
-#     "language": "English",
-#     "seasons": {
-#       "1": {"total_eps": 7, "watched": [1,2,3], "sent": [1,2,3],
-#             "current_ep": 4},
-#     },
-#     "hits": [ {file_id, season, episode, quality, ...} ],
-#     "status": "watching",       # watching | completed
-#     "started_at": ISODate,
-#     "last_activity_at": ISODate,
-#     "completed_at": ISODate | null,
-#     "poster_msg_id": 123,
-#     "current_file_msg_id": 456,
-#     "rated": False,
-#   }
-#
 # ============================================================
 
 from __future__ import annotations
@@ -125,7 +90,6 @@ async def add_premium_user(
 
         existing = await c.find_one({"user_id": int(user_id)})
         if existing and existing.get("expires_at", 0) > now:
-            # Stack onto current expiry
             expires_at = existing["expires_at"] + (months * 30 * 86400)
 
         await c.update_one(
@@ -288,7 +252,7 @@ async def was_reminder_sent(user_id: int, reminder: str) -> bool:
 
 
 # ============================================================
-# SESSION CRUD
+# SLUG
 # ============================================================
 
 def make_slug(title: str) -> str:
@@ -296,6 +260,81 @@ def make_slug(title: str) -> str:
         return ""
     return re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
 
+
+# ============================================================
+# MERGE HELPERS (NEW — preserve progress on re-open)
+# ============================================================
+
+def _merge_seasons(
+    old: Dict[str, Any],
+    new: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Merge old + new season dicts.
+    • Preserves `watched` and `sent` arrays from OLD
+    • Updates `total_eps` to the max of old/new
+    • Adds any NEW seasons that didn't exist before
+    """
+    out: Dict[str, Any] = {}
+    old = old or {}
+    new = new or {}
+
+    # Start with old seasons
+    for sn_str, sdata in old.items():
+        if not isinstance(sdata, dict):
+            continue
+        out[sn_str] = {
+            "total_eps": int(sdata.get("total_eps", 0) or 0),
+            "watched": list(sdata.get("watched") or []),
+            "sent": list(sdata.get("sent") or []),
+            "current_ep": int(sdata.get("current_ep", 1) or 1),
+        }
+
+    # Overlay new seasons (adding missing ones, updating total_eps)
+    for sn_str, sdata in new.items():
+        if not isinstance(sdata, dict):
+            continue
+        new_total = int(sdata.get("total_eps", 0) or 0)
+        if sn_str in out:
+            # Preserve watched/sent — only refresh total_eps upward
+            out[sn_str]["total_eps"] = max(
+                out[sn_str]["total_eps"], new_total
+            )
+        else:
+            out[sn_str] = {
+                "total_eps": new_total,
+                "watched": list(sdata.get("watched") or []),
+                "sent": list(sdata.get("sent") or []),
+                "current_ep": int(sdata.get("current_ep", 1) or 1),
+            }
+    return out
+
+
+def _merge_hits(
+    old: List[Dict[str, Any]],
+    new: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Union hits by file_id.
+    Old hits first (so their position is preserved),
+    then any new file_ids appended.
+    """
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for h in list(old or []) + list(new or []):
+        if not isinstance(h, dict):
+            continue
+        fid = h.get("file_id")
+        if not fid or fid in seen:
+            continue
+        seen.add(fid)
+        out.append(h)
+    return out
+
+
+# ============================================================
+# SESSION CRUD
+# ============================================================
 
 async def create_session(
     user_id: int,
@@ -306,7 +345,12 @@ async def create_session(
     tmdb_seasons: Optional[List[Dict[str, Any]]] = None,
     hits: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
-    """Create or update a watch session."""
+    """
+    Create or update a watch session.
+
+    ⚠️ IMPORTANT: when a session already exists, this MERGES data.
+    Watch progress (`watched`/`sent`) is NEVER wiped.
+    """
     c = _sessions_coll()
     if c is None:
         return False
@@ -317,57 +361,94 @@ async def create_session(
             return False
 
         now = time.time()
+        uid = int(user_id)
 
-        # Build seasons doc from TMDB data
-        seasons_doc: Dict[str, Dict[str, Any]] = {}
+        # Build fresh seasons from TMDB data
+        fresh_seasons: Dict[str, Dict[str, Any]] = {}
         for s in (tmdb_seasons or []):
             sn = s.get("season")
             if sn is None:
                 continue
-            seasons_doc[str(sn)] = {
+            fresh_seasons[str(sn)] = {
                 "total_eps": int(s.get("episodes", 0) or 0),
                 "watched": [],
                 "sent": [],
                 "current_ep": 1,
             }
-        if not seasons_doc:
-            seasons_doc["1"] = {
-                "total_eps": 0, "watched": [], "sent": [], "current_ep": 1,
+        if not fresh_seasons:
+            fresh_seasons["1"] = {
+                "total_eps": 0, "watched": [],
+                "sent": [], "current_ep": 1,
             }
 
         # Clean hits (JSON-safe)
         clean_hits = _clean_hits(hits or [])
 
-        await c.update_one(
-            {"user_id": int(user_id), "series_slug": slug},
-            {
-                "$set": {
-                    "user_id": int(user_id),
-                    "series_slug": slug,
-                    "series_title": str(title)[:200],
-                    "tmdb_id": int(tmdb_id) if tmdb_id else None,
-                    "poster": poster,
-                    "language": language or "",
-                    "seasons": seasons_doc,
-                    "hits": clean_hits,
-                    "started_at": now,
-                    "last_activity_at": now,
-                    "status": "watching",
-                    "completed_at": None,
-                    "poster_chat_id": int(user_id),
-                    "current_season": 1,
-                    "current_episode": 1,
-                    "rated": False,
-                },
-                "$setOnInsert": {
-                    "poster_msg_id": None,
-                    "current_file_msg_id": None,
-                },
-            },
-            upsert=True,
+        # ── Check if session already exists ──
+        existing = await c.find_one(
+            {"user_id": uid, "series_slug": slug}
         )
-        logger.info(f"[PREM] session created u={user_id} s={slug}")
+
+        if existing:
+            # ── MERGE MODE — preserve progress ──
+            merged_seasons = _merge_seasons(
+                existing.get("seasons") or {},
+                fresh_seasons,
+            )
+            merged_hits = _merge_hits(
+                existing.get("hits") or [],
+                clean_hits,
+            )
+
+            patch = {
+                "series_title": str(title)[:200],
+                "tmdb_id": int(tmdb_id) if tmdb_id else existing.get("tmdb_id"),
+                "poster": poster or existing.get("poster"),
+                "language": language or existing.get("language", ""),
+                "seasons": merged_seasons,
+                "hits": merged_hits,
+                "last_activity_at": now,
+            }
+
+            # Never un-complete a completed series
+            if existing.get("status") == "completed":
+                patch.pop("status", None)
+                patch.pop("completed_at", None)
+
+            await c.update_one(
+                {"_id": existing["_id"]},
+                {"$set": patch},
+            )
+            logger.info(
+                f"[PREM] session MERGED u={uid} s={slug} "
+                f"(preserved progress)"
+            )
+            return True
+
+        # ── FRESH INSERT ──
+        await c.insert_one({
+            "user_id": uid,
+            "series_slug": slug,
+            "series_title": str(title)[:200],
+            "tmdb_id": int(tmdb_id) if tmdb_id else None,
+            "poster": poster,
+            "language": language or "",
+            "seasons": fresh_seasons,
+            "hits": clean_hits,
+            "started_at": now,
+            "last_activity_at": now,
+            "status": "watching",
+            "completed_at": None,
+            "poster_chat_id": uid,
+            "current_season": 1,
+            "current_episode": 1,
+            "rated": False,
+            "poster_msg_id": None,
+            "current_file_msg_id": None,
+        })
+        logger.info(f"[PREM] session created u={uid} s={slug}")
         return True
+
     except Exception as e:
         logger.exception(f"[PREM] create session: {e}")
         return False
@@ -386,7 +467,9 @@ def _clean_hits(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "season": h.get("season"),
                 "episode": h.get("episode"),
                 "quality": h.get("quality") or "UNKNOWN",
-                "languages": list(h.get("languages") or h.get("audio_languages") or []),
+                "languages": list(
+                    h.get("languages") or h.get("audio_languages") or []
+                ),
                 "title": h.get("title") or "",
                 "series_title": h.get("series_title") or "",
             })
@@ -505,7 +588,9 @@ async def update_poster_msg(user_id: int, slug: str, msg_id: int) -> bool:
 async def update_current_file_msg(
     user_id: int, slug: str, msg_id: int,
 ) -> bool:
-    return await update_session(user_id, slug, current_file_msg_id=int(msg_id))
+    return await update_session(
+        user_id, slug, current_file_msg_id=int(msg_id)
+    )
 
 
 async def mark_completed(user_id: int, slug: str) -> bool:
