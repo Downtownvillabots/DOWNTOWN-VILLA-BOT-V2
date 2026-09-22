@@ -97,14 +97,16 @@ async def update_stats(job_id: str, delta: Dict[str, int]) -> bool:
     try:
         from bson import ObjectId
         inc = {f"stats.{k}": int(v) for k, v in delta.items()}
-        inc["updated_at"] = datetime.utcnow()
         r = await c.update_one(
             {"_id": ObjectId(job_id)},
-            {"$inc": inc},
+            {
+                "$inc": inc,
+                "$set": {"updated_at": datetime.utcnow()},
+            },
         )
         return r.matched_count > 0
     except Exception as e:
-        logger.warning(f"[IDX-STATE] update_stats({job_id}) failed: {e}")
+        logger.debug(f"[IDX-STATE] stats: {e}")
         return False
 
 
