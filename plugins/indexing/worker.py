@@ -1,13 +1,15 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — INDEXING WORKER (bot-safe)
+# 🏨 DOWNTOWN VILLA — INDEXING WORKER (final)
 # ============================================================
 #
 # Bots cannot use messages.GetHistory (BOT_METHOD_INVALID).
-# So we NEVER call get_chat_history.
+# We walk message IDs via get_messages(...) — bot-safe.
 #
-# Duplicate detection ALWAYS walks every online media shard
-# directly (no bloom shortcut) to confirm a file_id /
-# file_unique_id does not already exist anywhere.
+# Duplicate detection checks EVERY online shard directly,
+# trying every relevant key (_id, fingerprint, file_id,
+# file_unique_id). No bloom shortcut.
+#
+# Indexes are auto-created on first run.
 #
 # ============================================================
 
@@ -53,6 +55,9 @@ EMPTY_BATCH_LIMIT = max(2, EMPTY_BATCH_LIMIT)
 
 SUMMARY_EVERY = 100
 
+# Guard so we only create indexes once per boot
+_indexes_ready = False
+
 
 # ============================================================
 # STATE
@@ -70,7 +75,7 @@ STATE: Dict[str, Any] = {
     "range_mode": "last",
     "start_msg_id": None,
     "metadata_source": "both",
-    "batch_size": 100,
+    "batch_size": 200,
     "concurrency": 20,
     "delay": 0.3,
     "skip_duplicate": True,
@@ -156,7 +161,7 @@ async def start_worker(
     start_msg_id: Optional[int] = None,
     range_mode: str = "last",
     metadata_source: str = "both",
-    batch_size: int = 100,
+    batch_size: int = 200,
     concurrency: int = 20,
     delay: float = 0.3,
     skip_duplicate: bool = True,
@@ -166,7 +171,7 @@ async def start_worker(
     global _task
 
     logger.info(
-        f"[INDEX-WORKER] ▶️ start_worker() — "
+        f"[INDEX-WORKER] ▶️ start_worker — "
         f"channel={channel_id} mode={mode} dir={direction} "
         f"range={range_mode} meta={metadata_source}"
     )
@@ -251,12 +256,61 @@ def resume_worker() -> bool:
 
 
 # ============================================================
+# INDEX SETUP (auto, once per boot)
+# ============================================================
+
+async def _ensure_indexes() -> None:
+    """
+    Create indexes on every online media shard.
+    Called once at the start of _run(); skips if already done.
+    """
+    global _indexes_ready
+    if _indexes_ready:
+        return
+
+    try:
+        from database import db_registry
+        entries = db_registry.media_entries()
+    except Exception as e:
+        logger.warning(f"[INDEX-WORKER] cannot list shards: {e}")
+        return
+
+    for e in entries:
+        if not e.online:
+            continue
+        try:
+            coll = e.db["media_files"]
+            await coll.create_index("file_id", name="file_id_idx",
+                                    background=True)
+            await coll.create_index("file_unique_id",
+                                    name="file_unique_id_idx",
+                                    background=True, sparse=True)
+            await coll.create_index("fingerprint",
+                                    name="fingerprint_idx",
+                                    background=True, sparse=True)
+            await coll.create_index("file_type",
+                                    name="file_type_idx",
+                                    background=True, sparse=True)
+            await coll.create_index("normalized_title",
+                                    name="norm_title_idx",
+                                    background=True, sparse=True)
+            await coll.create_index("created_at",
+                                    name="created_at_idx",
+                                    background=True)
+            logger.info(f"[INDEX-WORKER] 🧩 indexes ok on {e.label}")
+        except Exception as ex:
+            logger.debug(f"[INDEX-WORKER] index {e.label}: {ex}")
+
+    _indexes_ready = True
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 
 async def _run() -> None:
     logger.info(
-        f"[INDEX-WORKER] 🚀 _run() channel={STATE['channel_id']} "
+        f"[INDEX-WORKER] 🚀 _run channel={STATE['channel_id']} "
         f"mode={STATE['mode']} dir={STATE['direction']} "
         f"range={STATE['range_mode']}"
     )
@@ -268,6 +322,12 @@ async def _run() -> None:
             logger.error("[INDEX-WORKER] ❌ client None")
             return
         logger.info("[INDEX-WORKER] ✅ client ready")
+
+        # Ensure indexes (fast no-op after first run)
+        try:
+            await _ensure_indexes()
+        except Exception as e:
+            logger.debug(f"[INDEX-WORKER] index setup: {e}")
 
         # Job doc
         try:
@@ -295,23 +355,18 @@ async def _run() -> None:
             logger.warning(f"[INDEX-WORKER] create job: {e}")
 
         # Channel title
-        logger.info(
-            f"[INDEX-WORKER] 🔍 resolving channel {STATE['channel_id']}..."
-        )
         try:
             chat = await C.get_chat(STATE["channel_id"])
             STATE["channel_title"] = chat.title or str(STATE["channel_id"])
             logger.info(
-                f"[INDEX-WORKER] ✅ channel: '{STATE['channel_title']}' "
-                f"(type={chat.type})"
+                f"[INDEX-WORKER] ✅ channel: '{STATE['channel_title']}'"
             )
         except Exception as e:
             STATE["last_error"] = f"cannot access channel: {e}"
             logger.error(f"[INDEX-WORKER] ❌ cannot access: {e}")
             return
 
-        # Range (no GetHistory!)
-        logger.info("[INDEX-WORKER] 🔍 resolving ID range...")
+        # Range
         start_id, end_id = _resolve_range()
         STATE["start_msg_id"] = start_id
         STATE["current_message_id"] = start_id
@@ -321,11 +376,9 @@ async def _run() -> None:
 
         logger.info(
             f"[INDEX-WORKER] 📊 range: {start_id} → {end_id} "
-            f"({total_ids} IDs to scan, "
-            f"step={'+1' if start_id < end_id else '-1'})"
+            f"({total_ids} IDs)"
         )
 
-        logger.info("[INDEX-WORKER] ▶️ walking...")
         await _walk_messages(C, start_id, end_id)
         await _finalize()
 
@@ -346,13 +399,12 @@ async def _run() -> None:
             f"scanned={STATE['scanned_ids']} processed={STATE['processed']} "
             f"saved={STATE['saved']} dup={STATE['duplicate_id']} "
             f"checked={STATE['dups_checked']} "
-            f"no_media={STATE['skipped_no_media']} failed={STATE['failed']} "
-            f"movies={STATE['movies']} series={STATE['series']}"
+            f"no_media={STATE['skipped_no_media']} failed={STATE['failed']}"
         )
 
 
 # ============================================================
-# RESOLVE RANGE
+# RANGE
 # ============================================================
 
 def _resolve_range() -> Tuple[int, int]:
@@ -376,7 +428,7 @@ def _resolve_range() -> Tuple[int, int]:
 
 
 # ============================================================
-# WALK MESSAGES
+# WALK
 # ============================================================
 
 async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
@@ -401,11 +453,9 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
     while not stop_when(next_id):
         if time.time() - start_time > MAX_RUNTIME:
             STATE["last_error"] = "runtime cap reached"
-            logger.warning("[INDEX-WORKER] runtime cap")
             break
 
         if STATE["stop_requested"]:
-            logger.info("[INDEX-WORKER] stop requested")
             break
 
         while STATE["paused"] and not STATE["stop_requested"]:
@@ -413,7 +463,6 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             if fu and fu <= time.time():
                 STATE["flood_until"] = 0.0
                 STATE["paused"] = False
-                logger.info("[INDEX-WORKER] auto-resumed")
                 break
             await asyncio.sleep(1.0)
 
@@ -447,21 +496,20 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             if seen_any and consecutive_empty >= EMPTY_BATCH_LIMIT:
                 logger.info(
                     f"[INDEX-WORKER] ⏹️ {consecutive_empty} empty "
-                    f"batches in a row → stopping early"
+                    f"batches → stopping early"
                 )
                 break
             if not seen_any and consecutive_empty >= EMPTY_BATCH_LIMIT * 3:
                 logger.warning(
                     f"[INDEX-WORKER] ⚠️ {consecutive_empty} empty "
-                    f"batches from start → channel empty or IDs high. Stop."
+                    f"from start → channel empty or IDs high"
                 )
                 break
 
         if batch_num <= 3 or batch_num % 10 == 0:
             logger.info(
                 f"[INDEX-WORKER] 📦 batch #{batch_num} "
-                f"ids={batch[0]}..{batch[-1]} "
-                f"(any={got_any} empty_run={consecutive_empty})"
+                f"ids={batch[0]}..{batch[-1]}"
             )
 
         if abs(next_id - last_checkpoint) >= CHECKPOINT_EVERY:
@@ -476,7 +524,6 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
                 f"processed={STATE['processed']} saved={STATE['saved']} "
                 f"dup={STATE['duplicate_id']} "
                 f"checked={STATE['dups_checked']} "
-                f"no_media={STATE['skipped_no_media']} "
                 f"failed={STATE['failed']}"
             )
 
@@ -485,7 +532,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 
 
 # ============================================================
-# PROCESS BATCH
+# BATCH
 # ============================================================
 
 async def _process_batch(C: Client, batch: List[int]) -> bool:
@@ -498,26 +545,21 @@ async def _process_batch(C: Client, batch: List[int]) -> bool:
         if wait > FLOOD_HARD_SLEEP:
             STATE["last_error"] = f"flood too long ({wait}s)"
             STATE["stop_requested"] = True
-            logger.error(f"[INDEX-WORKER] flood too long: {wait}s")
             return False
-        logger.warning(f"[INDEX-WORKER] ⚠️ flood {wait}s")
         STATE["flood_until"] = time.time() + wait
         if STATE["auto_pause"]:
             STATE["paused"] = True
         return False
     except RPCError as e:
         STATE["last_error"] = str(e)[:200]
-        logger.warning(f"[INDEX-WORKER] ⚠️ RPC: {e}")
         return False
-    except Exception as e:
-        logger.exception(f"[INDEX-WORKER] ❌ fetch: {e}")
+    except Exception:
         return False
 
     valid = [
         m for m in msgs
         if m is not None and not getattr(m, "empty", False)
     ]
-
     if not valid:
         return False
 
@@ -533,10 +575,6 @@ async def _process_batch(C: Client, batch: List[int]) -> bool:
     return True
 
 
-# ============================================================
-# PROCESS ONE
-# ============================================================
-
 async def _process_one(C: Client, msg, sem: asyncio.Semaphore) -> None:
     async with sem:
         if STATE["stop_requested"]:
@@ -551,7 +589,6 @@ async def _handle_message(C: Client, msg) -> None:
         media = _pick_media(msg)
         if not media:
             STATE["skipped_no_media"] += 1
-            logger.debug(f"[INDEX-WORKER] no media msg={msg.id}")
             return
 
         file_id = media.get("file_id")
@@ -571,7 +608,7 @@ async def _handle_message(C: Client, msg) -> None:
                     )
                     return
             except Exception as e:
-                logger.debug(f"[INDEX-WORKER] dup check: {e}")
+                logger.debug(f"[INDEX-WORKER] dup: {e}")
 
         try:
             from plugins.indexing.pipeline import process_message
@@ -581,7 +618,7 @@ async def _handle_message(C: Client, msg) -> None:
                 metadata_source=STATE["metadata_source"],
             )
         except Exception as e:
-            logger.exception(f"[INDEX-WORKER] ❌ pipeline crash: {e}")
+            logger.exception(f"[INDEX-WORKER] pipeline crash: {e}")
             STATE["failed"] += 1
             STATE["last_error"] = str(e)[:200]
             return
@@ -598,17 +635,10 @@ async def _handle_message(C: Client, msg) -> None:
                 or rec.get("file_name")
                 or "?"
             )
-
             if rtype == "movie":
                 STATE["movies"] += 1
             elif rtype == "series":
                 STATE["series"] += 1
-            else:
-                logger.warning(
-                    f"[INDEX-WORKER] ⚠️ SAVED but type={rtype!r} "
-                    f"keys={list(rec.keys())[:10]}"
-                )
-
             logger.info(
                 f"[INDEX-WORKER] ✅ SAVED msg={msg.id} "
                 f"type={rtype or 'unknown'} "
@@ -620,14 +650,9 @@ async def _handle_message(C: Client, msg) -> None:
                 STATE["skipped_no_file_id"] += 1
             else:
                 STATE["skipped_no_media"] += 1
-            logger.debug(f"[INDEX-WORKER] ⏭️ skip msg={msg.id} {reason}")
         else:
             STATE["failed"] += 1
             STATE["last_error"] = str(result.get("reason") or "?")[:200]
-            logger.warning(
-                f"[INDEX-WORKER] ⚠️ pipe fail msg={msg.id} "
-                f"reason={result.get('reason')}"
-            )
 
         if STATE["processed"] % SUMMARY_EVERY == 0:
             logger.info(
@@ -637,8 +662,7 @@ async def _handle_message(C: Client, msg) -> None:
                 f"fail={STATE['failed']}"
             )
 
-    except Exception as e:
-        logger.exception(f"[INDEX-WORKER] ❌ handle crash: {e}")
+    except Exception:
         STATE["failed"] += 1
 
 
@@ -651,19 +675,19 @@ def _pick_media(msg) -> Optional[Dict[str, Any]]:
         if getattr(msg, "video", None):
             v = msg.video
             return {"file_id": v.file_id,
-                    "file_unique_id": v.file_unique_id, "kind": "video"}
+                    "file_unique_id": v.file_unique_id}
         if getattr(msg, "document", None):
             d = msg.document
             return {"file_id": d.file_id,
-                    "file_unique_id": d.file_unique_id, "kind": "document"}
+                    "file_unique_id": d.file_unique_id}
         if getattr(msg, "audio", None):
             a = msg.audio
             return {"file_id": a.file_id,
-                    "file_unique_id": a.file_unique_id, "kind": "audio"}
+                    "file_unique_id": a.file_unique_id}
         if getattr(msg, "animation", None):
             an = msg.animation
             return {"file_id": an.file_id,
-                    "file_unique_id": an.file_unique_id, "kind": "animation"}
+                    "file_unique_id": an.file_unique_id}
     except Exception:
         pass
     return None
@@ -674,15 +698,8 @@ async def _is_exact_duplicate(
     file_unique_id: Optional[str] = None,
 ) -> bool:
     """
-    ALWAYS checks every online media shard directly.
-
-    NO bloom shortcut. Walks all shared DBs to confirm
-    file_id / file_unique_id does not already exist anywhere.
-
-    Keys tried per shard:
-      • _id            = sha256 fingerprint of file_id
-      • file_id        = raw telegram file_id
-      • file_unique_id = telegram unique id
+    Walk every online media shard, try every key:
+      _id, fingerprint, file_id, file_unique_id
     """
     if not file_id and not file_unique_id:
         return False
@@ -691,12 +708,13 @@ async def _is_exact_duplicate(
     try:
         from services.duplicate import compute_fingerprint
         fp = compute_fingerprint(file_id) if file_id else None
-    except Exception as e:
-        logger.debug(f"[INDEX-WORKER] fingerprint: {e}")
+    except Exception:
+        fp = None
 
     queries: List[Dict[str, Any]] = []
     if fp:
         queries.append({"_id": fp})
+        queries.append({"fingerprint": fp})
     if file_id:
         queries.append({"file_id": file_id})
     if file_unique_id:
@@ -708,8 +726,7 @@ async def _is_exact_duplicate(
     try:
         from database import db_registry
         entries = db_registry.media_entries()
-    except Exception as e:
-        logger.debug(f"[INDEX-WORKER] registry error: {e}")
+    except Exception:
         return False
 
     for entry in entries:
@@ -721,15 +738,11 @@ async def _is_exact_duplicate(
                 if doc:
                     key_name = list(q.keys())[0]
                     logger.info(
-                        f"[INDEX-WORKER] ♻️ DUP found "
-                        f"shard={entry.index} key={key_name}"
+                        f"[INDEX-WORKER] ♻️ DUP hit "
+                        f"shard=DB{entry.index} key={key_name}"
                     )
                     return True
-            except Exception as e:
-                logger.debug(
-                    f"[INDEX-WORKER] shard {entry.index} "
-                    f"q={list(q.keys())}: {e}"
-                )
+            except Exception:
                 continue
 
     return False
