@@ -141,14 +141,11 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         pass
 
     # ── AUTO-SUMMARY: if last job finished, show summary only ──
-    started = w.get("started_at") or 0
-    finished = w.get("finished_at") or 0
-    if (
-        not w.get("running")
-        and started
-        and finished
-        and finished >= started
-    ):
+    processed = int(w.get("processed", 0) or 0)
+    is_running = bool(w.get("running"))
+    is_paused = bool(w.get("paused"))
+
+    if not is_running and not is_paused and processed > 0:
         return await _build_summary_panel()
 
     auto_mode = await _get_auto_mode()
