@@ -51,7 +51,11 @@ async def ensure_indexes() -> bool:
     if c is None:
         return False
     try:
-        await c.create_index("token_id", unique=True)
+        await c.create_index(
+            "token_id",
+            unique=True,
+            partialFilterExpression={"token_id": {"$type": "string"}},
+        )
         await c.create_index("expires_at", expireAfterSeconds=0)
         await c.create_index([
             ("user_id", 1), ("movie_name", 1), ("status", 1),
