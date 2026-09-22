@@ -1,25 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — INDEXING WORKER
-# ============================================================
-#
-# Walks messages in chosen direction. Processes every file.
-#
-# RULES (LOCKED):
-#   • Only skip if SAME file_id exists (exact duplicate)
-#   • Every other file is imported
-#   • Never skip for missing metadata / bad name / no caption
-#
-# METADATA SOURCE:
-#   • filename — use file name only
-#   • caption  — use caption only
-#   • both     — merge (filename first, caption fills gaps)
-#
-# RANGE MODES:
-#   • full     — start at msg 1, walk forward to newest
-#   • first    — start at msg 1
-#   • last     — start at newest
-#   • custom   — start at user-provided msg id
-#
+# 🏨 DOWNTOWN VILLA — INDEXING WORKER (heavy logging)
 # ============================================================
 
 from __future__ import annotations
@@ -59,7 +39,6 @@ STATE: Dict[str, Any] = {
     "paused": False,
     "stop_requested": False,
 
-    # Config
     "channel_id": None,
     "channel_title": "",
     "mode": "both",
@@ -74,7 +53,6 @@ STATE: Dict[str, Any] = {
     "auto_pause": True,
     "owner": 0,
 
-    # Progress
     "job_id": None,
     "run_id": None,
     "started_at": None,
@@ -92,13 +70,11 @@ STATE: Dict[str, Any] = {
     "movies": 0,
     "series": 0,
 
-    # Speed
     "speed": 0.0,
     "eta_seconds": 0.0,
     "eta_text": "—",
     "last_progress_at": 0.0,
 
-    # Errors
     "last_error": None,
     "flood_until": 0.0,
 }
@@ -160,10 +136,18 @@ async def start_worker(
 ) -> bool:
     global _task
 
+    logger.info(
+        f"[INDEX-WORKER] ▶️ start_worker() called — "
+        f"channel={channel_id} mode={mode} dir={direction} "
+        f"range={range_mode} meta={metadata_source}"
+    )
+
     async with _state_lock:
         if STATE["running"]:
+            logger.warning("[INDEX-WORKER] already running — ignored")
             return False
         if _task and not _task.done():
+            logger.warning("[INDEX-WORKER] task exists — ignored")
             return False
 
         STATE["running"] = True
@@ -214,6 +198,7 @@ async def start_worker(
         STATE["flood_until"] = 0.0
 
     _task = asyncio.create_task(_run())
+    logger.info("[INDEX-WORKER] ▶️ asyncio task created")
     return True
 
 
@@ -244,7 +229,8 @@ def resume_worker() -> bool:
 
 async def _run() -> None:
     logger.info(
-        f"[INDEX-WORKER] starting channel={STATE['channel_id']} "
+        f"[INDEX-WORKER] 🚀 _run() started — "
+        f"channel={STATE['channel_id']} "
         f"mode={STATE['mode']} dir={STATE['direction']} "
         f"range={STATE['range_mode']} meta={STATE['metadata_source']}"
     )
@@ -253,7 +239,9 @@ async def _run() -> None:
         from core.client import client as C
         if C is None:
             STATE["last_error"] = "client not ready"
+            logger.error("[INDEX-WORKER] ❌ client is None — abort")
             return
+        logger.info("[INDEX-WORKER] ✅ client ready")
 
         # Create job doc
         try:
@@ -276,18 +264,31 @@ async def _run() -> None:
                 "delay": STATE["delay"],
                 "skip_duplicate": STATE["skip_duplicate"],
             })
+            logger.info(f"[INDEX-WORKER] 📋 job_id={STATE['run_id']}")
         except Exception as e:
-            logger.debug(f"[INDEX-WORKER] create job: {e}")
+            logger.warning(f"[INDEX-WORKER] create job failed: {e}")
 
         # Resolve channel title
+        logger.info(
+            f"[INDEX-WORKER] 🔍 resolving channel {STATE['channel_id']}..."
+        )
         try:
             chat = await C.get_chat(STATE["channel_id"])
             STATE["channel_title"] = chat.title or str(STATE["channel_id"])
+            logger.info(
+                f"[INDEX-WORKER] ✅ channel resolved: "
+                f"'{STATE['channel_title']}' (type={chat.type})"
+            )
         except Exception as e:
             STATE["last_error"] = f"cannot access channel: {e}"
+            logger.error(
+                f"[INDEX-WORKER] ❌ cannot access channel "
+                f"{STATE['channel_id']}: {e}"
+            )
             return
 
         # Resolve range
+        logger.info("[INDEX-WORKER] 🔍 resolving message range...")
         start_id, end_id, total = await _resolve_range(C)
         STATE["start_msg_id"] = start_id
         STATE["current_message_id"] = start_id
@@ -295,29 +296,38 @@ async def _run() -> None:
         STATE["total_messages"] = total
 
         logger.info(
-            f"[INDEX-WORKER] range {start_id} → {end_id} "
-            f"(total={total})"
+            f"[INDEX-WORKER] 📊 range resolved: "
+            f"start={start_id} end={end_id} total={total}"
         )
 
         if total <= 0:
             STATE["last_error"] = "no messages in range"
+            logger.warning("[INDEX-WORKER] ⚠️ 0 messages in range — abort")
             return
 
+        logger.info("[INDEX-WORKER] ▶️ walking messages...")
         await _walk_messages(C, start_id, end_id)
         await _finalize()
 
     except asyncio.CancelledError:
         STATE["last_error"] = "cancelled"
+        logger.warning("[INDEX-WORKER] ⚠️ cancelled")
         await _finalize("cancelled")
         raise
     except Exception as e:
-        logger.exception(f"[INDEX-WORKER] crash: {e}")
+        logger.exception(f"[INDEX-WORKER] ❌ crash: {e}")
         STATE["last_error"] = str(e)[:200]
         await _finalize("error")
     finally:
         STATE["running"] = False
         STATE["paused"] = False
         STATE["finished_at"] = time.time()
+        logger.info(
+            f"[INDEX-WORKER] 🏁 finished — "
+            f"processed={STATE['processed']} saved={STATE['saved']} "
+            f"dup={STATE['duplicate_id']} failed={STATE['failed']} "
+            f"no_media={STATE['skipped_no_media']}"
+        )
 
 
 # ============================================================
@@ -329,53 +339,26 @@ async def _resolve_range(C: Client) -> Tuple[int, int, int]:
     range_mode = STATE["range_mode"]
     direction = STATE["direction"]
 
-    newest_id = 0
+    logger.info(
+        f"[INDEX-WORKER] 🔍 _resolve_range: channel={channel_id} "
+        f"range_mode={range_mode} direction={direction}"
+    )
+
+    newest_id = 1
     try:
         async for msg in C.get_chat_history(channel_id, limit=1):
-            newest_id = int(getattr(msg, "id", 0) or 0)
+            newest_id = msg.id
             break
+        logger.info(f"[INDEX-WORKER] 📌 newest message id = {newest_id}")
     except Exception as e:
         logger.warning(
-            f"[INDEX-WORKER] get_chat_history FAILED: "
-            f"{type(e).__name__}: {e}"
-        )
-        newest_id = 0
-
-    # Fallback 1: pinned message often has a high id
-    if newest_id <= 0:
-        try:
-            chat = await C.get_chat(channel_id)
-            pinned = getattr(chat, "pinned_message", None)
-            if pinned and getattr(pinned, "id", None):
-                newest_id = int(pinned.id)
-                logger.info(
-                    f"[INDEX-WORKER] newest via pinned_message = {newest_id}"
-                )
-        except Exception as e:
-            logger.warning(f"[INDEX-WORKER] pinned fallback: {e}")
-
-    # Fallback 2: get_messages(channel_id, 0) returns latest
-    if newest_id <= 0:
-        try:
-            m = await C.get_messages(channel_id, message_ids=0)
-            if m and not getattr(m, "empty", False):
-                newest_id = int(getattr(m, "id", 0) or 0)
-                logger.info(
-                    f"[INDEX-WORKER] newest via get_messages(0) = {newest_id}"
-                )
-        except Exception as e:
-            logger.warning(f"[INDEX-WORKER] get_messages fallback: {e}")
-
-    if newest_id <= 0:
-        logger.error(
-            "[INDEX-WORKER] cannot determine newest msg id — "
-            "check bot admin rights + channel 'hide history' setting"
+            f"[INDEX-WORKER] ⚠️ cannot fetch newest message from "
+            f"{channel_id}: {e}"
         )
         return (1, 1, 0)
 
-    # FULL SCAN preset
     if range_mode == "full":
-        return (1, newest_id, max(1, newest_id))
+        return (1, newest_id, newest_id)
 
     if range_mode == "custom" and STATE["start_msg_id"]:
         start_id = int(STATE["start_msg_id"])
@@ -413,17 +396,19 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
     last_checkpoint = start_id
     last_progress_update = 0.0
     start_time = time.time()
-    fail_streak = 0
+    batch_num = 0
 
     while not stop_when(next_id):
         if time.time() - start_time > MAX_RUNTIME:
             STATE["last_error"] = "runtime cap reached"
+            logger.warning("[INDEX-WORKER] runtime cap reached")
             break
 
         if STATE["stop_requested"]:
+            logger.info("[INDEX-WORKER] stop requested")
             break
 
-        # ── Pause loop with flood auto-recovery ──
+        # ── Pause loop ──
         while STATE["paused"] and not STATE["stop_requested"]:
             fu = float(STATE.get("flood_until") or 0.0)
             if fu and fu <= time.time():
@@ -436,37 +421,30 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
         if STATE["stop_requested"]:
             break
 
-        # ── Pre-fetch guard ──
         if STATE["flood_until"] > time.time():
             await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
             continue
 
-        # Build batch WITHOUT advancing next_id
-        batch = []
-        cursor = next_id
+        # Build batch
+        batch: List[int] = []
         for _ in range(batch_size):
-            if stop_when(cursor):
+            if stop_when(next_id):
                 break
-            batch.append(cursor)
-            cursor += step
+            batch.append(next_id)
+            next_id += step
 
         if not batch:
             break
 
-        ok = await _process_batch(C, batch)
+        batch_num += 1
+        if batch_num <= 3 or batch_num % 10 == 0:
+            logger.info(
+                f"[INDEX-WORKER] 📦 batch #{batch_num} "
+                f"ids={batch[0]}..{batch[-1]} "
+                f"({len(batch)} msgs)"
+            )
 
-        if ok:
-            next_id = cursor
-            fail_streak = 0
-        else:
-            fail_streak += 1
-            if fail_streak >= 3 and STATE["flood_until"] <= time.time():
-                STATE["last_error"] = (
-                    f"batch @ {batch[0]} failed {fail_streak}x"
-                )
-                STATE["stop_requested"] = True
-                break
-            await asyncio.sleep(max(1.0, STATE["delay"]))
+        await _process_batch(C, batch)
 
         if abs(next_id - last_checkpoint) >= CHECKPOINT_EVERY:
             last_checkpoint = next_id
@@ -475,6 +453,14 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
         if time.time() - last_progress_update >= PROGRESS_UPDATE_EVERY:
             last_progress_update = time.time()
             _update_speed()
+            logger.info(
+                f"[INDEX-WORKER] 📈 progress: "
+                f"processed={STATE['processed']} "
+                f"saved={STATE['saved']} "
+                f"dup={STATE['duplicate_id']} "
+                f"no_media={STATE['skipped_no_media']} "
+                f"failed={STATE['failed']}"
+            )
 
         if STATE["delay"] > 0:
             await asyncio.sleep(STATE["delay"])
@@ -484,12 +470,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 # PROCESS BATCH
 # ============================================================
 
-async def _process_batch(C: Client, batch: List[int]) -> bool:
-    """
-    Returns:
-        True  — batch fetched (0 or more valid messages handled)
-        False — batch fetch failed; caller must NOT advance cursor
-    """
+async def _process_batch(C: Client, batch: List[int]) -> None:
     try:
         msgs = await C.get_messages(STATE["channel_id"], message_ids=batch)
         if not isinstance(msgs, list):
@@ -499,25 +480,27 @@ async def _process_batch(C: Client, batch: List[int]) -> bool:
         if wait > FLOOD_HARD_SLEEP:
             STATE["last_error"] = f"flood too long ({wait}s)"
             STATE["stop_requested"] = True
-            return False
-        logger.warning(f"[INDEX-WORKER] flood {wait}s")
+            logger.error(f"[INDEX-WORKER] flood too long: {wait}s")
+            return
+        logger.warning(f"[INDEX-WORKER] ⚠️ flood wait {wait}s")
         STATE["flood_until"] = time.time() + wait
         if STATE["auto_pause"]:
             STATE["paused"] = True
-        return False
+        return
     except RPCError as e:
         STATE["last_error"] = str(e)[:200]
-        return False
+        logger.warning(f"[INDEX-WORKER] ⚠️ RPCError: {e}")
+        return
     except Exception as e:
-        logger.exception(f"[INDEX-WORKER] fetch: {e}")
-        return False
+        logger.exception(f"[INDEX-WORKER] ❌ fetch failed: {e}")
+        return
 
     valid = [
         m for m in msgs
         if m is not None and not getattr(m, "empty", False)
     ]
     if not valid:
-        return True
+        return
 
     sem = asyncio.Semaphore(STATE["concurrency"])
     tasks = [_process_one(C, m, sem) for m in valid]
@@ -527,8 +510,6 @@ async def _process_batch(C: Client, batch: List[int]) -> bool:
         STATE["current_message_id"] = max(m.id for m in valid)
     except Exception:
         pass
-
-    return True
 
 
 # ============================================================
@@ -543,7 +524,6 @@ async def _process_one(C: Client, msg, sem: asyncio.Semaphore) -> None:
 
 
 async def _handle_message(C: Client, msg) -> None:
-    """Handle ONE message. Only skip if same file_id."""
     STATE["processed"] += 1
 
     try:
@@ -557,11 +537,20 @@ async def _handle_message(C: Client, msg) -> None:
             STATE["skipped_no_file_id"] += 1
             return
 
+        # Duplicate check
         if STATE["skip_duplicate"]:
-            if await _is_exact_duplicate(file_id):
-                STATE["duplicate_id"] += 1
-                return
+            try:
+                if await _is_exact_duplicate(file_id):
+                    STATE["duplicate_id"] += 1
+                    logger.debug(
+                        f"[INDEX-WORKER] dup msg={msg.id} "
+                        f"file={file_id[:20]}"
+                    )
+                    return
+            except Exception as e:
+                logger.debug(f"[INDEX-WORKER] dup check: {e}")
 
+        # Pipeline
         try:
             from plugins.indexing.pipeline import process_message
             result = await process_message(
@@ -570,7 +559,7 @@ async def _handle_message(C: Client, msg) -> None:
                 metadata_source=STATE["metadata_source"],
             )
         except Exception as e:
-            logger.exception(f"[INDEX-WORKER] pipeline: {e}")
+            logger.exception(f"[INDEX-WORKER] ❌ pipeline crash: {e}")
             STATE["failed"] += 1
             STATE["last_error"] = str(e)[:200]
             return
@@ -585,20 +574,36 @@ async def _handle_message(C: Client, msg) -> None:
                 STATE["movies"] += 1
             elif rtype == "series":
                 STATE["series"] += 1
+            logger.info(
+                f"[INDEX-WORKER] ✅ SAVED msg={msg.id} "
+                f"type={rtype} "
+                f"title='{rec.get('title') or rec.get('series_title') or '?'}'"
+            )
         elif status == "duplicate":
             STATE["duplicate_id"] += 1
+            logger.debug(
+                f"[INDEX-WORKER] ♻️ dup pipeline msg={msg.id} "
+                f"reason={result.get('reason')}"
+            )
         elif status == "skipped":
             reason = str(result.get("reason") or "")
             if "file_id" in reason:
                 STATE["skipped_no_file_id"] += 1
             else:
                 STATE["skipped_no_media"] += 1
+            logger.debug(
+                f"[INDEX-WORKER] ⏭️ skipped msg={msg.id} reason={reason}"
+            )
         else:
             STATE["failed"] += 1
             STATE["last_error"] = str(result.get("reason") or "?")[:200]
+            logger.warning(
+                f"[INDEX-WORKER] ⚠️ pipeline failed msg={msg.id} "
+                f"reason={result.get('reason')}"
+            )
 
     except Exception as e:
-        logger.exception(f"[INDEX-WORKER] handle: {e}")
+        logger.exception(f"[INDEX-WORKER] ❌ handle crash: {e}")
         STATE["failed"] += 1
 
 
@@ -630,7 +635,6 @@ def _pick_media(msg) -> Optional[Dict[str, Any]]:
 
 
 async def _is_exact_duplicate(file_id: str) -> bool:
-    """True ONLY if SAME file_id exists."""
     fp = None
     try:
         from services.duplicate import compute_fingerprint, _bloom_check
@@ -661,10 +665,8 @@ def _update_speed() -> None:
             return
         elapsed = max(0.001, time.time() - STATE["started_at"])
         STATE["speed"] = STATE["processed"] / elapsed
-
         total = STATE["total_messages"]
         done = STATE["processed"]
-
         if total > 0 and STATE["speed"] > 0:
             remaining = max(0, total - done)
             eta = remaining / STATE["speed"]
@@ -710,7 +712,7 @@ async def _finalize(status: Optional[str] = None) -> None:
             "series": STATE["series"],
         })
         logger.info(
-            f"[INDEX-WORKER] done — status={status} "
+            f"[INDEX-WORKER] 🏁 finalized status={status} "
             f"saved={STATE['saved']} dup={STATE['duplicate_id']} "
             f"failed={STATE['failed']}"
         )
