@@ -84,9 +84,19 @@ def _new_step(uid: int, step: str, **data) -> None:
 
 
 def _update_step(uid: int, **data) -> None:
-    s = _steps.get(int(uid))
+    s = _steps.get(uid)
     if not s:
         return
+    s["data"].update(data)
+    s["expires"] = time.time() + STEP_TTL
+
+
+def _set_step(uid: int, step: str, **data) -> None:
+    """Explicitly change the wizard step and merge data."""
+    s = _steps.get(uid)
+    if not s:
+        return
+    s["step"] = step
     s["data"].update(data)
     s["expires"] = time.time() + STEP_TTL
 
@@ -1410,6 +1420,136 @@ async def open_panel_for_admin(client: Client, message: Message) -> None:
 
 def snapshot() -> Dict[str, Any]:
     return {"panels": len(_panels), "pending_steps": len(_steps)}
+
+# ============================================================
+# SECTION 13 — FORWARD DETECTION (continues the wizard)
+# ============================================================
+#
+# When the wizard reaches step="channel_forward", these handlers
+# catch a forwarded message (or bare media) and advance the flow
+# to the "mode" step.
+
+@Client.on_message(
+    filters.private
+    & filters.forwarded
+    & ~filters.service,
+    group=-8199,
+)
+async def idx_forward_handler(client: Client, message: Message):
+    """
+    User forwarded a message from a channel → register it → step 2.
+    """
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+
+    s = _get_step(message.from_user.id)
+    if not s or s.get("step") != "channel_forward":
+        return
+
+    # Extract source
+    fwd_chat = getattr(message, "forward_from_chat", None)
+    if not fwd_chat:
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['warn']} <b>{F.fb('CANNOT DETECT CHANNEL')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('forward was from a hidden user')}",
+                f"📌 {F.sc('please forward from the channel itself')}",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    channel_id = int(fwd_chat.id)
+    title = getattr(fwd_chat, "title", None) or str(channel_id)
+    username = getattr(fwd_chat, "username", "") or ""
+
+    # Register in the indexing_channels collection
+    try:
+        from plugins.indexing import backward as BW
+        await BW.register_channel(
+            chat_id=channel_id,
+            title=title,
+            username=username,
+            kind="manual",
+            added_by=message.from_user.id,
+        )
+    except Exception as e:
+        logger.debug(f"[INDEX] register on forward: {e}")
+
+    # Update wizard state → move to mode step
+    _set_step(message.from_user.id, "mode", channel_id=channel_id)
+
+    txt, kb = await _build_step_mode()
+    await message.reply_text(
+        txt, reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    # Confirm receipt
+    try:
+        await message.reply_text(
+            f"{F.EMO['check']} <b>Channel registered</b>\n"
+            f"📛 {F.sc(str(title)[:60])}\n"
+            f"🆔 <code>{channel_id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    try:
+        message.stop_propagation()
+    except Exception:
+        pass
+
+
+@Client.on_message(
+    filters.private
+    & (filters.video | filters.document | filters.audio | filters.animation)
+    & ~filters.forwarded,
+    group=-8199,
+)
+async def idx_media_handler(client: Client, message: Message):
+    """
+    User sent a bare media file (not forwarded).
+    Treat its own chat as the channel.
+    """
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+
+    s = _get_step(message.from_user.id)
+    if not s or s.get("step") != "channel_forward":
+        return
+
+    channel_id = int(message.chat.id)
+    title = getattr(message.chat, "title", None) or str(channel_id)
+
+    try:
+        from plugins.indexing import backward as BW
+        await BW.register_channel(
+            chat_id=channel_id,
+            title=title,
+            username="",
+            kind="manual",
+            added_by=message.from_user.id,
+        )
+    except Exception as e:
+        logger.debug(f"[INDEX] register on media: {e}")
+
+    _update_step(message.from_user.id, channel_id=channel_id)
+    _steps[message.from_user.id]["step"] = "mode"
+
+    txt, kb = await _build_step_mode()
+    await message.reply_text(
+        txt, reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    try:
+        message.stop_propagation()
+    except Exception:
+        pass
 
 
 __all__ = [
