@@ -1,22 +1,23 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — INDEXING PIPELINE (self-contained)
+# 🏨 DOWNTOWN VILLA — INDEXING PIPELINE (fill-first routing)
 # ============================================================
 #
-# Same pattern as the reference filter-bot:
+# Writes to media shards in FILL-FIRST order:
+#   DB1 until threshold → DB2 until threshold → DB3 ...
+# Never hashes / distributes.
 #
-#     media = getattr(message, message.media.value, None)
-#     media.file_type = message.media.value
-#     media.caption   = message.caption
-#     ok, code = await save_file(media)
+# Duplicate check across EVERY online shard:
+#   _id · fingerprint · file_id · file_unique_id
 #
-# save_file() is defined right here — no external module needed.
-# It writes to db_registry media shards → collection "media_files"
-# with the exact schema series_group.search expects.
+# Cache: the current write shard is cached for 30 seconds to
+# avoid running dbStats on every save. On write failure the
+# cache is invalidated and pick_shard() runs again.
 #
 # Returns:
-#   saved      → (True, 1)
-#   duplicate  → (True, 0)
-#   error      → (False, 2)
+#   saved      → {"status": "saved",     "record": {...}}
+#   duplicate  → {"status": "duplicate", "reason": "same file_id"}
+#   skipped    → {"status": "skipped",   "reason": "..."}
+#   error      → {"status": "error",     "reason": "..."}
 # ============================================================
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,15 +34,25 @@ from pyrogram import enums
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# CONSTANTS
+# ============================================================
+
 _SUPPORTED = (
     enums.MessageMediaType.VIDEO,
     enums.MessageMediaType.AUDIO,
     enums.MessageMediaType.DOCUMENT,
 )
 
+# Cache current write shard for this many seconds
+SHARD_CACHE_TTL = 30.0
+
+_cached_shard: Optional[Tuple[int, Any]] = None
+_cached_shard_at: float = 0.0
+
 
 # ============================================================
-# REGEXES — for inline metadata extraction
+# REGEXES
 # ============================================================
 
 _RE_QUALITY = re.compile(
@@ -105,7 +117,6 @@ async def process_message(
         if not media:
             return {"status": "skipped", "reason": "no media object"}
 
-        # attach the two attrs save_file() reads — exact reference pattern
         try:
             media.file_type = mt.value
         except Exception:
@@ -115,18 +126,17 @@ async def process_message(
         except Exception:
             pass
 
-        ok, code = await save_file(media, message=message,
-                                   metadata_source=metadata_source)
+        ok, code = await save_file(
+            media,
+            message=message,
+            metadata_source=metadata_source,
+        )
 
         if ok and code == 1:
             rec = {
                 "file_id": getattr(media, "file_id", None),
                 "file_name": getattr(media, "file_name", None),
             }
-            logger.info(
-                f"[PIPELINE] ✅ saved "
-                f"file='{rec.get('file_name') or rec.get('file_id')}'"
-            )
             return {"status": "saved", "record": rec}
 
         if ok and code == 0:
@@ -140,65 +150,118 @@ async def process_message(
 
 
 # ============================================================
-# SAVE_FILE — the actual writer
+# SAVE_FILE — fill-first writer
 # ============================================================
 
-async def save_file(media, message=None, metadata_source="both") -> Tuple[bool, int]:
+async def save_file(
+    media,
+    message=None,
+    metadata_source: str = "both",
+) -> Tuple[bool, int]:
     """
     Returns:
         (True, 1)  → saved
         (True, 0)  → duplicate
         (False, 2) → error
     """
+    global _cached_shard, _cached_shard_at
+
     try:
         file_id = getattr(media, "file_id", None)
         if not file_id:
             return (False, 2)
 
+        file_unique_id = getattr(media, "file_unique_id", None)
         fingerprint = hashlib.md5(str(file_id).encode()).hexdigest()
 
-        # ── build the record ──
-        record = _build_record(media, message, fingerprint, metadata_source)
-
-        # ── duplicate check: same _id OR same file_id ──
-        from database import db_registry
-        entries = list(db_registry.media_entries())
-        if not entries:
-            logger.error("[PIPELINE] no media shards available")
+        # ── 1. Duplicate check across EVERY online shard ──
+        try:
+            from database import db_registry
+            entries = list(db_registry.media_entries())
+        except Exception as e:
+            logger.error(f"[PIPELINE] registry error: {e}")
             return (False, 2)
 
-        for entry in entries:
-            try:
-                existing = await entry.db["media_files"].find_one(
-                    {"$or": [
-                        {"_id": fingerprint},
-                        {"file_id": file_id},
-                    ]},
-                    {"_id": 1},
-                )
-                if existing:
-                    return (True, 0)  # duplicate
-            except Exception as e:
-                logger.debug(f"[PIPELINE] dup check on shard: {e}")
+        if not entries:
+            logger.error("[PIPELINE] no media shards")
+            return (False, 2)
 
-        # ── pick shard by fingerprint (deterministic) ──
-        idx = int(fingerprint, 16) % len(entries)
-        target = entries[idx]
-
-        # ── upsert (idempotent) ──
-        await target.db["media_files"].update_one(
+        queries: List[Dict[str, Any]] = [
             {"_id": fingerprint},
-            {"$set": record},
-            upsert=True,
-        )
+            {"fingerprint": fingerprint},
+            {"file_id": file_id},
+        ]
+        if file_unique_id:
+            queries.append({"file_unique_id": file_unique_id})
 
-        # ── best-effort bloom ──
+        for entry in entries:
+            if not entry.online:
+                continue
+            for q in queries:
+                try:
+                    existing = await entry.db["media_files"].find_one(
+                        q, {"_id": 1}
+                    )
+                    if existing:
+                        return (True, 0)  # duplicate
+                except Exception as e:
+                    logger.debug(f"[PIPELINE] dup check shard {entry.index}: {e}")
+
+        # ── 2. Pick target shard (fill-first, cached) ──
+        now = time.time()
+        if _cached_shard is None or (now - _cached_shard_at) > SHARD_CACHE_TTL:
+            try:
+                from database.media.routing import media_router
+                idx, db = await media_router.pick_shard()
+                _cached_shard = (idx, db)
+                _cached_shard_at = now
+            except Exception as e:
+                logger.error(f"[PIPELINE] no shard available: {e}")
+                return (False, 2)
+
+        shard_index, target_db = _cached_shard
+
+        # ── 3. Build record + upsert ──
+        record = _build_record(media, message, fingerprint, metadata_source)
+        record["shard_index"] = shard_index
+
+        try:
+            await target_db["media_files"].update_one(
+                {"_id": fingerprint},
+                {"$set": record},
+                upsert=True,
+            )
+        except Exception as e:
+            # Cache may be stale (shard just filled up) → force re-pick
+            _cached_shard = None
+            _cached_shard_at = 0.0
+            logger.warning(f"[PIPELINE] write failed, re-picking shard: {e}")
+            try:
+                from database.media.routing import media_router
+                shard_index, target_db = await media_router.pick_shard()
+                _cached_shard = (shard_index, target_db)
+                _cached_shard_at = time.time()
+                record["shard_index"] = shard_index
+                await target_db["media_files"].update_one(
+                    {"_id": fingerprint},
+                    {"$set": record},
+                    upsert=True,
+                )
+            except Exception as e2:
+                logger.exception(f"[PIPELINE] retry save failed: {e2}")
+                return (False, 2)
+
+        # ── 4. Best-effort bloom add ──
         try:
             from services.duplicate import _bloom_add
             _bloom_add(fingerprint)
         except Exception:
             pass
 
+        logger.info(
+            f"[PIPELINE] ✅ saved to DB{shard_index} "
+            f"file='{str(record.get('file_name', '?'))[:60]}'"
+        )
         return (True, 1)
 
     except Exception as e:
@@ -210,9 +273,12 @@ async def save_file(media, message=None, metadata_source="both") -> Tuple[bool, 
 # RECORD BUILDER
 # ============================================================
 
-def _build_record(media, message, fingerprint: str,
-                  metadata_source: str) -> Dict[str, Any]:
-    # raw text — filename + caption merged per chosen source
+def _build_record(
+    media,
+    message,
+    fingerprint: str,
+    metadata_source: str,
+) -> Dict[str, Any]:
     fname = str(getattr(media, "file_name", "") or "").strip()
     caption = str(getattr(media, "caption", "") or "").strip()
 
@@ -225,7 +291,6 @@ def _build_record(media, message, fingerprint: str,
 
     parsed = _parse(raw)
 
-    # source info
     chat = getattr(message, "chat", None) if message else None
     source_channel_id = getattr(chat, "id", None) if chat else None
     source_msg_id = getattr(message, "id", None) if message else None
@@ -234,7 +299,6 @@ def _build_record(media, message, fingerprint: str,
         "_id": fingerprint,
         "fingerprint": fingerprint,
 
-        # media
         "file_id": getattr(media, "file_id", None),
         "file_unique_id": getattr(media, "file_unique_id", None),
         "file_name": fname,
@@ -243,7 +307,6 @@ def _build_record(media, message, fingerprint: str,
         "duration": int(getattr(media, "duration", 0) or 0),
         "file_type": getattr(media, "file_type", None),
 
-        # parsed
         "title": parsed["title"],
         "series_title": parsed["title"] if parsed["type"] == "series" else None,
         "type": parsed["type"],
@@ -252,15 +315,13 @@ def _build_record(media, message, fingerprint: str,
         "episode": parsed["episode"],
         "quality": parsed["quality"] or "UNKNOWN",
         "audio_languages": parsed["languages"],
-        "languages": parsed["languages"],   # alias for search compat
+        "languages": parsed["languages"],
 
-        # provenance
         "source_channel_id": source_channel_id,
         "source_message_id": source_msg_id,
         "caption": caption[:1000],
         "raw_text": raw[:2000],
 
-        # flags
         "indexed_by": "pipeline",
         "created_at": datetime.utcnow(),
     }
@@ -286,17 +347,14 @@ def _parse(text: str) -> Dict[str, Any]:
 
     t = _RE_EXT.sub("", str(text))
 
-    # quality
     m = _RE_QUALITY.search(t)
     if m:
         out["quality"] = m.group(1).upper()
 
-    # year
     m = _RE_YEAR.search(t)
     if m:
         out["year"] = int(m.group(1))
 
-    # season + episode
     m = _RE_SEASON_EP.search(t)
     if m:
         g = m.groups()
@@ -304,10 +362,8 @@ def _parse(text: str) -> Dict[str, Any]:
         out["episode"] = int(g[1] or g[3])
         out["type"] = "series"
 
-    # languages
     out["languages"] = _extract_languages(t)
 
-    # title — strip everything from quality/year/SxxExx onward
     title = t
     cut = None
     for pat in (_RE_QUALITY, _RE_SEASON_EP, _RE_YEAR):
@@ -321,7 +377,6 @@ def _parse(text: str) -> Dict[str, Any]:
     title = re.sub(r"\s+", " ", title).strip(" -|·")
     out["title"] = title[:200] or None
 
-    # if we still don't know type: has year + title → movie
     if out["type"] == "unknown" and out["title"] and out["year"]:
         out["type"] = "movie"
 
