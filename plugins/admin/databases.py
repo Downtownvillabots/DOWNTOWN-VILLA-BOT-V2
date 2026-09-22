@@ -2186,7 +2186,7 @@ async def db_router(client: Client, q: CallbackQuery):
 
         # ─── CONFIRM ───
         if parts[1] == "dbc_confirm":
-            tok = parts[2]
+            tok = ":".join(parts[2:])
             entry = confirms.get(q.from_user.id, tok)
             if not entry:
                 return await q.answer("⏱️ expired", show_alert=True)
@@ -2262,7 +2262,7 @@ async def db_router(client: Client, q: CallbackQuery):
 
         # ─── CANCEL ───
         if parts[1] == "dbc_cancel":
-            tok = parts[2]
+            tok = ":".join(parts[2:])
             confirms.cancel(q.from_user.id, tok)
             text = f"{F.EMO['cross']} {F.sc('cancelled')}."
             kb = InlineKeyboardMarkup([[
