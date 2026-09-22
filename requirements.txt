@@ -1,0 +1,38 @@
+# ============================================================
+# 🏨 DOWNTOWN VILLA v2 — REQUIREMENTS
+# ============================================================
+
+# ── Telegram ──
+pyrofork==2.3.69
+TgCrypto==1.2.5
+
+# ── Database ──
+motor==3.7.1
+pymongo==4.13.2
+
+# ── Web (Render health check) ──
+aiohttp>=3.9.5
+
+# ── Speed layer (optional but recommended) ──
+uvloop>=0.20.0
+orjson>=3.10.7
+
+# ── Metadata / fuzzy ──
+rapidfuzz>=3.9.7
+
+# ── HTTP ──
+httpx>=0.27.2
+
+# ── System metrics ──
+psutil>=6.0.0
+
+# ── Env loading ──
+python-dotenv>=1.0.1
+
+# ── IMDBKit + cinemagoer (from DreamXBotz) ──
+# Install directly via pip (not from PyPI mirror)
+git+https://github.com/DreamXBotz/IMDBKit.git@main
+git+https://github.com/DreamXBotz/cinemagoer
+
+# ── Timezone data ──
+tzdata>=2024.1
