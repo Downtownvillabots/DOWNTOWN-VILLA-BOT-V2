@@ -11,14 +11,19 @@ logger = logging.getLogger(__name__)
 _loaded: List[str] = []
 _failed: List[str] = []
 
+_PKG = __name__[:-9] if __name__.endswith(".__init__") else __name__
+_done = False
+
 
 def discover() -> None:
-    global _loaded, _failed
+    global _loaded, _failed, _done
+    if _done: return
+    _done = True
     _loaded.clear(); _failed.clear()
     pkg_dir = Path(__file__).parent
     for mod in pkgutil.iter_modules([str(pkg_dir)]):
         if mod.name.startswith("_"): continue
-        full = f"{__name__}.{mod.name}"
+        full = f"{_PKG}.{mod.name}"
         try:
             importlib.import_module(full)
             _loaded.append(mod.name)
@@ -31,5 +36,5 @@ def discover() -> None:
 def loaded(): return list(_loaded)
 def failed(): return list(_failed)
 
-discover()
+if __name__ == _PKG: discover()
 __all__ = ["discover", "loaded", "failed"]
