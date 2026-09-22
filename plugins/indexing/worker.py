@@ -575,7 +575,8 @@ async def _handle_message(C: Client, msg) -> None:
         if STATE["skip_duplicate"]:
             STATE["dups_checked"] = STATE.get("dups_checked", 0) + 1
             try:
-                if await _is_exact_duplicate(file_id):
+                file_unique_id = media.get("file_unique_id")
+                if await _is_exact_duplicate(file_id, file_unique_id):
                     STATE["duplicate_id"] += 1
                     logger.info(
                         f"[INDEX-WORKER] ♻️ DUP msg={msg.id} "
@@ -683,30 +684,63 @@ def _pick_media(msg) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _is_exact_duplicate(file_id: str) -> bool:
-    fp = None
+async def _is_exact_duplicate(
+    file_id: str,
+    file_unique_id: Optional[str] = None,
+) -> bool:
+    """
+    Robust duplicate check.
+    Checks (in order):
+      1. Bloom filter (fast in-memory)
+      2. DB across every media shard, trying:
+           - _id = fingerprint
+           - file_id
+           - file_unique_id
+    """
+    fp: Optional[str] = None
+
+    # 1. Bloom
     try:
         from services.duplicate import compute_fingerprint, _bloom_check
         fp = compute_fingerprint(file_id)
-        if _bloom_check(fp):
+        if fp and _bloom_check(fp):
+            logger.debug(f"[INDEX-WORKER] dup bloom hit fp={fp[:12]}")
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[INDEX-WORKER] bloom check: {e}")
 
+    # 2. DB
     try:
         from database import db_registry
         for entry in db_registry.media_entries():
             try:
-                q = {"_id": fp} if fp else {"file_id": file_id}
-                exists = await entry.db["media_files"].find_one(q, {"_id": 1})
-                if exists:
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
+                queries: List[Dict[str, Any]] = []
+                if fp:
+                    queries.append({"_id": fp})
+                if file_id:
+                    queries.append({"file_id": file_id})
+                if file_unique_id:
+                    queries.append({"file_unique_id": file_unique_id})
 
+                for q in queries:
+                    doc = await entry.db["media_files"].find_one(
+                        q, {"_id": 1, "file_id": 1}
+                    )
+                    if doc:
+                        logger.debug(
+                            f"[INDEX-WORKER] dup db hit "
+                            f"shard={entry.index} q={list(q.keys())}"
+                        )
+                        return True
+            except Exception as e:
+                logger.debug(
+                    f"[INDEX-WORKER] shard {entry.index} query: {e}"
+                )
+                continue
+    except Exception as e:
+        logger.debug(f"[INDEX-WORKER] db check: {e}")
+
+    return False
 
 def _update_speed() -> None:
     try:
