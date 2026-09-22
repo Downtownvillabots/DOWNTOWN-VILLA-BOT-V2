@@ -234,6 +234,7 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
 
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     total = int(w.get("total_messages", 0) or 0)
+    processed = int(w.get("processed", 0) or 0)
     current = int(w.get("current_message_id", 0) or 0)
     saved = int(w.get("saved", 0) or 0)
     dup = int(w.get("duplicate_id", 0) or 0)
@@ -244,8 +245,9 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     speed = float(w.get("speed", 0.0) or 0.0)
     eta_text = w.get("eta_text", "—")
 
-    if total > 0:
-        pct = (1 - current / max(1, total)) * 100 if current > 0 else 0.0
+    # ── Progress: use real processed counter, not msg-id ratio ──
+    if total > 0 and processed > 0:
+        pct = min(100.0, (processed / total) * 100.0)
     else:
         pct = 0.0
 
@@ -746,15 +748,38 @@ async def _build_databases() -> Tuple[str, InlineKeyboardMarkup]:
     ]
     try:
         from database import db_registry
-        snap = await db_registry.snapshot()
-        for pool_name, info in (snap.get("pools") or {}).items():
-            icon = {"system": "⚙️", "user": "👤",
-                    "media": "🎬", "backup": "💾"}.get(pool_name, "📦")
-            lines.append(
-                f"{icon} <b>{F.sc(pool_name)}</b> · "
-                f"{info.get('online', 0)}/{info.get('total', 0)} · "
-                f"{FM.size(info.get('total_used_mb', 0) * 1024 * 1024)}"
-            )
+
+        snap = None
+        # Preferred: async snapshot()
+        if hasattr(db_registry, "snapshot"):
+            try:
+                snap = await db_registry.snapshot()
+            except TypeError:
+                # some registries expose snapshot() sync
+                snap = db_registry.snapshot()
+            except Exception as e:
+                logger.debug(f"[INDEX] snapshot(): {e}")
+
+        # Fallback: build minimal view from media_entries()
+        if not snap and hasattr(db_registry, "media_entries"):
+            try:
+                entries = list(db_registry.media_entries())
+                lines.append(
+                    f"🎬 <b>media</b> · "
+                    f"{len(entries)} shard(s) online"
+                )
+            except Exception as e:
+                lines.append(f"❌ <code>{str(e)[:60]}</code>")
+
+        if snap and isinstance(snap, dict):
+            for pool_name, info in (snap.get("pools") or {}).items():
+                icon = {"system": "⚙️", "user": "👤",
+                        "media": "🎬", "backup": "💾"}.get(pool_name, "📦")
+                lines.append(
+                    f"{icon} <b>{F.sc(pool_name)}</b> · "
+                    f"{info.get('online', 0)}/{info.get('total', 0)} · "
+                    f"{FM.size(info.get('total_used_mb', 0) * 1024 * 1024)}"
+                )
     except Exception as e:
         lines.append(f"❌ <code>{str(e)[:60]}</code>")
 
@@ -1033,8 +1058,12 @@ async def router_handler(client: Client, q: CallbackQuery):
         if action == "save_default":
             s = _get_step(uid)
             if s:
-                await _save_default_config(s.get("data", {}))
-            return await q.answer("💾 Saved")
+                ok = await _save_default_config(s.get("data", {}))
+                return await q.answer(
+                    "💾 Saved" if ok else "❌ Save failed",
+                    show_alert=not ok,
+                )
+            return await q.answer("⚠️ No session")
 
         # ── CONFIRM ──
         if action == "confirm":
@@ -1228,10 +1257,15 @@ async def indexing_text_input(client: Client, message: Message):
 
     text = (message.text or "").strip()
     if not text.isdigit():
-        return await message.reply_text(
+        await message.reply_text(
             f"{F.EMO['cross']} {F.sc('send a numeric message id')}",
             parse_mode=ParseMode.HTML,
         )
+        try:
+            message.stop_propagation()
+        except Exception:
+            pass
+        return
 
     _update_step(message.from_user.id, start_msg_id=int(text))
 
@@ -1252,19 +1286,38 @@ async def indexing_text_input(client: Client, message: Message):
 # SAVE DEFAULT
 # ============================================================
 
+# Only these keys are reusable across jobs
+_DEFAULT_KEYS = (
+    "mode",
+    "metadata_source",
+    "batch_size",
+    "concurrency",
+    "delay",
+    "skip_duplicate",
+    "auto_pause",
+)
+
+
 async def _save_default_config(data: Dict[str, Any]) -> bool:
+    """Persist only reusable keys — never session-specific ones."""
     try:
         from database import db_registry
         db = db_registry.get_system_db()
         if db is None:
             return False
+
+        clean = {k: data[k] for k in _DEFAULT_KEYS if k in data}
+        clean["updated_at"] = datetime.utcnow()
+
         await db["bot_settings"].update_one(
             {"_id": "indexing_default"},
-            {"$set": {**data, "updated_at": datetime.utcnow()}},
+            {"$set": clean},
             upsert=True,
         )
+        logger.info(f"[INDEX] default saved: {list(clean.keys())}")
         return True
-    except Exception:
+    except Exception as e:
+        logger.exception(f"[INDEX] save_default FAILED: {e}")
         return False
 
 
