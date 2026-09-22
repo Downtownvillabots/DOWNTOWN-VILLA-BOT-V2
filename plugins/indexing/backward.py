@@ -1,33 +1,12 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — CHANNEL AUTO-DETECT + BACKWARD SCAN
+# 🏨 DOWNTOWN VILLA — CHANNEL AUTO-DETECT + MANAGER
 # ============================================================
 #
-# TWO WAYS a channel gets registered:
-#
-#   1. AUTO:  Bot is added as admin to a channel
-#             → ChatMemberUpdated event fires
-#             → channel saved to DB
-#             → appears in /index picker
-#
+# Two ways a channel gets registered:
+#   1. AUTO:  Bot is added as admin → ChatMemberUpdated event
 #   2. MANUAL: User forwards a message from any channel
-#              → bot detects the source channel
-#              → saves + opens the config flow
 #
-# STORAGE: SYSTEM DB → indexing_channels
-#
-# SCHEMA:
-#   {
-#     "_id": ObjectId,
-#     "chat_id": -100xxx,
-#     "title": "My Channel",
-#     "username": "mychannel",
-#     "kind": "auto" | "manual",
-#     "enabled": True,
-#     "added_by": 123456,
-#     "added_at": ISODate,
-#     "updated_at": ISODate,
-#     "last_seen_at": ISODate,
-#   }
+# Storage: SYSTEM DB → indexing_channels
 #
 # ============================================================
 
@@ -39,7 +18,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
-from pyrogram.enums import ChatType, ChatMemberStatus, ParseMode
+from pyrogram.enums import ChatType, ParseMode
 from pyrogram.types import (
     CallbackQuery, ChatMemberUpdated, InlineKeyboardButton,
     InlineKeyboardMarkup, Message,
@@ -51,18 +30,9 @@ from utils import format as FM
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# SECTION 1 — CONSTANTS
-# ============================================================
-
 COLLECTION = "indexing_channels"
-PFX = "ich"     # callback prefix for channel manager
+PFX = "ich"
 
-
-# ============================================================
-# SECTION 2 — AUTH
-# ============================================================
 
 def _is_admin(uid) -> bool:
     try:
@@ -70,10 +40,6 @@ def _is_admin(uid) -> bool:
     except Exception:
         return False
 
-
-# ============================================================
-# SECTION 3 — DB
-# ============================================================
 
 def _coll():
     try:
@@ -86,6 +52,10 @@ def _coll():
         return None
 
 
+# ============================================================
+# REGISTER / LIST / UPDATE / REMOVE
+# ============================================================
+
 async def register_channel(
     chat_id: int,
     title: str = "",
@@ -93,7 +63,6 @@ async def register_channel(
     kind: str = "auto",
     added_by: int = 0,
 ) -> bool:
-    """Save (or refresh) a channel in the registry."""
     c = _coll()
     if c is None:
         return False
@@ -129,7 +98,6 @@ async def register_channel(
 
 
 async def list_registered_channels() -> List[Dict[str, Any]]:
-    """Return every registered channel, newest first."""
     c = _coll()
     if c is None:
         return []
@@ -139,8 +107,7 @@ async def list_registered_channels() -> List[Dict[str, Any]]:
         for d in docs:
             d.pop("_id", None)
         return docs
-    except Exception as e:
-        logger.debug(f"[CH-AUTO] list: {e}")
+    except Exception:
         return []
 
 
@@ -175,10 +142,8 @@ async def set_enabled(chat_id: int, enabled: bool) -> bool:
     try:
         r = await c.update_one(
             {"chat_id": int(chat_id)},
-            {"$set": {
-                "enabled": bool(enabled),
-                "updated_at": datetime.utcnow(),
-            }},
+            {"$set": {"enabled": bool(enabled),
+                      "updated_at": datetime.utcnow()}},
         )
         return r.matched_count > 0
     except Exception:
@@ -186,7 +151,6 @@ async def set_enabled(chat_id: int, enabled: bool) -> bool:
 
 
 async def list_enabled_channel_ids() -> List[int]:
-    """IDs of channels with enabled=True (used by indexing watcher)."""
     c = _coll()
     if c is None:
         return []
@@ -199,15 +163,11 @@ async def list_enabled_channel_ids() -> List[int]:
 
 
 # ============================================================
-# SECTION 4 — CHAT MEMBER UPDATE (auto-detect)
+# AUTO-DETECT: BOT ADDED AS ADMIN
 # ============================================================
 
 @Client.on_chat_member_updated(group=-295)
 async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
-    """
-    Detect when the bot is added/promoted in a channel.
-    Register the channel automatically.
-    """
     try:
         chat = update.chat
         if chat.type != ChatType.CHANNEL:
@@ -217,7 +177,6 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         if not new_member:
             return
 
-        # Is this the bot?
         try:
             me = await client.identity()
         except Exception:
@@ -232,20 +191,16 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
 
         status = getattr(new_member, "status", None)
         status_str = (
-            status.name.lower() if hasattr(status, "name") else str(status).lower()
+            status.name.lower() if hasattr(status, "name")
+            else str(status).lower()
         )
 
-        # Only care when promoted/added
         if status_str not in ("administrator", "creator", "owner"):
-            # Bot was removed or demoted
             if status_str in ("left", "kicked", "restricted"):
                 await set_enabled(chat.id, False)
-                logger.info(
-                    f"[CH-AUTO] bot removed from {chat.id} — disabled"
-                )
+                logger.info(f"[CH-AUTO] bot removed from {chat.id}")
             return
 
-        # Register
         registered = await register_channel(
             chat_id=chat.id,
             title=chat.title or "",
@@ -255,15 +210,12 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         )
 
         if registered:
-            # Optional: notify the log channel
             await _notify_added(client, chat)
-
     except Exception as e:
         logger.exception(f"[CH-AUTO] member update: {e}")
 
 
 async def _notify_added(client: Client, chat) -> None:
-    """Send a small log message (optional)."""
     try:
         log_ch = getattr(config, "LOG_CHANNEL", 0)
         if not log_ch:
@@ -277,7 +229,7 @@ async def _notify_added(client: Client, chat) -> None:
                 f"📢 <b>{F.sc(str(chat.title or '?'))[:60]}</b>",
                 f"🆔 <code>{chat.id}</code>",
                 "",
-                f"📌 {F.sc('channel auto-registered for indexing')}",
+                f"📌 {F.sc('auto-registered for indexing')}",
                 f"📌 {F.sc('open /index to configure')}",
             ]),
             parse_mode=ParseMode.HTML,
@@ -288,29 +240,19 @@ async def _notify_added(client: Client, chat) -> None:
 
 
 # ============================================================
-# SECTION 5 — FORWARD DETECT (manual)
+# MANUAL DETECT: FORWARDED MESSAGE
 # ============================================================
 
 @Client.on_message(
-    filters.private
-    & filters.forwarded
-    & ~filters.service,
+    filters.private & filters.forwarded & ~filters.service,
     group=-294,
 )
 async def detect_forwarded_channel(client: Client, message: Message):
-    """
-    Detect a forwarded message from a channel.
-    Register the source channel + prompt to start.
-    """
     try:
-        # Only handle forwarded from channels
         fwd_chat = getattr(message, "forward_from_chat", None)
-        if not fwd_chat:
-            return
-        if fwd_chat.type != ChatType.CHANNEL:
+        if not fwd_chat or fwd_chat.type != ChatType.CHANNEL:
             return
 
-        # Only admins
         if not message.from_user or not _is_admin(message.from_user.id):
             return
 
@@ -318,7 +260,6 @@ async def detect_forwarded_channel(client: Client, message: Message):
         title = fwd_chat.title or str(channel_id)
         username = fwd_chat.username or ""
 
-        # Register
         await register_channel(
             chat_id=channel_id,
             title=title,
@@ -327,7 +268,6 @@ async def detect_forwarded_channel(client: Client, message: Message):
             added_by=message.from_user.id,
         )
 
-        # Show a quick confirmation with a start button
         kb = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
@@ -338,7 +278,7 @@ async def detect_forwarded_channel(client: Client, message: Message):
             [
                 InlineKeyboardButton(
                     f"📢 {F.sc('manage channels')}",
-                    callback_data=f"idx:databases",
+                    callback_data="idx:channels",
                 ),
                 InlineKeyboardButton(
                     f"{F.EMO['cross']} {F.sc('dismiss')}",
@@ -357,24 +297,22 @@ async def detect_forwarded_channel(client: Client, message: Message):
                 *([f"🔗 @{username}"] if username else []),
                 "",
                 F.DIV_S,
-                f"📌 {F.sc('channel registered for indexing')}",
+                f"📌 {F.sc('channel registered')}",
                 f"📌 {F.sc('tap start to configure')}",
             ]),
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-
     except Exception as e:
         logger.exception(f"[CH-AUTO] forward detect: {e}")
 
 
 # ============================================================
-# SECTION 6 — CHANNEL MANAGER PANEL (from /index)
+# CHANNEL MANAGER PANEL
 # ============================================================
 
 async def open_channel_manager(client: Client, q: CallbackQuery) -> None:
-    """Open the channel manager panel (called from /index)."""
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("❌ Admin only", show_alert=True)
 
@@ -395,17 +333,14 @@ async def open_channel_manager(client: Client, q: CallbackQuery) -> None:
         lines.append(f"⚪ {F.sc('no channels yet')}")
         lines.append("")
         lines.append(f"📌 {F.sc('add bot as admin to a channel')}")
-        lines.append(f"📌 {F.sc('or forward any message from a channel')}")
+        lines.append(f"📌 {F.sc('or forward a message from a channel')}")
     else:
         for i, ch in enumerate(channels, 1):
             icon = "🟢" if ch.get("enabled") else "🔴"
             kind = str(ch.get("kind", "?"))
-            kind_icon = {"auto": "🤖", "manual": "👤"}.get(kind, "📌")
+            k_icon = {"auto": "🤖", "manual": "👤"}.get(kind, "📌")
             title = str(ch.get("title", "?"))[:40]
-            lines.append(
-                f"<b>{i:02d}.</b> {icon} {kind_icon} "
-                f"<b>{F.sc(title)}</b>"
-            )
+            lines.append(f"<b>{i:02d}.</b> {icon} {k_icon} <b>{F.sc(title)}</b>")
             lines.append(f"    🆔 <code>{ch.get('chat_id')}</code>")
             lines.append("")
 
@@ -450,7 +385,6 @@ async def open_channel_manager(client: Client, q: CallbackQuery) -> None:
 
 
 async def view_channel(client: Client, q: CallbackQuery, chat_id: int) -> None:
-    """Show a single channel's detail + actions."""
     ch = await get_channel(chat_id)
     if not ch:
         return await q.answer("⚠️ Not found", show_alert=True)
@@ -519,14 +453,7 @@ async def view_channel(client: Client, q: CallbackQuery, chat_id: int) -> None:
     await q.answer()
 
 
-# ============================================================
-# SECTION 7 — ROUTER
-# ============================================================
-
-@Client.on_callback_query(
-    filters.regex(rf"^{PFX}:"),
-    group=-295,
-)
+@Client.on_callback_query(filters.regex(rf"^{PFX}:"), group=-295)
 async def channel_manager_router(client: Client, q: CallbackQuery):
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("❌ Admin only", show_alert=True)
@@ -566,12 +493,10 @@ async def channel_manager_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌ Invalid", show_alert=True)
             text = "\n".join([
                 f"{F.EMO['warn']} <b>{F.fb('REMOVE CHANNEL?')}</b>",
-                F.DIV,
-                "",
-                f"🆔 <code>{cid}</code>",
-                "",
-                f"📌 {F.sc('only removes from the registry')}",
-                f"📌 {F.sc('the Telegram channel stays intact')}",
+                F.DIV, "",
+                f"🆔 <code>{cid}</code>", "",
+                f"📌 {F.sc('only removes from registry')}",
+                f"📌 {F.sc('Telegram channel stays intact')}",
             ])
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -610,7 +535,6 @@ async def channel_manager_router(client: Client, q: CallbackQuery):
             return await q.answer()
 
         return await q.answer("❓ Unknown", show_alert=True)
-
     except Exception as e:
         logger.exception(f"[CH-AUTO] router: {e}")
         try:
@@ -618,10 +542,6 @@ async def channel_manager_router(client: Client, q: CallbackQuery):
         except Exception:
             pass
 
-
-# ============================================================
-# SECTION 8 — SNAPSHOT
-# ============================================================
 
 async def snapshot() -> Dict[str, Any]:
     channels = await list_registered_channels()
@@ -633,18 +553,8 @@ async def snapshot() -> Dict[str, Any]:
     }
 
 
-# ============================================================
-# PUBLIC EXPORTS
-# ============================================================
-
 __all__ = [
-    "register_channel",
-    "list_registered_channels",
-    "get_channel",
-    "unregister_channel",
-    "set_enabled",
-    "list_enabled_channel_ids",
-    "open_channel_manager",
-    "view_channel",
-    "snapshot",
+    "register_channel", "list_registered_channels", "get_channel",
+    "unregister_channel", "set_enabled", "list_enabled_channel_ids",
+    "open_channel_manager", "view_channel", "snapshot",
 ]
