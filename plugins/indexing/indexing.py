@@ -4,7 +4,7 @@
 #
 # ONE COMMAND: /index
 #
-# FULL CONFIGURATION FLOW (everything is a button):
+# FULL CONFIGURATION FLOW:
 #   STEP 1/6 — Channel       (pick registered or forward)
 #   STEP 2/6 — Mode          (movies / series / both)
 #   STEP 3/6 — Direction     (forward / backward)
@@ -129,7 +129,7 @@ def _unregister_panel(msg_id: int) -> None:
 
 
 # ============================================================
-# MAIN PANEL
+# MAIN PANEL (dispatcher — decides which panel to show)
 # ============================================================
 
 async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
@@ -140,27 +140,36 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
     except Exception:
         pass
 
-    # ── AUTO-SUMMARY: if last job finished, show summary only ──
+    running = bool(w.get("running"))
+    paused = bool(w.get("paused"))
     processed = int(w.get("processed", 0) or 0)
-    is_running = bool(w.get("running"))
-    is_paused = bool(w.get("paused"))
 
-    if not is_running and not is_paused and processed > 0:
-        return await _build_summary_panel()
+    # 1. Live job in progress → live progress panel
+    if running or paused:
+        return await _build_live_panel(w)
 
+    # 2. Job finished → 100% report
+    if processed > 0:
+        return await _build_report_panel(w)
+
+    # 3. Fresh / idle → empty control panel
+    return await _build_idle_panel(w)
+
+
+# ============================================================
+# LIVE PANEL (running / paused)
+# ============================================================
+
+async def _build_live_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     auto_mode = await _get_auto_mode()
 
-    running = w.get("running", False)
-    paused = w.get("paused", False)
+    running = bool(w.get("running"))
+    paused = bool(w.get("paused"))
 
     if running and not paused:
         s_icon, s_text = "🟢", "RUNNING"
-    elif paused:
-        s_icon, s_text = "🟡", "PAUSED"
-    elif w.get("started_at") and not running:
-        s_icon, s_text = "✅", "FINISHED"
     else:
-        s_icon, s_text = "⚪", "IDLE"
+        s_icon, s_text = "🟡", "PAUSED"
 
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -171,23 +180,12 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         f"{'🟢 ' + F.sc('on') if auto_mode else '🔴 ' + F.sc('off')}",
         "",
     ]
-
-    # Live progress when running/paused/finished
-    if running or paused or w.get("started_at"):
-        lines.extend(await _render_live_progress(w))
-
+    lines.extend(await _render_live_progress(w))
     lines += [F.DIV_S, f"🕒 <code>{FM.datetime_()}</code>"]
-
-    text = "\n".join(lines)[:4000]
 
     rows: List[List[InlineKeyboardButton]] = []
 
-    if not running:
-        rows.append([InlineKeyboardButton(
-            f"{F.EMO['play']} {F.sc('start new job')}",
-            callback_data=f"{PFX}:start",
-        )])
-    elif paused:
+    if paused:
         rows.append([
             InlineKeyboardButton(
                 f"{F.EMO['play']} {F.sc('resume')}",
@@ -211,64 +209,28 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         ])
 
     # Live refresh rate selector
-    if running or paused:
-        cur_iv = _live_intervals.get(0, DEFAULT_LIVE)
-        live_row = [InlineKeyboardButton(
-            f"{'✅ ' if iv == cur_iv else ''}{iv}s",
-            callback_data=f"{PFX}:live:{iv}",
-        ) for iv in LIVE_OPTIONS]
-        rows.append([InlineKeyboardButton(
-            f"🔄 {F.sc('refresh rate')}",
-            callback_data=f"{PFX}:noop",
-        )])
-        rows.append(live_row)
+    cur_iv = _live_intervals.get(0, DEFAULT_LIVE)
+    rows.append([InlineKeyboardButton(
+        f"🔄 {F.sc('refresh rate')}",
+        callback_data=f"{PFX}:noop",
+    )])
+    rows.append([InlineKeyboardButton(
+        f"{'✅ ' if iv == cur_iv else ''}{iv}s",
+        callback_data=f"{PFX}:live:{iv}",
+    ) for iv in LIVE_OPTIONS])
 
     rows.append([
-        InlineKeyboardButton(
-            f"📢 {F.sc('channels')}",
-            callback_data=f"{PFX}:channels",
-        ),
-        InlineKeyboardButton(
-            f"📊 {F.sc('live')}",
-            callback_data=f"{PFX}:live_now",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"🧾 {F.sc('history')}",
-            callback_data=f"{PFX}:history",
-        ),
-        InlineKeyboardButton(
-            f"🎯 {F.sc('auto')} · {'🟢' if auto_mode else '🔴'}",
-            callback_data=f"{PFX}:toggle_auto",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"🗄️ {F.sc('databases')}",
-            callback_data=f"{PFX}:databases",
-        ),
-        InlineKeyboardButton(
-            f"🧹 {F.sc('duplicates')}",
-            callback_data=f"{PFX}:duplicates",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"🗑️ {F.sc('reset')}",
-            callback_data=f"{PFX}:reset",
-        ),
         InlineKeyboardButton(
             f"{F.EMO['refresh']} {F.sc('refresh')}",
             callback_data=f"{PFX}:refresh",
         ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data=f"{PFX}:close",
+        ),
     ])
-    rows.append([InlineKeyboardButton(
-        f"{F.EMO['cross']} {F.sc('close')}",
-        callback_data=f"{PFX}:close",
-    )])
 
-    return text, InlineKeyboardMarkup(rows)
+    return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
 
 
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
@@ -283,34 +245,25 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     processed = int(w.get("processed", 0))
 
     started = w.get("started_at") or 0
-    finished = w.get("finished_at") or 0
-    is_finished = bool(finished and started and finished >= started)
-
-    # Progress calculation (dynamic total)
-    if is_finished:
-        pct = 100.0
-    elif max_seen > 0:
-        # Estimate: highest id seen + buffer for trailing IDs
-        est_total = max_seen + 500
-        pct = min(95.0, (scanned / max(1, est_total)) * 100)
-    else:
-        pct = min(30.0, (scanned / 500) * 30.0)
-
-    # Progress bar uses INDEXING mode (red → green)
-    bar = P.bar(pct, "indexing", width=14, show_percent=False)
-
-    # Elapsed
+    elapsed_str = "—"
     if started:
-        elapsed = (finished or time.time()) - started
-        elapsed_str = FM.duration_short(elapsed)
+        elapsed_str = FM.duration_short(time.time() - started)
+
+    # Progress %
+    if max_seen > 0:
+        pct = min(95.0, (scanned / max(1, max_seen + 500)) * 100)
+    elif scanned > 0:
+        pct = min(60.0, (scanned / 1000) * 60.0)
     else:
-        elapsed_str = "—"
+        pct = 0.0
+
+    bar = P.bar(pct, "indexing", width=14, show_percent=False)
 
     return [
         F.DIV_S,
         f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
         F.DIV_S, "",
-        f"<code>{bar}</code> {pct:.1f}%",
+        f"<code>{bar}</code> {pct:.0f}%",
         "",
         f"📡 {F.sc('channel')} · "
         f"<code>{str(w.get('channel_title', '?'))[:30]}</code>",
@@ -334,6 +287,150 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"⏱️ {F.sc('eta')} · <b>{w.get('eta_text', '—')}</b>",
         "",
     ]
+
+
+# ============================================================
+# REPORT PANEL (finished — 100% full green bar)
+# ============================================================
+
+async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    saved = int(w.get("saved", 0))
+    dup = int(w.get("duplicate_id", 0))
+    skipped = int(w.get("skipped_no_media", 0))
+    failed = int(w.get("failed", 0))
+    movies = int(w.get("movies", 0))
+    series = int(w.get("series", 0))
+    processed = int(w.get("processed", 0))
+    scanned = int(w.get("scanned_ids", 0))
+
+    started = w.get("started_at") or 0
+    finished = w.get("finished_at") or time.time()
+    duration = 0
+    if started:
+        duration = int(finished - started)
+
+    # 100% full GREEN bar (indexing mode = 🟩 at 100)
+    bar = P.bar(100, "indexing", width=14, show_percent=False)
+
+    total_files = saved + dup + failed
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"✅ <b>{F.fb('INDEXING REPORT')}</b>",
+        F.DIV, "",
+        f"<code>{bar}</code> 100%",
+        "",
+        f"📡 {F.sc('channel')} · "
+        f"<code>{str(w.get('channel_title', '?'))[:40]}</code>",
+        f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
+        f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
+        f"⏱️ {F.sc('duration')} · <b>{FM.duration_short(duration)}</b>",
+        "",
+        F.DIV_S,
+        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
+        f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
+        "",
+        F.DIV_S,
+        f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
+        f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+        f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
+        f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
+        "",
+        f"📁 {F.sc('total files')} · <b>{FM.num(total_files)}</b>",
+        "",
+        F.DIV_S,
+        f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
+        f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
+        "",
+        F.DIV,
+        f"🕒 <code>{FM.datetime_()}</code>",
+    ]
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"✅ {F.sc('completed')}",
+            callback_data=f"{PFX}:noop",
+        )],
+        [InlineKeyboardButton(
+            f"{F.EMO['play']} {F.sc('start new job')}",
+            callback_data=f"{PFX}:start",
+        )],
+        [
+            InlineKeyboardButton(
+                f"🧾 {F.sc('history')}",
+                callback_data=f"{PFX}:history",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data=f"{PFX}:close",
+            ),
+        ],
+    ])
+
+    return "\n".join(lines)[:4000], kb
+
+
+# ============================================================
+# IDLE PANEL (fresh — no active job)
+# ============================================================
+
+async def _build_idle_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    auto_mode = await _get_auto_mode()
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📚 <b>{F.fb('INDEXING CONTROL CENTER')}</b>",
+        F.DIV, "",
+        f"⚪ <b>{F.sc('idle')}</b>",
+        f"🎯 {F.sc('auto mode')} · "
+        f"{'🟢 ' + F.sc('on') if auto_mode else '🔴 ' + F.sc('off')}",
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('no active job')}",
+        f"📌 {F.sc('tap start new job to begin')}",
+        "",
+        f"🕒 <code>{FM.datetime_()}</code>",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"{F.EMO['play']} {F.sc('start new job')}",
+            callback_data=f"{PFX}:start",
+        )],
+        [
+            InlineKeyboardButton(
+                f"📢 {F.sc('channels')}",
+                callback_data=f"{PFX}:channels",
+            ),
+            InlineKeyboardButton(
+                f"🧾 {F.sc('history')}",
+                callback_data=f"{PFX}:history",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🎯 {F.sc('auto')} · {'🟢' if auto_mode else '🔴'}",
+                callback_data=f"{PFX}:toggle_auto",
+            ),
+            InlineKeyboardButton(
+                f"🧹 {F.sc('duplicates')}",
+                callback_data=f"{PFX}:duplicates",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data=f"{PFX}:refresh",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data=f"{PFX}:close",
+            ),
+        ],
+    ]
+
+    return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
+
 
 # ============================================================
 # STEP 1/6 — CHANNEL
@@ -739,74 +836,6 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
 
     return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
 
-async def _build_summary_panel() -> Tuple[str, InlineKeyboardMarkup]:
-    """Final summary after a job completes."""
-    w = {}
-    try:
-        from plugins.indexing import worker as WK
-        w = WK.status()
-    except Exception:
-        pass
-
-    saved = int(w.get("saved", 0))
-    dup = int(w.get("duplicate_id", 0))
-    skipped = int(w.get("skipped_no_media", 0))
-    failed = int(w.get("failed", 0))
-    movies = int(w.get("movies", 0))
-    series = int(w.get("series", 0))
-    processed = int(w.get("processed", 0))
-    scanned = int(w.get("scanned_ids", 0))
-
-    started = w.get("started_at") or 0
-    duration = 0
-    if started:
-        duration = int(time.time() - started)
-
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"✅ <b>{F.fb('INDEXING SUMMARY')}</b>",
-        F.DIV, "",
-        f"📡 {F.sc('channel')} · "
-        f"<code>{str(w.get('channel_title', '?'))[:40]}</code>",
-        f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
-        f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
-        f"⏱️ {F.sc('duration')} · <b>{FM.duration_short(duration)}</b>",
-        "",
-        F.DIV_S,
-        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
-        f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
-        "",
-        f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
-        f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
-        f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
-        f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
-        "",
-        f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
-        f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
-        "",
-        F.DIV,
-        f"🕒 <code>{FM.datetime_()}</code>",
-    ]
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{F.EMO['play']} {F.sc('start new job')}",
-            callback_data=f"{PFX}:start",
-        )],
-        [
-            InlineKeyboardButton(
-                f"{F.EMO['back']} {F.sc('back to panel')}",
-                callback_data=f"{PFX}:back",
-            ),
-            InlineKeyboardButton(
-                f"{F.EMO['cross']} {F.sc('close')}",
-                callback_data=f"{PFX}:close",
-            ),
-        ],
-    ])
-
-    return "\n".join(lines)[:4000], kb
-
 
 # ============================================================
 # HISTORY / DATABASES / DUPLICATES
@@ -877,17 +906,14 @@ async def _build_databases() -> Tuple[str, InlineKeyboardMarkup]:
         from database import db_registry
 
         snap = None
-        # Preferred: async snapshot()
         if hasattr(db_registry, "snapshot"):
             try:
                 snap = await db_registry.snapshot()
             except TypeError:
-                # some registries expose snapshot() sync
                 snap = db_registry.snapshot()
             except Exception as e:
                 logger.debug(f"[INDEX] snapshot(): {e}")
 
-        # Fallback: build minimal view from media_entries()
         if not snap and hasattr(db_registry, "media_entries"):
             try:
                 entries = list(db_registry.media_entries())
@@ -1319,16 +1345,12 @@ async def router_handler(client: Client, q: CallbackQuery):
             except Exception:
                 pass
 
-            text, kb = await _build_summary_panel()
+            text, kb = await _build_report_panel(
+                _safe_worker_status()
+            )
             await _safe_edit(q, text, kb)
-            _register_panel(q.message.id, q.message.chat.id, "summary", text)
+            _register_panel(q.message.id, q.message.chat.id, "main", text)
             return
-
-        # ── SUMMARY (manual view) ──
-        if action == "summary":
-            text, kb = await _build_summary_panel()
-            await _safe_edit(q, text, kb)
-            return await q.answer()
 
         if action == "stop":
             try:
@@ -1341,7 +1363,6 @@ async def router_handler(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
-    
         if action == "history":
             text, kb = await _build_history()
             await _safe_edit(q, text, kb)
@@ -1477,7 +1498,6 @@ async def indexing_text_input(client: Client, message: Message):
 # SAVE DEFAULT
 # ============================================================
 
-# Only these keys are reusable across jobs
 _DEFAULT_KEYS = (
     "mode",
     "metadata_source",
@@ -1554,7 +1574,6 @@ async def _auto_refresh_loop() -> None:
                 chat_id = panel["chat_id"]
                 iv = _live_intervals.get(chat_id, DEFAULT_LIVE)
 
-                # Time to refresh?
                 if now - last_refresh.get(msg_id, 0) < iv:
                     continue
                 last_refresh[msg_id] = now
@@ -1585,9 +1604,18 @@ async def _auto_refresh_loop() -> None:
         except Exception:
             pass
 
+
 # ============================================================
 # HELPERS
 # ============================================================
+
+def _safe_worker_status() -> Dict[str, Any]:
+    try:
+        from plugins.indexing import worker as WK
+        return WK.status()
+    except Exception:
+        return {}
+
 
 async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
     try:
@@ -1615,13 +1643,10 @@ async def open_panel_for_admin(client: Client, message: Message) -> None:
 def snapshot() -> Dict[str, Any]:
     return {"panels": len(_panels), "pending_steps": len(_steps)}
 
+
 # ============================================================
-# SECTION 13 — FORWARD DETECTION (continues the wizard)
+# FORWARD DETECTION (continues the wizard)
 # ============================================================
-#
-# When the wizard reaches step="channel_forward", these handlers
-# catch a forwarded message (or bare media) and advance the flow
-# to the "mode" step.
 
 @Client.on_message(
     filters.private
@@ -1630,9 +1655,7 @@ def snapshot() -> Dict[str, Any]:
     group=-8199,
 )
 async def idx_forward_handler(client: Client, message: Message):
-    """
-    User forwarded a message from a channel → register it → step 2.
-    """
+    """User forwarded a message from a channel → register it → step 2."""
     if not message.from_user or not _is_admin(message.from_user.id):
         return
 
@@ -1640,7 +1663,6 @@ async def idx_forward_handler(client: Client, message: Message):
     if not s or s.get("step") != "channel_forward":
         return
 
-    # Extract source
     fwd_chat = getattr(message, "forward_from_chat", None)
     if not fwd_chat:
         return await message.reply_text(
@@ -1657,7 +1679,6 @@ async def idx_forward_handler(client: Client, message: Message):
     title = getattr(fwd_chat, "title", None) or str(channel_id)
     username = getattr(fwd_chat, "username", "") or ""
 
-    # Register in the indexing_channels collection
     try:
         from plugins.indexing import backward as BW
         await BW.register_channel(
@@ -1670,7 +1691,6 @@ async def idx_forward_handler(client: Client, message: Message):
     except Exception as e:
         logger.debug(f"[INDEX] register on forward: {e}")
 
-    # Update wizard state → move to mode step
     _set_step(message.from_user.id, "mode", channel_id=channel_id)
 
     txt, kb = await _build_step_mode()
@@ -1680,7 +1700,6 @@ async def idx_forward_handler(client: Client, message: Message):
         disable_web_page_preview=True,
     )
 
-    # Confirm receipt
     try:
         await message.reply_text(
             f"{F.EMO['check']} <b>Channel registered</b>\n"
@@ -1704,10 +1723,7 @@ async def idx_forward_handler(client: Client, message: Message):
     group=-8199,
 )
 async def idx_media_handler(client: Client, message: Message):
-    """
-    User sent a bare media file (not forwarded).
-    Treat its own chat as the channel.
-    """
+    """User sent a bare media file (not forwarded)."""
     if not message.from_user or not _is_admin(message.from_user.id):
         return
 
@@ -1730,8 +1746,7 @@ async def idx_media_handler(client: Client, message: Message):
     except Exception as e:
         logger.debug(f"[INDEX] register on media: {e}")
 
-    _update_step(message.from_user.id, channel_id=channel_id)
-    _steps[message.from_user.id]["step"] = "mode"
+    _set_step(message.from_user.id, "mode", channel_id=channel_id)
 
     txt, kb = await _build_step_mode()
     await message.reply_text(
