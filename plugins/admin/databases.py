@@ -1,12 +1,12 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — DB BROWSER
+# 🏨 DOWNTOWN VILLA — DATABASE CONTROL CENTER (v1 layout, v2 colors)
 # ============================================================
 #
-# Live view of every shard across every pool.
-# Full control: clear shard, clear pool, clear ALL, delete doc.
+# Layout: v1 (categories / per-db / collections / docs / indexes /
+#         health / perf / audit / errors / dupes / clear / live)
+# Colors: v2 (utils/progress.py — storage bar green→red)
 #
-# Every destructive action is 3-step confirmed.
-# Every panel has ❌ Cancel button.
+# Callback prefix: adm:dbc_*
 #
 # ============================================================
 
@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
 from core import config
+from database import db_registry
 from utils import fonts as F
 from utils import format as FM
 from utils import progress as P
@@ -32,788 +36,1989 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# SECTION 1 — CONFIRMATION STORE
+# SECTION 1 — AUTH
 # ============================================================
 
-# token → {kind, pool, index, step, created, expires}
-_confirms: Dict[str, Dict[str, Any]] = {}
-
-CONFIRM_TTL = 120.0
-
-
-def _new_confirm(kind: str, **kwargs) -> str:
-    token = f"{kind[:3]}{int(time.time())}{id(kwargs) % 100000:05d}"
-    _confirms[token] = {
-        "kind": kind,
-        "step": 1,
-        "created": time.time(),
-        "expires": time.time() + CONFIRM_TTL,
-        **kwargs,
-    }
-    return token
-
-
-def _get_confirm(token: str) -> Optional[Dict[str, Any]]:
-    c = _confirms.get(token)
-    if not c:
-        return None
-    if time.time() > c["expires"]:
-        _confirms.pop(token, None)
-        return None
-    return c
-
-
-def _advance_confirm(token: str) -> Optional[Dict[str, Any]]:
-    c = _get_confirm(token)
-    if not c:
-        return None
-    c["step"] += 1
-    c["expires"] = time.time() + CONFIRM_TTL
-    return c
-
-
-def _drop_confirm(token: str) -> None:
-    _confirms.pop(token, None)
-
-
-def _cleanup_confirms() -> None:
-    now = time.time()
-    for t in list(_confirms.keys()):
-        if _confirms[t]["expires"] < now:
-            _confirms.pop(t, None)
-
-
-# ============================================================
-# SECTION 2 — DB ACCESS
-# ============================================================
-
-def _db_manager():
+def _is_admin(uid) -> bool:
     try:
-        from database import db_manager as _m
-        return _m
+        return int(uid) in [int(a) for a in config.ADMINS]
     except Exception:
-        return None
-
-
-async def _list_collections(entry) -> List[Tuple[str, int]]:
-    """Return [(collection_name, doc_count)] for one shard."""
-    out: List[Tuple[str, int]] = []
-    try:
-        names = await entry.db.list_collection_names()
-        for name in sorted(names):
-            try:
-                count = await entry.db[name].count_documents({})
-                out.append((name, count))
-            except Exception:
-                out.append((name, -1))
-    except Exception as e:
-        logger.debug(f"[DB-PANEL] list collections: {e}")
-    return out
-
-
-async def _shard_capacity(entry) -> Tuple[float, float]:
-    """Return (used_mb, threshold_mb) for one shard."""
-    cfg = _pool_config(entry.pool)
-    threshold = cfg["threshold_mb"]
-    try:
-        stats = await entry.db.command("dbStats")
-        used = ((stats.get("storageSize", 0) or 0)
-                + (stats.get("indexSize", 0) or 0))
-        used_mb = used / (1024 * 1024)
-        return used_mb, threshold
-    except Exception:
-        return 0.0, threshold
-
-
-def _pool_config(pool: str) -> Dict[str, Any]:
-    """Return threshold and label for a pool."""
-    thresholds = {
-        "system": 100,
-        "user": 200,
-        "media": 400,
-        "backup": 400,
-    }
-    prefix = pool.upper()
-    threshold = config.env_int(
-        f"{prefix}_THRESHOLD_MB",
-        thresholds.get(pool, 400),
-    )
-    return {"threshold_mb": max(50, threshold)}
+        return False
 
 
 # ============================================================
-# SECTION 3 — INDEX PAGE
+# SECTION 2 — CONSTANTS
 # ============================================================
 
-async def build_index() -> Tuple[str, InlineKeyboardMarkup]:
-    """
-    Main DB browser page — all 4 pools.
-    """
-    mgr = _db_manager()
-    if mgr is None:
-        return _offline_page()
+IST = timezone(timedelta(hours=5, minutes=30))
+BAR_W = 14
+CACHE_TTL = 8
+LIVE_DEFAULT = 3
+LIVE_OPTIONS = [3, 5, 10, 30]
+RECENT_LIMITS = [5, 10, 20]
+COLL_PAGE = 20
+MAX_LAT = 30
 
-    lines: List[str] = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['db']} <b>{F.fb('DATABASE BROWSER')}</b>",
-        F.DIV,
-        "",
-    ]
+DIV = F.DIV
+DIV_S = F.DIV_S
 
-    # Count summary
-    total_shards = 0
-    total_online = 0
-    total_used = 0.0
+try:
+    DB_CAPACITY_MB = int(getattr(config, "DB_CAPACITY_MB", 512))
+except (TypeError, ValueError):
+    DB_CAPACITY_MB = 512
 
-    pool_data: Dict[str, Dict[str, Any]] = {}
+_SENSITIVE = re.compile(
+    r"(token|password|secret|api[_-]?key|api[_-]?hash|session|uri|database_uri|dsn|auth)",
+    re.IGNORECASE,
+)
+_URI_PAT = re.compile(r"mongodb(\+srv)?://[^\s'\"]+", re.IGNORECASE)
 
-    for pool_name in ("system", "user", "media", "backup"):
-        entries = mgr.entries(pool_name)
-        online = [e for e in entries if e.online]
-        used_mb_total = 0.0
-        for e in online:
-            used, _ = await _shard_capacity(e)
-            used_mb_total += used
-        pool_data[pool_name] = {
-            "total": len(entries),
-            "online": len(online),
-            "used_mb": used_mb_total,
+
+# ============================================================
+# SECTION 3 — HELPERS
+# ============================================================
+
+def now_ist() -> str:
+    return datetime.now(IST).strftime("%I:%M:%S %p IST")
+
+
+def esc(s: Any) -> str:
+    if s is None:
+        return ""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def redact(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {
+            k: ("🔐 [REDACTED]" if _SENSITIVE.search(str(k)) else redact(val))
+            for k, val in v.items()
         }
-        total_shards += len(entries)
-        total_online += len(online)
-        total_used += used_mb_total
+    if isinstance(v, list):
+        return [redact(x) for x in v]
+    if isinstance(v, str):
+        return _URI_PAT.sub("mongodb://[REDACTED]", v)
+    return v
 
-    # Header stats
-    lines.append(
-        f"{F.EMO['check']} {F.sc('online')} · "
-        f"<b>{total_online}</b> / {total_shards}"
-    )
-    lines.append(
-        f"{F.EMO['storage']} {F.sc('total used')} · "
-        f"<b>{FM.size(total_used * 1024 * 1024)}</b>"
-    )
-    lines.append(
-        f"{F.EMO['clock']} <code>{FM.datetime_()}</code>"
-    )
-    lines.append("")
 
-    # Pools overview
-    pool_meta = {
-        "system": ("⚙️", "System", "cache · state · sessions · flows"),
-        "user":   ("👤", "User",   "users · groups · premium"),
-        "media":  ("🎬", "Media",  "media files"),
-        "backup": ("💾", "Backup", "backup state · runs"),
-    }
+def summarize_doc(doc: Dict[str, Any], maxf: int = 12, maxl: int = 100) -> str:
+    safe = redact(doc)
+    out = []
+    for i, (k, v) in enumerate(safe.items()):
+        if i >= maxf:
+            out.append(f"  <i>… {F.sc('truncated')}</i>")
+            break
+        sval = str(v)
+        if len(sval) > maxl:
+            sval = sval[: maxl - 1] + "…"
+        out.append(f"  <b>{esc(k)}</b> : <code>{esc(sval)}</code>")
+    return "\n".join(out)
 
-    for pool_name, (icon, name, desc) in pool_meta.items():
-        info = pool_data[pool_name]
-        if info["total"] == 0:
-            status = "⚪"
-        elif info["online"] == info["total"]:
-            status = "🟢"
-        elif info["online"] == 0:
-            status = "🔴"
+
+def bar_line(label: str, pct_val: float, width: int = BAR_W) -> str:
+    """v2 colored bar: single color + ⬛ empties."""
+    color = P.storage_color(pct_val)
+    bar = P.bar(pct_val, "storage", width=width, show_percent=False)
+    return (
+        f"{color} <b>{F.sc(label)}</b> · <code>{pct_val:.1f}%</code>\n"
+        f"<code>{bar}</code>"
+    )
+
+
+def one_line(label: str, value: str, icon: str = "•") -> str:
+    return f"{icon} {F.sc(label)} · <code>{value}</code>"
+
+
+# ============================================================
+# SECTION 4 — CACHE
+# ============================================================
+
+class _Cache:
+    def __init__(self, ttl: int = CACHE_TTL):
+        self.ttl = ttl
+        self._d: Dict[str, Tuple[float, Any]] = {}
+
+    def get(self, k: str):
+        e = self._d.get(k)
+        if not e:
+            return None
+        if time.time() - e[0] > self.ttl:
+            self._d.pop(k, None)
+            return None
+        return e[1]
+
+    def set(self, k: str, v: Any):
+        self._d[k] = (time.time(), v)
+
+    def invalidate(self, k: Optional[str] = None):
+        if k is None:
+            self._d.clear()
         else:
-            status = "🟡"
-
-        lines.append(
-            f"{status} {icon} <b>{F.sc(name)}</b> · "
-            f"<code>{info['online']}/{info['total']}</code> "
-            f"· {FM.size(info['used_mb'] * 1024 * 1024)}"
-        )
-        lines.append(f"   <i>{F.sc(desc)}</i>")
-        lines.append("")
-
-    lines.append(F.DIV_S)
-    lines.append(f"📌 {F.sc('tap a pool to see shards')}")
-    lines.append(f"📌 {F.sc('every action is live')}")
-
-    # Keyboard
-    rows: List[List[InlineKeyboardButton]] = []
-
-    # Pool buttons
-    for pool_name, (icon, name, _) in pool_meta.items():
-        info = pool_data[pool_name]
-        rows.append([InlineKeyboardButton(
-            f"{icon} {name.upper()} · "
-            f"{info['online']}/{info['total']} shards",
-            callback_data=f"adm:db_pool:{pool_name}",
-        )])
-
-    # Nuke row
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['warn']} {F.sc('NUKE ALL DATA')}",
-            callback_data="adm:db_nuke_all",
-        ),
-    ])
-
-    # Nav row
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['refresh']} {F.sc('refresh')}",
-            callback_data="adm:page:databases",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="adm:home",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data="adm:close",
-        ),
-    ])
-
-    text = "\n".join(lines)[:4000]
-    return text, InlineKeyboardMarkup(rows)
+            self._d.pop(k, None)
 
 
-def _offline_page() -> Tuple[str, InlineKeyboardMarkup]:
-    text = "\n".join([
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['db']} <b>{F.fb('DATABASE BROWSER')}</b>",
-        F.DIV,
-        "",
-        f"{F.EMO['cross']} <b>{F.fb('DATABASE MANAGER NOT FOUND')}</b>",
-        "",
-        f"📌 {F.sc('check your config')}",
-    ])
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="adm:home",
-        ),
-    ]])
-    return text, kb
+cache = _Cache()
 
 
 # ============================================================
-# SECTION 4 — POOL PAGE
+# SECTION 5 — ERROR BUFFER
 # ============================================================
 
-async def build_pool(pool: str) -> Tuple[str, InlineKeyboardMarkup]:
-    """Show all shards in one pool with capacity bars."""
-    mgr = _db_manager()
-    if mgr is None:
-        return _offline_page()
+class _Errors:
+    def __init__(self, maxlen: int = 50):
+        self._q: deque = deque(maxlen=maxlen)
 
-    entries = mgr.entries(pool)
-    if not entries:
-        text = "\n".join([
-            f"{F.EMO['db']} <b>{F.fb(pool.upper())}</b>",
-            F.DIV,
-            "",
-            f"{F.EMO['cross']} {F.sc('no shards configured')}",
-        ])
-        return text, _back_only_kb()
+    def record(self, src: str, err: str):
+        safe = _URI_PAT.sub("mongodb://[REDACTED]", str(err))
+        self._q.append({"ts": now_ist(), "src": src, "err": safe[:280]})
 
-    pool_meta = {
-        "system": ("⚙️", "System"),
-        "user":   ("👤", "User"),
-        "media":  ("🎬", "Media"),
-        "backup": ("💾", "Backup"),
-    }
-    icon, name = pool_meta.get(pool, ("📦", pool.title()))
+    def recent(self, n: int = 20):
+        return list(self._q)[-n:][::-1]
 
-    lines: List[str] = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{icon} <b>{F.fb(f'{name.upper()} POOL')}</b>",
-        F.DIV,
-        "",
-    ]
 
-    total_docs = 0
-    total_used = 0.0
+errors = _Errors()
 
-    shard_rows: List[Dict[str, Any]] = []
-    for entry in entries:
-        if not entry.online:
-            shard_rows.append({
-                "entry": entry,
-                "online": False,
-                "used_mb": 0.0,
-                "threshold": _pool_config(pool)["threshold_mb"],
-                "docs": 0,
-            })
-            continue
 
-        used_mb, threshold = await _shard_capacity(entry)
-        docs = entry.stats.get("objects", 0)
-        total_docs += docs
-        total_used += used_mb
+# ============================================================
+# SECTION 6 — LATENCY TRACKER
+# ============================================================
 
-        shard_rows.append({
-            "entry": entry,
-            "online": True,
-            "used_mb": used_mb,
-            "threshold": threshold,
-            "docs": docs,
+class _Latency:
+    def __init__(self, maxlen: int = MAX_LAT):
+        self._d: Dict[str, deque] = {}
+        self._m = maxlen
+
+    def record(self, key: str, ms: Optional[float]):
+        if ms is None:
+            return
+        self._d.setdefault(key, deque(maxlen=self._m)).append(round(ms, 1))
+
+    def stats(self, key: str) -> Dict[str, Any]:
+        d = list(self._d.get(key, []))
+        if not d:
+            return {"cur": None, "avg": None, "min": None, "max": None}
+        return {
+            "cur": d[-1],
+            "avg": round(sum(d) / len(d), 1),
+            "min": min(d),
+            "max": max(d),
+        }
+
+
+latency = _Latency()
+
+
+# ============================================================
+# SECTION 7 — AUDIT LOG
+# ============================================================
+
+class _Audit:
+    def __init__(self, maxlen: int = 200):
+        self._q: deque = deque(maxlen=maxlen)
+
+    def log(self, admin: int, action: str, target: str = "-",
+            result: str = "-", extra: str = ""):
+        self._q.append({
+            "ts": now_ist(), "admin": admin, "action": action,
+            "target": target, "result": result, "extra": extra,
         })
+        logger.info(f"[AUDIT] admin={admin} action={action} target={target}")
 
-    lines.append(
-        f"{F.EMO['package']} {F.sc('shards')} · "
-        f"<b>{len(entries)}</b>"
-    )
-    lines.append(
-        f"{F.EMO['file']} {F.sc('total docs')} · "
-        f"<b>{FM.num(total_docs)}</b>"
-    )
-    lines.append(
-        f"{F.EMO['storage']} {F.sc('total used')} · "
-        f"<b>{FM.size(total_used * 1024 * 1024)}</b>"
-    )
-    lines.append("")
-    lines.append(F.DIV_S)
-    lines.append("")
+    def recent(self, n: int = 20):
+        return list(self._q)[-n:][::-1]
 
-    # Render each shard
-    for row in shard_rows:
-        entry = row["entry"]
-        if not row["online"]:
-            lines.append(
-                f"🔴 <b>{F.sc(entry.label)}</b> · "
-                f"<i>{F.sc('offline')}</i>"
-            )
-            lines.append("")
-            continue
 
-        used = row["used_mb"]
-        threshold = row["threshold"]
-        pct = (used / threshold * 100) if threshold else 0.0
-
-        lines.append(
-            f"{P.storage_color(pct)} <b>{F.sc(entry.label)}</b>"
-        )
-        lines.append(
-            f"{P.bar(pct, 'storage', width=10)} "
-            f"· {used:.1f}/{threshold} MB"
-        )
-        lines.append(
-            f"{F.EMO['file']} {FM.num(row['docs'])} docs "
-            f"· {F.EMO['clock']} {entry.last_ping_ms:.0f}ms"
-        )
-        lines.append("")
-
-    # Keyboard
-    rows: List[List[InlineKeyboardButton]] = []
-    for row in shard_rows:
-        entry = row["entry"]
-        icon = "🟢" if row["online"] else "🔴"
-        rows.append([InlineKeyboardButton(
-            f"{icon} {entry.label}",
-            callback_data=f"adm:db_shard:{pool}:{entry.index}",
-        )])
-
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['warn']} {F.sc('CLEAR ENTIRE POOL')}",
-            callback_data=f"adm:db_clear_pool:{pool}",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['refresh']} {F.sc('refresh')}",
-            callback_data=f"adm:db_pool:{pool}",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="adm:page:databases",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data="adm:close",
-        ),
-    ])
-
-    text = "\n".join(lines)[:4000]
-    return text, InlineKeyboardMarkup(rows)
+audit = _Audit()
 
 
 # ============================================================
-# SECTION 5 — SHARD PAGE
+# SECTION 8 — DIAGNOSTICS
 # ============================================================
 
-async def build_shard(pool: str, index: int) -> Tuple[str, InlineKeyboardMarkup]:
-    """Show one shard's collections + counts + clear button."""
-    mgr = _db_manager()
-    if mgr is None:
-        return _offline_page()
+class Diagnostics:
 
-    entry = mgr.get(pool, index)
-    if entry is None:
-        return _not_found_page(f"shard {pool}/{index} not found")
-
-    if not entry.online:
-        text = "\n".join([
-            f"{F.EMO['cross']} <b>{F.fb('SHARD OFFLINE')}</b>",
-            F.DIV,
-            "",
-            f"🏷️ {entry.label}",
-            f"⚠️ {entry.error or 'unknown error'}",
-        ])
-        return text, _back_kb(f"adm:db_pool:{pool}")
-
-    used_mb, threshold = await _shard_capacity(entry)
-    pct = (used_mb / threshold * 100) if threshold else 0.0
-
-    collections = await _list_collections(entry)
-
-    lines: List[str] = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['folder']} <b>{F.fb(entry.label)}</b>",
-        F.DIV,
-        "",
-        f"{F.EMO['db']} {F.sc('pool')} · <code>{entry.pool}</code>",
-        f"{F.EMO['id']} {F.sc('index')} · <code>{entry.index}</code>",
-        f"{F.EMO['net']} {F.sc('ping')} · <b>{entry.last_ping_ms:.0f}ms</b>",
-        "",
-        f"{P.storage_color(pct)} <b>{F.sc('storage')}</b>",
-        f"<code>{P.bar(pct, 'storage', width=14)}</code>",
-        f"{used_mb:.1f} MB / {threshold} MB",
-        "",
-        F.DIV_S,
-        f"{F.EMO['folder']} <b>{F.sc('collections')}</b> · "
-        f"<b>{len(collections)}</b>",
-        F.DIV_S,
-        "",
-    ]
-
-    for name, count in collections[:20]:
-        count_str = FM.num(count) if count >= 0 else "?"
-        lines.append(f"• <code>{name}</code> · <b>{count_str}</b>")
-    if len(collections) > 20:
-        lines.append(f"<i>… +{len(collections) - 20} more</i>")
-
-    # Keyboard
-    rows: List[List[InlineKeyboardButton]] = []
-
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['warn']} {F.sc('CLEAR THIS SHARD')}",
-            callback_data=f"adm:db_clear_shard:{pool}:{index}",
-        ),
-    ])
-
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['refresh']} {F.sc('refresh')}",
-            callback_data=f"adm:db_shard:{pool}:{index}",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"adm:db_pool:{pool}",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data="adm:close",
-        ),
-    ])
-
-    text = "\n".join(lines)[:4000]
-    return text, InlineKeyboardMarkup(rows)
-
-
-# ============================================================
-# SECTION 6 — CONFIRMATION CARDS
-# ============================================================
-
-def build_clear_shard_confirm(pool: str, index: int, step: int) -> Tuple[str, InlineKeyboardMarkup]:
-    """3-step confirmation for clearing a shard."""
-    titles = {
-        1: "⚠️ STEP 1/3 — CLEAR SHARD",
-        2: "🚨 STEP 2/3 — FINAL WARNING",
-        3: "☢️ STEP 3/3 — PERMANENT DELETE",
-    }
-    prompts = {
-        1: "This will remove ALL data from this shard.",
-        2: "This CANNOT be undone.",
-        3: "Tap YES to permanently delete everything.",
-    }
-
-    title = titles.get(step, "STEP")
-    prompt = prompts.get(step, "")
-
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"<b>{F.fb(title)}</b>",
-        F.DIV,
-        "",
-        f"🎯 {F.sc('target')} · <code>{pool}/{index}</code>",
-        "",
-        f"{F.EMO['warn']} <b>{F.sc(prompt)}</b>",
-        "",
-        F.DIV_S,
-        f"📌 {F.sc('step')} · <b>{step}</b> / 3",
-    ]
-
-    token = _new_confirm("shard", pool=pool, index=index, step=step)
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{F.EMO['warn']} {F.sc('continue')}",
-            callback_data=f"adm:db_confirm:{token}",
-        )],
-        [InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data=f"adm:db_cancel:{token}",
-        )],
-    ])
-
-    text = "\n".join(lines)[:4000]
-    return text, kb
-
-
-def build_clear_pool_confirm(pool: str, step: int) -> Tuple[str, InlineKeyboardMarkup]:
-    titles = {
-        1: "⚠️ STEP 1/3 — CLEAR POOL",
-        2: "🚨 STEP 2/3 — FINAL WARNING",
-        3: "☢️ STEP 3/3 — PERMANENT DELETE",
-    }
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"<b>{F.fb(titles.get(step, 'STEP'))}</b>",
-        F.DIV,
-        "",
-        f"🎯 {F.sc('pool')} · <code>{pool}</code>",
-        f"{F.EMO['db']} {F.sc('ALL shards in this pool')}",
-        "",
-        f"{F.EMO['warn']} <b>{F.sc('this wipes every shard')}</b>",
-        "",
-        F.DIV_S,
-        f"📌 {F.sc('step')} · <b>{step}</b> / 3",
-    ]
-
-    token = _new_confirm("pool", pool=pool, step=step)
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{F.EMO['warn']} {F.sc('continue')}",
-            callback_data=f"adm:db_confirm:{token}",
-        )],
-        [InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data=f"adm:db_cancel:{token}",
-        )],
-    ])
-
-    text = "\n".join(lines)[:4000]
-    return text, kb
-
-
-def build_nuke_all_confirm(step: int) -> Tuple[str, InlineKeyboardMarkup]:
-    """10-step escalation for the ultimate nuke."""
-    if step >= 10:
-        title = "💀 FINAL CONFIRMATION — TYPE OR TAP"
-        prompt = "This will wipe EVERY pool, EVERY shard, EVERYTHING."
-    elif step >= 7:
-        title = f"☢️ STEP {step}/10 — EXTREME DANGER"
-        prompt = "You are about to nuke the entire bot database."
-    elif step >= 4:
-        title = f"🚨 STEP {step}/10 — WARNING"
-        prompt = "All shards will be emptied."
-    else:
-        title = f"⚠️ STEP {step}/10 — CONFIRM"
-        prompt = "This is the ultimate destructive action."
-
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"<b>{F.fb(title)}</b>",
-        F.DIV,
-        "",
-        f"🎯 {F.sc('target')} · <b>ALL POOLS</b>",
-        "",
-        f"{F.EMO['warn']} <b>{F.sc(prompt)}</b>",
-        "",
-        F.DIV_S,
-        f"📌 {F.sc('step')} · <b>{step}</b> / 10",
-    ]
-
-    token = _new_confirm("nuke", step=step)
-
-    label = (
-        f"💀 {F.sc('FINAL — WIPE EVERYTHING')}"
-        if step >= 10 else
-        f"{F.EMO['warn']} {F.sc('continue')}"
-    )
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            label,
-            callback_data=f"adm:db_confirm:{token}",
-        )],
-        [InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data=f"adm:db_cancel:{token}",
-        )],
-    ])
-
-    text = "\n".join(lines)[:4000]
-    return text, kb
-
-
-# ============================================================
-# SECTION 7 — ACTION EXECUTORS
-# ============================================================
-
-async def do_clear_shard(pool: str, index: int) -> Dict[str, Any]:
-    """Execute shard wipe."""
-    mgr = _db_manager()
-    if mgr is None:
-        return {"ok": False, "reason": "no manager"}
-    try:
-        return await mgr.clear_shard(pool, index)
-    except Exception as e:
-        logger.exception(f"[DB-PANEL] clear_shard: {e}")
-        return {"ok": False, "reason": str(e)}
-
-
-async def do_clear_pool(pool: str) -> Dict[str, Any]:
-    """Execute pool wipe."""
-    mgr = _db_manager()
-    if mgr is None:
-        return {"ok": False, "reason": "no manager"}
-    try:
-        return await mgr.clear_pool(pool)
-    except Exception as e:
-        logger.exception(f"[DB-PANEL] clear_pool: {e}")
-        return {"ok": False, "reason": str(e)}
-
-
-async def do_nuke_all() -> Dict[str, Any]:
-    """Execute ALL pool wipe — the ultimate."""
-    mgr = _db_manager()
-    if mgr is None:
-        return {"ok": False, "reason": "no manager"}
-    out = {"pools": {}, "total": 0, "ok": True}
-    for pool in ("system", "user", "media", "backup"):
+    @staticmethod
+    async def ping(db) -> Optional[float]:
         try:
-            r = await mgr.clear_pool(pool)
-            out["pools"][pool] = r.get("total_deleted", 0)
-            out["total"] += r.get("total_deleted", 0)
+            t0 = time.time()
+            await db.command("ping")
+            return (time.time() - t0) * 1000.0
         except Exception as e:
-            out["pools"][pool] = f"error: {e}"
-            out["ok"] = False
-    logger.warning(f"[DB-PANEL] NUKE ALL — {out['total']} docs deleted")
-    return out
+            errors.record("ping", str(e))
+            return None
+
+    @staticmethod
+    async def db_stats(db) -> Optional[Dict[str, Any]]:
+        try:
+            return await db.command("dbStats")
+        except Exception as e:
+            errors.record("dbStats", str(e))
+            return None
+
+    @staticmethod
+    async def coll_stats(db, name: str) -> Optional[Dict[str, Any]]:
+        try:
+            return await db.command("collStats", name)
+        except Exception as e:
+            errors.record(f"collStats:{name}", str(e))
+            return None
+
+    @staticmethod
+    async def list_collections(db) -> List[str]:
+        try:
+            return sorted(await db.list_collection_names())
+        except Exception as e:
+            errors.record("listCollections", str(e))
+            return []
+
+    @staticmethod
+    async def build_version(db) -> Optional[str]:
+        try:
+            return (await db.command("buildInfo")).get("version")
+        except Exception:
+            return None
+
+    @staticmethod
+    async def list_indexes(db, coll: str) -> List[Dict[str, Any]]:
+        try:
+            out = []
+            async for ix in db[coll].list_indexes():
+                out.append(ix)
+            return out
+        except Exception as e:
+            errors.record(f"listIndexes:{coll}", str(e))
+            return []
+
+    @staticmethod
+    async def sample(db, coll: str, limit: int = 5) -> List[Dict[str, Any]]:
+        try:
+            return await db[coll].find({}).limit(limit).to_list(length=limit)
+        except Exception as e:
+            errors.record(f"sample:{coll}", str(e))
+            return []
 
 
 # ============================================================
-# SECTION 8 — RESULT CARDS
+# SECTION 9 — STATS MANAGER
 # ============================================================
 
-def build_result_card(title: str, result: Dict[str, Any], back_cb: str) -> Tuple[str, InlineKeyboardMarkup]:
+class StatsManager:
+
+    def _entries(self, cat: str) -> List:
+        try:
+            if cat == "system":
+                return db_registry.system_entries()
+            if cat == "user":
+                return db_registry.user_entries()
+            if cat == "media":
+                return db_registry.media_entries()
+        except Exception:
+            pass
+        return []
+
+    def _find_entry(self, cat: str, index: int):
+        for e in self._entries(cat):
+            if e.index == index:
+                return e
+        return None
+
+    async def db_info(self, cat: str, index: int) -> Optional[Dict[str, Any]]:
+        e = self._find_entry(cat, index)
+        if not e:
+            return None
+        return await self._gather(cat, e)
+
+    async def category(self, cat: str) -> Dict[str, Any]:
+        key = f"cat:{cat}"
+        cached = cache.get(key)
+        if cached:
+            return cached
+        entries = self._entries(cat)
+        results = await asyncio.gather(*[self._gather(cat, e) for e in entries])
+        totals = self._totals(results)
+        data = {
+            "items": results,
+            "totals": totals,
+            "updated": now_ist(),
+            "count": len(results),
+            "category": cat,
+        }
+        cache.set(key, data)
+        return data
+
+    async def overall(self) -> Dict[str, Any]:
+        cached = cache.get("overall")
+        if cached:
+            return cached
+        s, u, m = await asyncio.gather(
+            self.category("system"),
+            self.category("user"),
+            self.category("media"),
+        )
+        overall_totals = self._merge([
+            s["totals"], u["totals"], m["totals"],
+        ])
+        data = {
+            "system": s, "user": u, "media": m,
+            "totals": overall_totals,
+            "count": s["count"] + u["count"] + m["count"],
+            "updated": now_ist(),
+        }
+        cache.set("overall", data)
+        return data
+
+    async def _gather(self, cat: str, entry) -> Dict[str, Any]:
+        db = entry.db
+        out = {
+            "cat": cat, "index": entry.index, "label": entry.label,
+            "online": False, "ping_ms": None, "version": None,
+            "collections": 0, "objects": 0,
+            "data_size": 0, "storage_size": 0, "index_size": 0,
+            "avg_obj": 0, "collection_names": [],
+        }
+        p = await Diagnostics.ping(db)
+        if p is None:
+            return out
+        out["online"] = True
+        out["ping_ms"] = round(p, 1)
+        latency.record(f"{cat}:{entry.label}", p)
+
+        st = await Diagnostics.db_stats(db)
+        if st:
+            out["collections"] = st.get("collections", 0)
+            out["objects"] = st.get("objects", 0)
+            out["data_size"] = st.get("dataSize", 0)
+            out["storage_size"] = st.get("storageSize", 0)
+            out["index_size"] = st.get("indexSize", 0)
+            out["avg_obj"] = st.get("avgObjSize", 0) or 0
+
+        out["collection_names"] = await Diagnostics.list_collections(db)
+        out["version"] = await Diagnostics.build_version(db)
+        return out
+
+    def _totals(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
+        t = {"objects": 0, "data_size": 0, "storage_size": 0,
+             "index_size": 0, "collections": 0}
+        for i in items:
+            if not i["online"]:
+                continue
+            t["objects"] += i["objects"]
+            t["data_size"] += i["data_size"]
+            t["storage_size"] += i["storage_size"]
+            t["index_size"] += i["index_size"]
+            t["collections"] += i["collections"]
+        return t
+
+    def _merge(self, totals: List[Dict[str, int]]) -> Dict[str, int]:
+        m = {"objects": 0, "data_size": 0, "storage_size": 0,
+             "index_size": 0, "collections": 0}
+        for t in totals:
+            for k in m:
+                m[k] += t.get(k, 0)
+        return m
+
+
+stats = StatsManager()
+
+
+# ============================================================
+# SECTION 10 — LIVE MONITOR
+# ============================================================
+
+class LiveMonitor:
+    def __init__(self):
+        self._tasks: Dict[int, asyncio.Task] = {}
+        self._state: Dict[int, Dict[str, Any]] = {}
+
+    def is_live(self, chat_id: int) -> bool:
+        t = self._tasks.get(chat_id)
+        return t is not None and not t.done()
+
+    def interval(self, chat_id: int) -> int:
+        return self._state.get(chat_id, {}).get("interval", LIVE_DEFAULT)
+
+    async def start(self, client, chat_id, msg_id, view, extra):
+        await self.stop(chat_id)
+        self._state[chat_id] = {
+            "interval": self.interval(chat_id) or LIVE_DEFAULT,
+            "view": view,
+            "extra": extra,
+        }
+        self._tasks[chat_id] = asyncio.create_task(
+            self._loop(client, chat_id, msg_id, view, extra)
+        )
+
+    async def stop(self, chat_id):
+        t = self._tasks.pop(chat_id, None)
+        self._state.pop(chat_id, None)
+        if t and not t.done():
+            t.cancel()
+            try:
+                await t
+            except Exception:
+                pass
+
+    async def _loop(self, client, chat_id, msg_id, view, extra):
+        try:
+            while True:
+                await asyncio.sleep(self.interval(chat_id))
+                cache.invalidate()
+                try:
+                    text, kb = await build_view(view, extra)
+                    await client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if "not modified" in str(e).lower():
+                        continue
+                    if "message to edit not found" in str(e).lower():
+                        return
+        except asyncio.CancelledError:
+            return
+
+
+live = LiveMonitor()
+
+
+# ============================================================
+# SECTION 11 — CONFIRMATIONS
+# ============================================================
+
+class Confirmations:
+    def __init__(self, ttl: int = 180):
+        self._p: Dict[str, Dict[str, Any]] = {}
+        self._ttl = ttl
+
+    def _k(self, uid, tok):
+        return f"{uid}:{tok}"
+
+    def start(self, uid, tok, payload):
+        self._p[self._k(uid, tok)] = {
+            "step": 1, "payload": payload,
+            "exp": time.time() + self._ttl,
+        }
+
+    def get(self, uid, tok):
+        e = self._p.get(self._k(uid, tok))
+        if not e:
+            return None
+        if time.time() > e["exp"]:
+            self._p.pop(self._k(uid, tok), None)
+            return None
+        return e
+
+    def advance(self, uid, tok):
+        e = self.get(uid, tok)
+        if not e:
+            return None
+        e["step"] += 1
+        e["exp"] = time.time() + self._ttl
+        return e
+
+    def cancel(self, uid, tok):
+        self._p.pop(self._k(uid, tok), None)
+
+    def cleanup(self):
+        now = time.time()
+        for k in list(self._p.keys()):
+            if self._p[k]["exp"] < now:
+                self._p.pop(k, None)
+
+
+confirms = Confirmations()
+
+
+# ============================================================
+# SECTION 12 — DUPLICATE SCAN
+# ============================================================
+
+async def duplicate_scan(cat: str, index: int, key: str = "file_id") -> Dict[str, Any]:
+    info = await stats.db_info(cat, index)
+    if not info or not info["online"]:
+        return {"ok": False, "reason": "DB offline"}
+    entry = stats._find_entry(cat, index)
+    if not entry:
+        return {"ok": False, "reason": "Entry missing"}
+
+    db = entry.db
+    total = 0
+    per_coll: List[Dict[str, Any]] = []
+
+    for name in info["collection_names"]:
+        try:
+            pipeline = [
+                {"$match": {key: {"$exists": True, "$ne": None}}},
+                {"$group": {"_id": f"${key}", "n": {"$sum": 1}}},
+                {"$match": {"n": {"$gt": 1}}},
+                {"$count": "g"},
+            ]
+            r = await db[name].aggregate(pipeline).to_list(length=1)
+            g = r[0]["g"] if r else 0
+            if g:
+                per_coll.append({"name": name, "dupes": g})
+                total += g
+        except Exception as e:
+            errors.record(f"dup:{name}", str(e))
+
+    return {"ok": True, "total": total, "per_collection": per_coll}
+
+
+# ============================================================
+# SECTION 13 — VIEW BUILDERS
+# ============================================================
+
+def _header() -> str:
+    return (
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>\n"
+        f"{F.EMO['db']} <b>{F.fb('DATABASE CONTROL CENTER')}</b>\n"
+        f"{F.DIV}"
+    )
+
+
+def _status(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return f"⚪ {F.sc('no databases')}"
+    up = sum(1 for i in items if i["online"])
+    if up == len(items):
+        return f"🟢 {F.sc('healthy')}"
+    if up == 0:
+        return f"🔴 {F.sc('offline')}"
+    return f"🟡 {up}/{len(items)} {F.sc('online')}"
+
+
+def _db_block(cat: str, d: Dict[str, Any], share_pct: Optional[float] = None) -> str:
+    status = "🟢" if d["online"] else "🔴"
+    ping = f"{d['ping_ms']}ms" if d["ping_ms"] is not None else "—"
+    label = d.get("label") or f"{cat}-{d['index']:02d}"
+
     lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"<b>{F.fb(title)}</b>",
+        f"{status} <b>{F.fb(f'{cat.upper()} DB {d['index']:02d}')}</b>",
+        F.DIV_S,
+        one_line("cluster", esc(label), "🏷️"),
+        one_line("ping", ping, "⏱️"),
+        one_line("documents", FM.num(d["objects"]), "📦"),
+        one_line("storage", FM.size(d["storage_size"]), "💾"),
+        one_line("data", FM.size(d["data_size"]), "📄"),
+        one_line("indexes", FM.size(d["index_size"]), "🧩"),
+        one_line("collections", FM.num(d["collections"]), "🗂️"),
+    ]
+
+    # Storage capacity bar (v2 colors)
+    storage = d.get("storage_size") or 0
+    used_mb = storage / (1024 * 1024)
+    cap_pct = min(100.0, (used_mb / DB_CAPACITY_MB) * 100.0) if DB_CAPACITY_MB else 0.0
+    color = P.storage_color(cap_pct)
+    bar = P.bar(cap_pct, "storage", width=BAR_W, show_percent=False)
+
+    lines.append("")
+    lines.append(
+        f"{color} <b>{F.sc('capacity')}</b> · "
+        f"<code>{FM.size(storage)}</code> / <code>{DB_CAPACITY_MB} MB</code>"
+    )
+    lines.append(f"<code>{bar}</code> {cap_pct:.1f}%")
+
+    if share_pct is not None:
+        lines.append("")
+        lines.append(bar_line("share of category", share_pct, width=10))
+
+    return "\n".join(lines)
+
+
+def _totals_block(t: Dict[str, int]) -> str:
+    return "\n".join([
+        f"📊 <b>{F.fb('ALL DATABASES TOTAL')}</b>",
+        F.DIV_S,
+        one_line("documents", FM.num(t["objects"]), "📦"),
+        one_line("storage", FM.size(t["storage_size"]), "💾"),
+        one_line("data", FM.size(t["data_size"]), "📄"),
+        one_line("indexes", FM.size(t["index_size"]), "🧩"),
+        one_line("collections", FM.num(t["collections"]), "🗂️"),
+    ])
+
+
+# ============================================================
+# SECTION 14 — VIEW MAIN
+# ============================================================
+
+def kb_main():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{F.EMO['server']} {F.sc('system databases')}",
+            callback_data="adm:dbc_cat:system")],
+        [InlineKeyboardButton(
+            f"{F.EMO['users']} {F.sc('user databases')}",
+            callback_data="adm:dbc_cat:user")],
+        [InlineKeyboardButton(
+            f"{F.EMO['film']} {F.sc('media databases')}",
+            callback_data="adm:dbc_cat:media")],
+        [InlineKeyboardButton(
+            f"{F.EMO['chart']} {F.sc('overall')}",
+            callback_data="adm:dbc_cat:overall")],
+        [
+            InlineKeyboardButton(
+                f"❤️ {F.sc('health')}",
+                callback_data="adm:dbc_health:overall"),
+            InlineKeyboardButton(
+                f"⚡ {F.sc('performance')}",
+                callback_data="adm:dbc_perf:overall"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🧹 {F.sc('duplicates')}",
+                callback_data="adm:dbc_dups:media:1"),
+            InlineKeyboardButton(
+                f"🧩 {F.sc('indexes')}",
+                callback_data="adm:dbc_colls:media:1:1"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"📋 {F.sc('activity log')}",
+                callback_data="adm:dbc_audit"),
+            InlineKeyboardButton(
+                f"🚨 {F.sc('errors')}",
+                callback_data="adm:dbc_errors"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"📡 {F.sc('live monitor')}",
+                callback_data="adm:dbc_live"),
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data="adm:dbc_refresh"),
+        ],
+        [InlineKeyboardButton(
+            f"{F.EMO['close']} {F.sc('close')}",
+            callback_data="adm:dbc_close")],
+    ])
+
+
+async def view_main():
+    data = await stats.overall()
+    s, u, m = data["system"], data["user"], data["media"]
+    tot = data["totals"]
+
+    total_docs = max(1, s["totals"]["objects"] + u["totals"]["objects"] + m["totals"]["objects"])
+    sp = (s["totals"]["objects"] / total_docs) * 100
+    up = (u["totals"]["objects"] / total_docs) * 100
+    mp = (m["totals"]["objects"] / total_docs) * 100
+
+    lines = [
+        _header(), "",
+        f"{F.EMO['clock']} {F.sc('updated')} · <code>{data['updated']}</code>",
+        "",
+        f"<b>{F.fb('DATABASE CATEGORIES')}</b>",
+        f"{F.EMO['server']} {F.sc('system')} · <b>{s['count']}</b> {F.sc('databases')}",
+        f"{F.EMO['users']} {F.sc('user')} · <b>{u['count']}</b> {F.sc('databases')}",
+        f"{F.EMO['film']} {F.sc('media')} · <b>{m['count']}</b> {F.sc('databases')}",
+        f"{F.EMO['db']} {F.sc('total')} · <b>{data['count']}</b> {F.sc('databases')}",
+        "",
+        f"<b>{F.fb('DOCUMENT DISTRIBUTION')}</b>",
+        bar_line("system", sp, width=10),
+        bar_line("user", up, width=10),
+        bar_line("media", mp, width=10),
+        "",
+        F.DIV,
+        _totals_block(tot),
         F.DIV,
         "",
-    ]
-
-    if not result.get("ok", True) and "reason" in result:
-        lines.append(f"{F.EMO['cross']} {F.sc('failed')} · "
-                     f"<code>{result['reason']}</code>")
-    else:
-        lines.append(f"{F.EMO['check']} <b>{F.sc('completed')}</b>")
-        if "documents_deleted" in result:
-            lines.append(
-                f"{F.EMO['trash']} {F.sc('docs deleted')} · "
-                f"<b>{FM.num(result['documents_deleted'])}</b>"
-            )
-        if "collections_cleared" in result:
-            lines.append(
-                f"{F.EMO['folder']} {F.sc('collections')} · "
-                f"<b>{result['collections_cleared']}</b>"
-            )
-        if "total" in result:
-            lines.append(
-                f"{F.EMO['trash']} {F.sc('total deleted')} · "
-                f"<b>{FM.num(result['total'])}</b>"
-            )
-        if "pools" in result:
-            for p, n in result["pools"].items():
-                lines.append(f"• {p} · <b>{n}</b>")
-
-    lines += [
+        f"<b>{F.fb('SYSTEM STATUS')}</b>",
+        f"{F.EMO['server']} {F.sc('system')} · {_status(s['items'])}",
+        f"{F.EMO['users']} {F.sc('user')} · {_status(u['items'])}",
+        f"{F.EMO['film']} {F.sc('media')} · {_status(m['items'])}",
         "",
         F.DIV_S,
-        f"🕒 <code>{FM.datetime_()}</code>",
+        f"📡 {F.sc('live monitoring')} · 🟢 {F.sc('ready')}",
     ]
+    return "\n".join(lines), kb_main()
 
-    kb = InlineKeyboardMarkup([
+
+# ============================================================
+# SECTION 15 — VIEW CATEGORY
+# ============================================================
+
+def kb_category(cat, data):
+    rows: List[List[InlineKeyboardButton]] = []
+    pair: List[InlineKeyboardButton] = []
+    for item in data["items"]:
+        emoji = "🟢" if item["online"] else "🔴"
+        label = f"{emoji} {cat.upper()} {item['index']:02d}"
+        pair.append(InlineKeyboardButton(
+            label, callback_data=f"adm:dbc_db:{cat}:{item['index']}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    rows.append([InlineKeyboardButton(
+        f"📊 {F.sc('all')} {cat.upper()}",
+        callback_data=f"adm:dbc_catall:{cat}")])
+
+    if cat != "overall":
+        rows.append([
+            InlineKeyboardButton(
+                f"❤️ {F.sc('health')}",
+                callback_data=f"adm:dbc_health:{cat}"),
+            InlineKeyboardButton(
+                f"⚡ {F.sc('performance')}",
+                callback_data=f"adm:dbc_perf:{cat}"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"adm:dbc_cat:{cat}"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="adm:dbc_main"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def view_category(cat: str):
+    if cat == "overall":
+        return await view_main()
+    data = await stats.category(cat)
+
+    titles = {
+        "system": (F.EMO['server'], "SYSTEM DATABASE CONTROL"),
+        "user":   (F.EMO['users'],  "USER DATABASE CONTROL"),
+        "media":  (F.EMO['film'],   "MEDIA DATABASE CONTROL"),
+    }
+    icon, t = titles.get(cat, (F.EMO['db'], "DATABASE CONTROL"))
+
+    total_docs = max(1, data["totals"]["objects"])
+    lines = [
+        _header(), "",
+        f"{icon} <b>{F.fb(t)}</b>",
+        F.DIV, "",
+        f"📊 <b>{data['count']} {F.sc('configured')}</b>",
+        f"🕐 <code>{data['updated']}</code>",
+        "",
+    ]
+    for item in data["items"]:
+        share = (item["objects"] / total_docs) * 100 if total_docs else 0
+        lines.append(_db_block(cat, item, share_pct=share))
+        lines.append("")
+        lines.append(F.DIV)
+        lines.append("")
+    lines.append(_totals_block(data["totals"]))
+    return "\n".join(lines), kb_category(cat, data)
+
+
+# ============================================================
+# SECTION 16 — VIEW DB
+# ============================================================
+
+def kb_db(cat, index):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"🧱 {F.sc('collections')}",
+                callback_data=f"adm:dbc_colls:{cat}:{index}:1"),
+            InlineKeyboardButton(
+                f"📊 {F.sc('statistics')}",
+                callback_data=f"adm:dbc_stats:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🔍 {F.sc('search')}",
+                callback_data=f"adm:dbc_search:{cat}:{index}"),
+            InlineKeyboardButton(
+                f"🧹 {F.sc('duplicates')}",
+                callback_data=f"adm:dbc_dups:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🧩 {F.sc('indexes')}",
+                callback_data=f"adm:dbc_colls:{cat}:{index}:1"),
+            InlineKeyboardButton(
+                f"🗑️ {F.sc('clear data')}",
+                callback_data=f"adm:dbc_clear:{cat}:{index}"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"❤️ {F.sc('health')}",
+                callback_data=f"adm:dbc_health:{cat}"),
+            InlineKeyboardButton(
+                f"⚡ {F.sc('performance')}",
+                callback_data=f"adm:dbc_perf:{cat}"),
+        ],
         [
             InlineKeyboardButton(
                 f"{F.EMO['refresh']} {F.sc('refresh')}",
-                callback_data="adm:page:databases",
-            ),
+                callback_data=f"adm:dbc_db:{cat}:{index}"),
             InlineKeyboardButton(
                 f"{F.EMO['back']} {F.sc('back')}",
-                callback_data=back_cb,
-            ),
+                callback_data=f"adm:dbc_cat:{cat}"),
         ],
     ])
 
-    return "\n".join(lines)[:4000], kb
+
+async def view_db(cat: str, index: int):
+    info = await stats.db_info(cat, index)
+    if not info:
+        return (
+            f"❌ {F.sc('database not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_cat:{cat}")]]),
+        )
+
+    status = f"🟢 {F.sc('online')}" if info["online"] else f"🔴 {F.sc('offline')}"
+    ping = f"{info['ping_ms']}ms" if info["ping_ms"] is not None else "—"
+    ver = info["version"] or "—"
+
+    overhead = (info["index_size"] / max(1, info["data_size"])) * 100
+    eff = (info["data_size"] / max(1, info["storage_size"])) * 100
+
+    storage = info.get("storage_size") or 0
+    used_mb = storage / (1024 * 1024)
+    cap_pct = min(100.0, (used_mb / DB_CAPACITY_MB) * 100.0) if DB_CAPACITY_MB else 0.0
+    color = P.storage_color(cap_pct)
+    cap_bar = P.bar(cap_pct, "storage", width=BAR_W, show_percent=False)
+
+    lines = [
+        _header(), "",
+        f"🗄️ <b>{F.fb(f'{cat.upper()} DATABASE {info['index']:02d}')}</b>",
+        F.DIV, "",
+        one_line("cluster", esc(info['label']), "🏷️"),
+        f"📡 {F.sc('status')} · {status}",
+        one_line("ping", ping, "⏱️"),
+        one_line("mongodb", esc(ver), "🍃"),
+        "",
+        one_line("documents", FM.num(info['objects']), "📦"),
+        one_line("collections", FM.num(info['collections']), "🗂️"),
+        one_line("data", FM.size(info['data_size']), "📄"),
+        one_line("storage", FM.size(info['storage_size']), "💾"),
+        one_line("indexes", FM.size(info['index_size']), "🧩"),
+        one_line("avg object", FM.size(int(info['avg_obj'] or 0)), "📐"),
+        "",
+        f"<b>{F.fb('STORAGE CAPACITY')}</b>",
+        f"{color} <code>{FM.size(storage)}</code> / <code>{DB_CAPACITY_MB} MB</code>",
+        f"<code>{cap_bar}</code> {cap_pct:.1f}%",
+        "",
+        f"<b>{F.fb('PERFORMANCE METRICS')}</b>",
+        bar_line("index overhead", overhead, width=10),
+        bar_line("storage efficiency", eff, width=10),
+        "",
+        F.DIV,
+        f"📚 <b>{F.fb('COLLECTIONS')}</b>",
+        F.DIV,
+    ]
+
+    names = info["collection_names"]
+    if not names:
+        lines.append(f"⚪ {F.sc('no collections')}")
+    else:
+        for i, n in enumerate(names[:20], 1):
+            lines.append(f"  <b>{i:02d}.</b> <code>{esc(n)}</code>")
+        if len(names) > 20:
+            lines.append(f"  <i>… +{len(names) - 20} {F.sc('more')}</i>")
+
+    return "\n".join(lines), kb_db(cat, index)
 
 
 # ============================================================
-# SECTION 9 — HELPERS
+# SECTION 17 — VIEW COLLECTIONS
 # ============================================================
 
-def _back_only_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
+def kb_colls(cat, index, page, total_pages, names):
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"📁 {n[:40]}",
+            callback_data=f"adm:dbc_coll:{cat}:{index}:{n}")]
+        for n in names[:COLL_PAGE]
+    ]
+    nav: List[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(
+            f"{F.EMO['prev']} {F.sc('prev')}",
+            callback_data=f"adm:dbc_colls:{cat}:{index}:{page - 1}"))
+    nav.append(InlineKeyboardButton(
+        f"{page}/{total_pages}", callback_data="adm:dbc_noop"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton(
+            f"{F.sc('next')} {F.EMO['next']}",
+            callback_data=f"adm:dbc_colls:{cat}:{index}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="adm:page:databases",
-        ),
-    ]])
+            callback_data=f"adm:dbc_db:{cat}:{index}"),
+        InlineKeyboardButton(
+            f"{F.EMO['brand']} {F.sc('home')}",
+            callback_data="adm:dbc_main"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
-def _back_kb(target: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
+async def view_colls(cat: str, index: int, page: int):
+    info = await stats.db_info(cat, index)
+    if not info:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_cat:{cat}")]]),
+        )
+    names = info["collection_names"]
+    total = len(names)
+    tp = max(1, (total + COLL_PAGE - 1) // COLL_PAGE)
+    page = max(1, min(page, tp))
+    start = (page - 1) * COLL_PAGE
+    slice_ = names[start:start + COLL_PAGE]
+
+    lines = [
+        _header(), "",
+        f"🧱 <b>{F.fb(f'COLLECTIONS — {cat.upper()} DB {index:02d}')}</b>",
+        F.DIV, "",
+        f"📊 {F.sc('total')} · <code>{total}</code>",
+        f"📄 {F.sc('page')} · <code>{page}/{tp}</code>",
+        "",
+    ]
+    for i, n in enumerate(slice_, start=start + 1):
+        lines.append(f"  <b>{i:02d}.</b> <code>{esc(n)}</code>")
+
+    return "\n".join(lines), kb_colls(cat, index, page, tp, slice_)
+
+
+# ============================================================
+# SECTION 18 — VIEW COLLECTION DETAIL
+# ============================================================
+
+def kb_coll(cat, index, name):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"📄 {F.sc('recent docs')}",
+                callback_data=f"adm:dbc_recent:{cat}:{index}:{name}:5"),
+            InlineKeyboardButton(
+                f"🔑 {F.sc('indexes')}",
+                callback_data=f"adm:dbc_idx:{cat}:{index}:{name}"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🧹 {F.sc('find duplicates')}",
+                callback_data=f"adm:dbc_dup_coll:{cat}:{index}:{name}"),
+            InlineKeyboardButton(
+                f"🗑️ {F.sc('clear')}",
+                callback_data=f"adm:dbc_clear_coll:{cat}:{index}:{name}"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data=f"adm:dbc_coll:{cat}:{index}:{name}"),
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"adm:dbc_colls:{cat}:{index}:1"),
+        ],
+    ])
+
+
+async def view_coll(cat: str, index: int, name: str):
+    entry = stats._find_entry(cat, index)
+    if not entry:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_cat:{cat}")]]),
+        )
+
+    st = await Diagnostics.coll_stats(entry.db, name)
+
+    lines = [
+        _header(), "",
+        f"🧱 <b>{F.fb('COLLECTION')}</b>",
+        F.DIV, "",
+        f"📚 {F.sc('name')} · <code>{esc(name)}</code>",
+        f"🗄️ {F.sc('database')} · {cat.upper()} {index:02d} ({esc(entry.label)})",
+        "",
+    ]
+
+    if st:
+        data_sz = st.get("size", 0) or 0
+        stor_sz = st.get("storageSize", 0) or 0
+        idx_sz = st.get("totalIndexSize", 0) or 0
+        eff = (data_sz / max(1, stor_sz)) * 100
+        oh = (idx_sz / max(1, data_sz)) * 100
+
+        lines += [
+            one_line("documents", FM.num(st.get("count", 0)), "📦"),
+            one_line("data", FM.size(data_sz), "📄"),
+            one_line("storage", FM.size(stor_sz), "💾"),
+            one_line("index size", FM.size(idx_sz), "🧩"),
+            one_line("avg object", FM.size(int(st.get("avgObjSize", 0) or 0)), "📐"),
+            one_line("indexes", str(len(st.get("indexSizes", {}) or {})), "🔑"),
+            "",
+            f"<b>{F.fb('METRICS')}</b>",
+            bar_line("storage efficiency", eff, width=10),
+            bar_line("index overhead", oh, width=10),
+        ]
+    else:
+        lines.append(f"⚪ {F.sc('statistics unavailable')}")
+
+    return "\n".join(lines), kb_coll(cat, index, name)
+
+
+# ============================================================
+# SECTION 19 — VIEW RECENT DOCS
+# ============================================================
+
+async def view_recent(cat: str, index: int, name: str, limit: int):
+    entry = stats._find_entry(cat, index)
+    if not entry:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_cat:{cat}")]]),
+        )
+
+    docs = await Diagnostics.sample(entry.db, name, limit)
+    lines = [
+        _header(), "",
+        f"📄 <b>{F.fb('RECENT DOCUMENTS')}</b>",
+        f"📚 <code>{esc(name)}</code>",
+        F.DIV, "",
+        f"🔢 {F.sc('limit')} · <code>{limit}</code>",
+        f"📊 {F.sc('returned')} · <code>{len(docs)}</code>",
+        "",
+    ]
+    if not docs:
+        lines.append(f"⚪ {F.sc('no documents')}")
+    for i, d in enumerate(docs, 1):
+        lines.append(f"<b>{F.fb(f'DOCUMENT {i:02d}')}</b>")
+        lines.append(summarize_doc(d))
+        lines.append("")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"LIMIT {n}",
+            callback_data=f"adm:dbc_recent:{cat}:{index}:{name}:{n}")
+         for n in RECENT_LIMITS],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data=f"adm:dbc_recent:{cat}:{index}:{name}:{limit}"),
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"adm:dbc_coll:{cat}:{index}:{name}"),
+        ],
+    ])
+    return "\n".join(lines), kb
+
+
+# ============================================================
+# SECTION 20 — VIEW INDEXES
+# ============================================================
+
+async def view_indexes(cat: str, index: int, name: str):
+    entry = stats._find_entry(cat, index)
+    if not entry:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_cat:{cat}")]]),
+        )
+
+    idxs = await Diagnostics.list_indexes(entry.db, name)
+    lines = [
+        _header(), "",
+        f"🔑 <b>{F.fb('INDEXES')}</b>",
+        f"📚 <code>{esc(name)}</code>",
+        F.DIV, "",
+        f"🔢 {F.sc('total')} · <code>{len(idxs)}</code>",
+        "",
+    ]
+    if not idxs:
+        lines.append(f"⚪ {F.sc('no indexes')}")
+    for i, ix in enumerate(idxs, 1):
+        safe = redact(ix)
+        lines.append(f"<b>{i:02d}. {esc(safe.get('name', '?'))}</b>")
+        lines.append(f"  🔑 {F.sc('keys')} · <code>{esc(safe.get('key', {}))}</code>")
+        if safe.get("unique"):
+            lines.append(f"  ✅ {F.sc('unique')}")
+        if safe.get("sparse"):
+            lines.append(f"  ✅ {F.sc('sparse')}")
+        if "expireAfterSeconds" in safe:
+            lines.append(f"  ⏱️ {F.sc('ttl')} · <code>{safe['expireAfterSeconds']}s</code>")
+        lines.append("")
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"adm:dbc_idx:{cat}:{index}:{name}"),
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=target,
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data="adm:close",
-        ),
+            callback_data=f"adm:dbc_coll:{cat}:{index}:{name}"),
     ]])
+    return "\n".join(lines), kb
 
 
-def _not_found_page(msg: str) -> Tuple[str, InlineKeyboardMarkup]:
-    text = "\n".join([
-        f"{F.EMO['cross']} <b>{F.fb('NOT FOUND')}</b>",
+# ============================================================
+# SECTION 21 — VIEW HEALTH
+# ============================================================
+
+async def view_health(cat: str):
+    if cat == "overall":
+        data = await stats.overall()
+        groups = [
+            ("system", data["system"]),
+            ("user", data["user"]),
+            ("media", data["media"]),
+        ]
+    else:
+        c = await stats.category(cat)
+        groups = [(cat, c)]
+
+    lines = [_header(), "", f"❤️ <b>{F.fb('DATABASE HEALTH')}</b>", F.DIV, ""]
+    all_ok = True
+    for name, cd in groups:
+        lines.append(f"<b>{name.upper()}</b> · {_status(cd['items'])}")
+        for i in cd["items"]:
+            if i["online"]:
+                lines.append(
+                    f"  🟢 <code>{esc(i['label'])}</code> · "
+                    f"<code>{i['ping_ms']}ms</code>"
+                )
+            else:
+                lines.append(f"  🔴 <code>{esc(i['label'])}</code> · {F.sc('offline')}")
+                all_ok = False
+        lines.append("")
+
+    lines.append(F.DIV)
+    lines.append(
+        f"🟢 <b>{F.fb('ALL HEALTHY')}</b>" if all_ok
+        else f"🟡 <b>{F.fb('WARNINGS PRESENT')}</b>"
+    )
+
+    back = "adm:dbc_main" if cat == "overall" else f"adm:dbc_cat:{cat}"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"adm:dbc_health:{cat}"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=back),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ============================================================
+# SECTION 22 — VIEW PERFORMANCE
+# ============================================================
+
+async def view_perf(cat: str):
+    if cat == "overall":
+        data = await stats.overall()
+        groups = [
+            ("system", data["system"]),
+            ("user", data["user"]),
+            ("media", data["media"]),
+        ]
+    else:
+        c = await stats.category(cat)
+        groups = [(cat, c)]
+
+    lines = [_header(), "", f"⚡ <b>{F.fb('DATABASE PERFORMANCE')}</b>", F.DIV, ""]
+    for name, cd in groups:
+        for i in cd["items"]:
+            st = latency.stats(f"{name}:{i['label']}")
+            cur = st["cur"] if st["cur"] is not None else "—"
+            avg = st["avg"] if st["avg"] is not None else "—"
+            mn = st["min"] if st["min"] is not None else "—"
+            mx = st["max"] if st["max"] is not None else "—"
+            lines.append(f"<b>{name.upper()} · {esc(i['label'])}</b>")
+            lines.append(f"  ᴄᴜʀ · <code>{cur}ms</code>   ᴀᴠɢ · <code>{avg}ms</code>")
+            lines.append(f"  ᴍɪɴ · <code>{mn}ms</code>   ᴍᴀx · <code>{mx}ms</code>")
+            if isinstance(st["cur"], (int, float)):
+                lat_pct = min(100.0, st["cur"] / 2.0)
+                color = P.storage_color(lat_pct)
+                bar = P.bar(lat_pct, "storage", width=10, show_percent=False)
+                lines.append(f"  {color} <code>{bar}</code>")
+            lines.append("")
+
+    back = "adm:dbc_main" if cat == "overall" else f"adm:dbc_cat:{cat}"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"adm:dbc_perf:{cat}"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=back),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ============================================================
+# SECTION 23 — VIEW AUDIT
+# ============================================================
+
+async def view_audit():
+    entries = audit.recent(30)
+    lines = [_header(), "", f"📋 <b>{F.fb('ACTIVITY LOG')}</b>", F.DIV, ""]
+    if not entries:
+        lines.append(f"⚪ {F.sc('no activity')}")
+    for e in entries:
+        lines.append(f"⏱️ <code>{e['ts']}</code>")
+        lines.append(f"👤 <code>{e['admin']}</code> · <b>{esc(e['action'])}</b>")
+        lines.append(f"🎯 <code>{esc(e['target'])}</code>")
+        lines.append(f"✅ <code>{esc(e['result'])}</code>")
+        lines.append("")
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data="adm:dbc_audit"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="adm:dbc_main"),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ============================================================
+# SECTION 24 — VIEW ERRORS
+# ============================================================
+
+async def view_errors():
+    errs = errors.recent(20)
+    lines = [_header(), "", f"🚨 <b>{F.fb('DATABASE ERRORS')}</b>", F.DIV, ""]
+    if not errs:
+        lines.append(f"🟢 {F.sc('no recent errors')}")
+    for e in errs:
+        lines.append(f"⏱️ <code>{e['ts']}</code>")
+        lines.append(f"📍 <b>{esc(e['src'])}</b>")
+        lines.append(f"<code>{esc(e['err'])}</code>")
+        lines.append("")
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data="adm:dbc_errors"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="adm:dbc_main"),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ============================================================
+# SECTION 25 — VIEW CAT ALL
+# ============================================================
+
+async def view_cat_all(cat: str):
+    data = await stats.category(cat)
+    total_docs = max(1, data["totals"]["objects"])
+    lines = [
+        _header(), "",
+        f"📊 <b>{F.fb(f'ALL {cat.upper()} DATABASES')}</b>",
+        F.DIV, "",
+        _totals_block(data["totals"]),
+        "",
         F.DIV,
         "",
-        f"<i>{F.sc(msg)}</i>",
-    ])
-    return text, _back_only_kb()
+    ]
+    for item in data["items"]:
+        share = (item["objects"] / total_docs) * 100
+        lines.append(_db_block(cat, item, share_pct=share))
+        lines.append("")
+        lines.append(F.DIV)
+        lines.append("")
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"adm:dbc_catall:{cat}"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=f"adm:dbc_cat:{cat}"),
+    ]])
+    return "\n".join(lines), kb
 
 
 # ============================================================
-# SECTION 10 — PUBLIC EXPORTS
+# SECTION 26 — VIEW DUPLICATES
+# ============================================================
+
+def kb_dups(cat, index):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔍 {F.sc('start scan')}",
+            callback_data=f"adm:dbc_dup_scan:{cat}:{index}")],
+        [InlineKeyboardButton(
+            f"🗑️ {F.sc('remove duplicates')}",
+            callback_data=f"adm:dbc_dup_remove:{cat}:{index}")],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data=f"adm:dbc_dups:{cat}:{index}"),
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"adm:dbc_db:{cat}:{index}"),
+        ],
+    ])
+
+
+async def view_dups(cat: str, index: int):
+    info = await stats.db_info(cat, index)
+    if not info:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data="adm:dbc_main")]]),
+        )
+
+    lines = [
+        _header(), "",
+        f"🧹 <b>{F.fb('DUPLICATE CONTROL CENTER')}</b>",
+        F.DIV, "",
+        f"🗄️ {F.sc('target')} · {cat.upper()} DB {index:02d}",
+        f"🏷️ {F.sc('cluster')} · <code>{esc(info['label'])}</code>",
+        f"📦 {F.sc('total records')} · <code>{FM.num(info['objects'])}</code>",
+        "",
+        F.DIV_S,
+        f"🔍 {F.sc('scan status')} · <b>{F.sc('ready')}</b>",
+        F.DIV_S,
+        "",
+        f"Press <b>{F.sc('start scan')}</b> to scan for duplicates on key "
+        f"<code>file_id</code>.",
+        "",
+        f"⚠️ {F.sc('scan is read-only. removal requires 3-step confirmation.')}",
+    ]
+    return "\n".join(lines), kb_dups(cat, index)
+
+
+async def view_dup_scan(cat: str, index: int):
+    result = await duplicate_scan(cat, index, "file_id")
+    info = await stats.db_info(cat, index)
+
+    lines = [
+        _header(), "",
+        f"🧹 <b>{F.fb('DUPLICATE SCAN RESULT')}</b>",
+        F.DIV, "",
+        f"🗄️ {F.sc('target')} · {cat.upper()} DB {index:02d}",
+    ]
+    if not result.get("ok"):
+        lines.append(f"🔴 {F.sc('scan failed')} · {esc(result.get('reason'))}")
+        return "\n".join(lines), kb_dups(cat, index)
+
+    total_docs = max(1, info["objects"])
+    lines.append(f"📦 {F.sc('scanned')} · <code>{FM.num(total_docs)}</code>")
+    lines.append(f"🧹 {F.sc('duplicate groups')} · <code>{FM.num(result['total'])}</code>")
+    lines.append("")
+
+    if result["per_collection"]:
+        lines.append(f"<b>{F.fb('PER COLLECTION')}</b>")
+        for pc in result["per_collection"][:20]:
+            lines.append(
+                f"• <code>{esc(pc['name'])}</code> · "
+                f"<b>{FM.num(pc['dupes'])}</b>"
+            )
+    else:
+        lines.append(f"🟢 {F.sc('no duplicates found')}")
+
+    return "\n".join(lines), kb_dups(cat, index)
+
+
+# ============================================================
+# SECTION 27 — VIEW CLEAR
+# ============================================================
+
+async def view_clear(cat: str, index: int):
+    info = await stats.db_info(cat, index)
+    if not info:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data="adm:dbc_main")]]),
+        )
+
+    lines = [
+        _header(), "",
+        f"☢️ <b>{F.fb('DANGER ZONE — CLEAR DATA')}</b>",
+        F.DIV, "",
+        f"🎯 {F.sc('target')} · {cat.upper()} DB {index:02d}",
+        f"🏷️ {F.sc('cluster')} · <code>{esc(info['label'])}</code>",
+        f"📦 {F.sc('documents')} · <code>{FM.num(info['objects'])}</code>",
+        f"💾 {F.sc('storage')} · <code>{FM.size(info['storage_size'])}</code>",
+        "",
+        F.DIV,
+        f"⚠️ <b>{F.sc('this will remove all documents in all collections.')}</b>",
+        f"⚠️ <b>{F.sc('this cannot be undone.')}</b>",
+        F.DIV,
+        "",
+        F.sc("multi-stage confirmation required."),
+    ]
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🗑️ {F.sc('clear this database')}",
+            callback_data=f"adm:dbc_clear_db:{cat}:{index}")],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"adm:dbc_db:{cat}:{index}"),
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('cancel')}",
+                callback_data="adm:dbc_main"),
+        ],
+    ])
+    return "\n".join(lines), kb
+
+
+async def do_clear_db(cat: str, index: int):
+    entry = stats._find_entry(cat, index)
+    if not entry:
+        return (
+            f"❌ {F.sc('db not found')}",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data="adm:dbc_main")]]),
+        )
+
+    deleted = 0
+    for name in await Diagnostics.list_collections(entry.db):
+        try:
+            r = await entry.db[name].delete_many({})
+            deleted += r.deleted_count
+        except Exception as e:
+            errors.record(f"clear:{name}", str(e))
+
+    cache.invalidate()
+    audit.log(0, "clear_database", target=f"{cat}:{index}", result=f"deleted={deleted}")
+
+    lines = [
+        _header(), "",
+        f"🟢 <b>{F.fb('OPERATION COMPLETE')}</b>",
+        F.DIV, "",
+        f"🎯 {F.sc('target')} · {cat.upper()} DB {index:02d}",
+        f"🗑️ {F.sc('documents removed')} · <code>{FM.num(deleted)}</code>",
+        f"⏱️ {F.sc('time')} · <code>{now_ist()}</code>",
+        f"📊 {F.sc('statistics refreshed')} · 🟢 {F.sc('yes')}",
+    ]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"📊 {F.sc('view database')}",
+            callback_data=f"adm:dbc_db:{cat}:{index}"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="adm:dbc_main"),
+    ]])
+    return "\n".join(lines), kb
+
+
+# ============================================================
+# SECTION 28 — VIEW ROUTER
+# ============================================================
+
+async def build_view(view: str, extra: Dict[str, Any]):
+    try:
+        if view == "main":
+            return await view_main()
+        if view == "category":
+            return await view_category(extra["cat"])
+        if view == "db":
+            return await view_db(extra["cat"], extra["index"])
+        if view == "colls":
+            return await view_colls(
+                extra["cat"], extra["index"], extra.get("page", 1))
+        if view == "coll":
+            return await view_coll(extra["cat"], extra["index"], extra["name"])
+        if view == "recent":
+            return await view_recent(
+                extra["cat"], extra["index"], extra["name"],
+                extra.get("limit", 5))
+        if view == "indexes":
+            return await view_indexes(
+                extra["cat"], extra["index"], extra["name"])
+        if view == "health":
+            return await view_health(extra["cat"])
+        if view == "perf":
+            return await view_perf(extra["cat"])
+        if view == "audit":
+            return await view_audit()
+        if view == "errors":
+            return await view_errors()
+        if view == "catall":
+            return await view_cat_all(extra["cat"])
+        return await view_main()
+    except Exception as e:
+        logger.exception(f"build_view({view}) failed")
+        return (
+            f"🔴 {F.sc('render failed')}: <code>{esc(e)}</code>",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['brand']} {F.sc('home')}",
+                    callback_data="adm:dbc_main")]]),
+        )
+
+
+# ============================================================
+# SECTION 29 — PUBLIC ENTRY (called from /admin → Databases)
+# ============================================================
+
+async def build_index():
+    """Called by admin.py when the Databases button is tapped."""
+    return await view_main()
+
+
+# ============================================================
+# SECTION 30 — CALLBACK ROUTER (priority -9520)
+# ============================================================
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:dbc_"), group=-9520,
+)
+async def db_router(client: Client, q: CallbackQuery):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    data = str(q.data)
+    parts = data.split(":")
+
+    try:
+        # ─── MAIN ───
+        if data == "adm:dbc_main":
+            await live.stop(q.message.chat.id)
+            text, kb = await build_view("main", {})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── REFRESH ───
+        if data == "adm:dbc_refresh":
+            cache.invalidate()
+            text, kb = await build_view("main", {})
+            await _edit(q, text, kb)
+            return await q.answer(f"{F.EMO['refresh']} {F.sc('refreshed')}")
+
+        # ─── CLOSE ───
+        if data == "adm:dbc_close":
+            await live.stop(q.message.chat.id)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            return await q.answer(F.sc("closed"))
+
+        # ─── NOOP ───
+        if data == "adm:dbc_noop":
+            return await q.answer()
+
+        # ─── CATEGORY ───
+        if parts[1] == "dbc_cat":
+            cat = parts[2]
+            text, kb = await build_view("category", {"cat": cat})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── CAT ALL ───
+        if parts[1] == "dbc_catall":
+            cat = parts[2]
+            text, kb = await build_view("catall", {"cat": cat})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── DB ───
+        if parts[1] == "dbc_db":
+            cat = parts[2]
+            idx = int(parts[3])
+            text, kb = await build_view("db", {"cat": cat, "index": idx})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── COLLECTIONS ───
+        if parts[1] == "dbc_colls":
+            cat = parts[2]
+            idx = int(parts[3])
+            page = int(parts[4])
+            text, kb = await build_view(
+                "colls", {"cat": cat, "index": idx, "page": page})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── ONE COLLECTION ───
+        if parts[1] == "dbc_coll":
+            cat = parts[2]
+            idx = int(parts[3])
+            name = ":".join(parts[4:])
+            text, kb = await build_view(
+                "coll", {"cat": cat, "index": idx, "name": name})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── RECENT DOCS ───
+        if parts[1] == "dbc_recent":
+            cat = parts[2]
+            idx = int(parts[3])
+            limit = int(parts[-1])
+            name = ":".join(parts[4:-1])
+            text, kb = await build_view(
+                "recent",
+                {"cat": cat, "index": idx, "name": name, "limit": limit})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── INDEXES ───
+        if parts[1] == "dbc_idx":
+            cat = parts[2]
+            idx = int(parts[3])
+            name = ":".join(parts[4:])
+            text, kb = await build_view(
+                "indexes", {"cat": cat, "index": idx, "name": name})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── HEALTH ───
+        if parts[1] == "dbc_health":
+            cat = parts[2]
+            text, kb = await build_view("health", {"cat": cat})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── PERF ───
+        if parts[1] == "dbc_perf":
+            cat = parts[2]
+            text, kb = await build_view("perf", {"cat": cat})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── AUDIT ───
+        if parts[1] == "dbc_audit":
+            text, kb = await build_view("audit", {})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── ERRORS ───
+        if parts[1] == "dbc_errors":
+            text, kb = await build_view("errors", {})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── DUPLICATES ───
+        if parts[1] == "dbc_dups":
+            cat = parts[2]
+            idx = int(parts[3])
+            text, kb = await view_dups(cat, idx)
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        if parts[1] == "dbc_dup_scan":
+            cat = parts[2]
+            idx = int(parts[3])
+            await q.answer(f"🔍 {F.sc('scanning...')}")
+            text, kb = await view_dup_scan(cat, idx)
+            await _edit(q, text, kb)
+            return
+
+        if parts[1] == "dbc_dup_remove":
+            cat = parts[2]
+            idx = int(parts[3])
+            tok = f"dup:{cat}:{idx}:{int(time.time())}"
+            confirms.start(q.from_user.id, tok, {
+                "action": "dup_remove", "cat": cat, "index": idx,
+            })
+            text = (
+                f"⚠️ <b>{F.fb('DUPLICATE REMOVAL — STEP 1/3')}</b>\n"
+                f"{F.DIV}\n\n"
+                f"🎯 {F.sc('target')} · {cat.upper()} DB {idx:02d}\n\n"
+                f"{F.sc('this may delete database records.')}\n\n"
+                f"{F.sc('continue?')}"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"⚠️ {F.sc('continue')}",
+                    callback_data=f"adm:dbc_confirm:{tok}")],
+                [InlineKeyboardButton(
+                    f"{F.EMO['cross']} {F.sc('cancel')}",
+                    callback_data=f"adm:dbc_cancel:{tok}")],
+            ])
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── CLEAR ───
+        if parts[1] == "dbc_clear":
+            cat = parts[2]
+            idx = int(parts[3])
+            text, kb = await view_clear(cat, idx)
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        if parts[1] == "dbc_clear_db":
+            cat = parts[2]
+            idx = int(parts[3])
+            tok = f"clear:{cat}:{idx}:{int(time.time())}"
+            confirms.start(q.from_user.id, tok, {
+                "action": "clear_db", "cat": cat, "index": idx,
+            })
+            text = (
+                f"⚠️ <b>{F.fb('STEP 1/3 — CLEAR DATABASE')}</b>\n"
+                f"{F.DIV}\n\n"
+                f"🎯 {cat.upper()} DB {idx:02d}\n\n"
+                f"{F.sc('all documents will be removed.')}\n\n"
+                f"{F.sc('continue?')}"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"⚠️ {F.sc('continue')}",
+                    callback_data=f"adm:dbc_confirm:{tok}")],
+                [InlineKeyboardButton(
+                    f"{F.EMO['cross']} {F.sc('cancel')}",
+                    callback_data=f"adm:dbc_cancel:{tok}")],
+            ])
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── CONFIRM ───
+        if parts[1] == "dbc_confirm":
+            tok = parts[2]
+            entry = confirms.get(q.from_user.id, tok)
+            if not entry:
+                return await q.answer("⏱️ expired", show_alert=True)
+
+            step = entry["step"]
+            if step < 3:
+                confirms.advance(q.from_user.id, tok)
+                if step == 1:
+                    text = (
+                        f"🚨 <b>{F.fb('STEP 2/3 — FINAL WARNING')}</b>\n"
+                        f"{F.DIV}\n\n"
+                        f"{F.sc('this cannot be undone.')}\n\n"
+                        f"{F.sc('continue?')}"
+                    )
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            f"🚨 {F.sc('continue')}",
+                            callback_data=f"adm:dbc_confirm:{tok}")],
+                        [InlineKeyboardButton(
+                            f"{F.EMO['cross']} {F.sc('cancel')}",
+                            callback_data=f"adm:dbc_cancel:{tok}")],
+                    ])
+                else:
+                    text = (
+                        f"☢️ <b>{F.fb('STEP 3/3 — PERMANENT DELETION')}</b>\n"
+                        f"{F.DIV}\n\n"
+                        f"{F.sc('click below to execute.')}"
+                    )
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            f"☢️ {F.sc('yes, permanently delete')}",
+                            callback_data=f"adm:dbc_confirm:{tok}")],
+                        [InlineKeyboardButton(
+                            f"{F.EMO['cross']} {F.sc('cancel')}",
+                            callback_data=f"adm:dbc_cancel:{tok}")],
+                    ])
+                await _edit(q, text, kb)
+                return await q.answer()
+
+            confirms.cancel(q.from_user.id, tok)
+            payload = entry["payload"]
+            action = payload.get("action")
+
+            if action == "clear_db":
+                text, kb = await do_clear_db(
+                    payload["cat"], payload["index"])
+                await _edit(q, text, kb)
+                return await q.answer(f"{F.EMO['check']} {F.sc('done')}")
+
+            if action == "dup_remove":
+                audit.log(
+                    q.from_user.id, "duplicate_removal_safe_mode",
+                    target=f"{payload['cat']}:{payload['index']}",
+                    result="SAFE_MODE",
+                )
+                text = (
+                    f"⚠️ <b>{F.fb('DUPLICATE REMOVAL — SAFE MODE')}</b>\n"
+                    f"{F.DIV}\n\n"
+                    f"{F.sc('removal is disabled to prevent data loss.')}"
+                )
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        f"{F.EMO['back']} {F.sc('back')}",
+                        callback_data="adm:dbc_main")]])
+                await _edit(q, text, kb)
+                return await q.answer(F.sc("safe mode"))
+
+        # ─── CANCEL ───
+        if parts[1] == "dbc_cancel":
+            tok = parts[2]
+            confirms.cancel(q.from_user.id, tok)
+            text = f"{F.EMO['cross']} {F.sc('cancelled')}."
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['brand']} {F.sc('home')}",
+                    callback_data="adm:dbc_main")]])
+            await _edit(q, text, kb)
+            return await q.answer(F.sc("cancelled"))
+
+        # ─── LIVE ───
+        if parts[1] == "dbc_live":
+            chat_id = q.message.chat.id
+            if live.is_live(chat_id):
+                await live.stop(chat_id)
+                return await q.answer(
+                    f"🔴 {F.sc('live monitor off')}", show_alert=True)
+            rows = [
+                [InlineKeyboardButton(
+                    f"{n}s", callback_data=f"adm:dbc_livego:{n}")
+                 for n in LIVE_OPTIONS],
+                [InlineKeyboardButton(
+                    f"{F.EMO['cross']} {F.sc('cancel')}",
+                    callback_data="adm:dbc_main")],
+            ]
+            text = (
+                f"🟢 <b>{F.fb('LIVE MONITOR')}</b>\n"
+                f"{F.sc('choose refresh interval:')}"
+            )
+            await _edit(q, text, InlineKeyboardMarkup(rows))
+            return await q.answer()
+
+        if parts[1] == "dbc_livego":
+            interval = int(parts[2])
+            chat_id = q.message.chat.id
+            await live.start(client, chat_id, q.message.id, "main", {})
+            live._state[chat_id]["interval"] = interval
+            await q.answer(
+                f"🟢 {F.sc('live on')} · {interval}s", show_alert=True)
+            text, kb = await build_view("main", {})
+            await _edit(q, text, kb)
+            return
+
+        # ─── STATS (stub — same as db view) ───
+        if parts[1] == "dbc_stats":
+            cat = parts[2]
+            idx = int(parts[3])
+            text, kb = await build_view("db", {"cat": cat, "index": idx})
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── SEARCH (stub) ───
+        if parts[1] == "dbc_search":
+            cat = parts[2]
+            idx = int(parts[3])
+            text = (
+                f"{F.EMO['search']} <b>{F.fb('SEARCH')}</b>\n"
+                f"{F.DIV}\n\n"
+                f"{F.sc('coming soon — document search')}"
+            )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_db:{cat}:{idx}")]])
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        # ─── DUP COLL / CLEAR COLL (stubs) ───
+        if parts[1] in ("dbc_dup_coll", "dbc_clear_coll"):
+            cat = parts[2]
+            idx = int(parts[3])
+            name = ":".join(parts[4:])
+            text = (
+                f"{F.EMO['warn']} <b>{F.fb('COMING SOON')}</b>\n"
+                f"{F.DIV}\n\n"
+                f"📚 <code>{esc(name)}</code>"
+            )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('back')}",
+                    callback_data=f"adm:dbc_coll:{cat}:{idx}:{name}")]])
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        return await q.answer(f"❓ {data[:40]}", show_alert=True)
+
+    except Exception as e:
+        logger.exception(f"[DB-CENTER] router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# SECTION 31 — SAFE EDIT
+# ============================================================
+
+async def _edit(q: CallbackQuery, text: str, kb) -> None:
+    try:
+        await q.message.edit_text(
+            text,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return
+        logger.debug(f"[DB-CENTER] edit: {e}")
+
+
+# ============================================================
+# SECTION 32 — CLEANUP LOOP
+# ============================================================
+
+async def _confirm_cleanup():
+    while True:
+        try:
+            confirms.cleanup()
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
+_cleanup_task: Optional[asyncio.Task] = None
+
+
+def ensure_cleanup() -> None:
+    global _cleanup_task
+    if _cleanup_task and not _cleanup_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _cleanup_task = loop.create_task(_confirm_cleanup())
+    except RuntimeError:
+        pass
+
+
+# ============================================================
+# SECTION 33 — SNAPSHOT
+# ============================================================
+
+def snapshot() -> Dict[str, Any]:
+    return {
+        "live_chats": len(live._tasks),
+        "pending_confirms": len(confirms._p),
+        "errors_logged": len(errors._q),
+    }
+
+
+# ============================================================
+# SECTION 34 — PUBLIC EXPORTS
 # ============================================================
 
 __all__ = [
     "build_index",
-    "build_pool",
-    "build_shard",
-    "build_clear_shard_confirm",
-    "build_clear_pool_confirm",
-    "build_nuke_all_confirm",
-    "build_result_card",
-    "do_clear_shard",
-    "do_clear_pool",
-    "do_nuke_all",
-    "_get_confirm",
-    "_advance_confirm",
-    "_drop_confirm",
-    "_cleanup_confirms",
+    "build_view",
+    "snapshot",
 ]
