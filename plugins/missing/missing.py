@@ -115,6 +115,8 @@ async def _build_main() -> Tuple[str, InlineKeyboardMarkup]:
     if _is_admin(0):  # will be replaced with real check
         pass
 
+    # Settings button — safe to always show since _build_main
+    # is only invoked from cmd_missing (admin-gated).
     rows.append([
         InlineKeyboardButton(
             f"⚙️ {F.sc('settings')}",
