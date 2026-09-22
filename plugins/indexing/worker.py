@@ -573,12 +573,13 @@ async def _handle_message(C: Client, msg) -> None:
             return
 
         if STATE["skip_duplicate"]:
+            STATE["dups_checked"] = STATE.get("dups_checked", 0) + 1
             try:
                 if await _is_exact_duplicate(file_id):
                     STATE["duplicate_id"] += 1
                     logger.info(
                         f"[INDEX-WORKER] ♻️ DUP msg={msg.id} "
-                        f"file={file_id[:20]}"
+                        f"file_id={file_id[:30]}..."
                     )
                     return
             except Exception as e:
