@@ -5,6 +5,12 @@
 # Guesses genre / decade / collection marker / language hint.
 # Never blocks a file. Empty tags are fine.
 #
+# NOTE ON LANGUAGE HINTS:
+#   Only full-word aliases are used — no 2-letter codes and no
+#   short 3-letter codes that collide with common English words
+#   (ben, mar, pun, spa, etc.). This bot is primarily Tamil +
+#   Malayalam, so false language hints would break search.
+#
 # ============================================================
 
 from __future__ import annotations
@@ -42,26 +48,40 @@ _GENRE_MAP = {
     "western":     ["western", "cowboy"],
 }
 
+# ── Only FULL-WORD, NON-AMBIGUOUS aliases ──
 _LANG_HINTS = {
-    "English":   ["english", "eng", "en"],
-    "Hindi":     ["hindi", "hin", "hi"],
-    "Tamil":     ["tamil", "tam", "ta"],
-    "Telugu":    ["telugu", "tel", "te"],
-    "Malayalam": ["malayalam", "mal", "ml"],
-    "Kannada":   ["kannada", "kan", "kn"],
-    "Bengali":   ["bengali", "ben", "bn"],
-    "Marathi":   ["marathi", "mar", "mr"],
-    "Punjabi":   ["punjabi", "pun", "pa"],
-    "Korean":    ["korean", "kor", "ko"],
-    "Japanese":  ["japanese", "jpn", "ja"],
-    "Chinese":   ["chinese", "chi", "zh"],
-    "Spanish":   ["spanish", "spa", "es"],
-    "French":    ["french", "fre", "fr"],
-    "German":    ["german", "ger", "de"],
-    "Russian":   ["russian", "rus", "ru"],
-    "Arabic":    ["arabic", "ara", "ar"],
-    "Turkish":   ["turkish", "tur", "tr"],
-    "Thai":      ["thai", "tha", "th"],
+    "English":     ["english"],
+    "Hindi":       ["hindi"],
+    "Tamil":       ["tamil"],
+    "Telugu":      ["telugu"],
+    "Malayalam":   ["malayalam"],
+    "Kannada":     ["kannada"],
+    "Bengali":     ["bengali"],
+    "Marathi":     ["marathi"],
+    "Punjabi":     ["punjabi"],
+    "Urdu":        ["urdu"],
+    "Korean":      ["korean"],
+    "Japanese":    ["japanese"],
+    "Chinese":     ["chinese", "mandarin", "cantonese"],
+    "Spanish":     ["spanish", "castellano", "espanol"],
+    "French":      ["french", "francais"],
+    "German":      ["german", "deutsch"],
+    "Russian":     ["russian"],
+    "Arabic":      ["arabic"],
+    "Turkish":     ["turkish"],
+    "Thai":        ["thai"],
+    "Italian":     ["italian"],
+    "Portuguese":  ["portuguese", "portugues"],
+    "Dutch":       ["dutch"],
+    "Polish":      ["polish"],
+    "Indonesian":  ["indonesian"],
+    "Vietnamese":  ["vietnamese"],
+    "Filipino":    ["filipino", "tagalog"],
+    "Nepali":      ["nepali"],
+    "Sinhala":     ["sinhala", "sinhalese"],
+    "Assamese":    ["assamese"],
+    "Odia":        ["odia", "oriya"],
+    "Bhojpuri":    ["bhojpuri"],
 }
 
 
@@ -128,6 +148,7 @@ def _find_collection_marker(text: str) -> Optional[str]:
 
 
 def _guess_language(text: str) -> Optional[str]:
+    """Only full-word aliases — no short codes, no false positives."""
     for lang, aliases in _LANG_HINTS.items():
         for alias in aliases:
             if re.search(rf"\b{re.escape(alias)}\b", text):
