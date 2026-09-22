@@ -603,20 +603,30 @@ async def _handle_message(C: Client, msg) -> None:
             STATE["saved"] += 1
             rec = result.get("record") or {}
             rtype = str(rec.get("type") or "").lower()
+            title_dbg = (
+                rec.get("title")
+                or rec.get("series_title")
+                or rec.get("file_name")
+                or "?"
+            )
+
             if rtype == "movie":
                 STATE["movies"] += 1
             elif rtype == "series":
                 STATE["series"] += 1
+            else:
+                # DEBUG — shows what the pipeline actually stored
+                logger.warning(
+                    f"[INDEX-WORKER] ⚠️ SAVED but type={rtype!r} "
+                    f"keys={list(rec.keys())[:10]}"
+                )
+
             logger.info(
-                f"[INDEX-WORKER] ✅ SAVED msg={msg.id} type={rtype} "
-                f"title='{rec.get('title') or rec.get('series_title') or '?'}'"
+                f"[INDEX-WORKER] ✅ SAVED msg={msg.id} "
+                f"type={rtype or 'unknown'} "
+                f"title='{str(title_dbg)[:60]}'"
             )
-        elif status == "duplicate":
-            STATE["duplicate_id"] += 1
-            logger.info(
-                f"[INDEX-WORKER] ♻️ DUP(pipe) msg={msg.id} "
-                f"reason={result.get('reason')}"
-            )
+            
         elif status == "skipped":
             reason = str(result.get("reason") or "")
             if "file_id" in reason:
