@@ -37,7 +37,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import (
