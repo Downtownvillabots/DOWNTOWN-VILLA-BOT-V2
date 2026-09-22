@@ -1,35 +1,41 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — BACKUP CHANNEL MANAGER (IN-PANEL)
+# 🏨 DOWNTOWN VILLA — BACKUP PANEL (THE ONE COMMAND)
 # ============================================================
 #
-# Channel management is INSIDE the /backup panel.
-# No separate command.
+# ONLY ONE COMMAND:
+#     /backup
 #
-# Exposed as:
-#   open_channels_panel(client, q_or_msg)   ← called from /backup
-#   router_handler(client, q)               ← handles bch:* callbacks
-#   text_handler(client, msg)               ← handles text input
+# Everything else is a button.
 #
-# Two kinds of channels:
-#   • BACKUP   — where files are copied (multiple allowed)
-#   • STORAGE  — long-term archive (multiple allowed)
+# Layout:
+#   ┌─────────────────────────────────┐
+#   │  📊 LIVE STATUS + PROGRESS BARS  │
+#   │                                 │
+#   │  [▶️ START] [⏸️ PAUSE] [⏹️ STOP] │
+#   │  [📢 CHANNELS] [📊 STATUS]       │
+#   │  [🧾 HISTORY] [❌ FAILURES]      │
+#   │  [♻️ RECONCILE] [🗑️ RESET]       │
+#   │  [🔄 REFRESH] [❌ CLOSE]         │
+#   └─────────────────────────────────┘
 #
-# Every action is a button. Zero commands.
+# Integrates:
+#   • channels.py      → channel manager (buttons)
+#   • state.py         → live progress + counts
+#   • worker.py        → start/pause/stop
+#   • reconcile.py     → crash recovery
+#   • reset.py         → wipe with confirm
 #
 # ============================================================
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import (
-    ChannelPrivate, PeerIdInvalid, UsernameInvalid, UsernameNotOccupied,
-)
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -37,6 +43,7 @@ from pyrogram.types import (
 from core import config
 from utils import fonts as F
 from utils import format as FM
+from utils import progress as P
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +52,8 @@ logger = logging.getLogger(__name__)
 # SECTION 1 — CONSTANTS
 # ============================================================
 
-PFX = "bch"          # callback namespace
-KIND_BACKUP = "backup"
-KIND_STORAGE = "storage"
+PFX = "dtvb"     # callback namespace for /backup panel
+AUTO_REFRESH_SEC = 5.0
 
 
 # ============================================================
@@ -62,833 +68,889 @@ def _is_admin(uid) -> bool:
 
 
 # ============================================================
-# SECTION 3 — DB ACCESS (system DB → backup_channels)
+# SECTION 3 — LIVE PANEL REGISTRY
 # ============================================================
 
-def _coll():
-    try:
-        from database import db_registry
-        db = db_registry.get_system_db()
-        if db is None:
-            return None
-        return db["backup_channels"]
-    except Exception:
-        return None
+# message_id → {chat_id, page, last_text, created}
+_panels: Dict[int, Dict[str, Any]] = {}
 
 
-async def _list_channels(kind: Optional[str] = None) -> List[Dict[str, Any]]:
-    c = _coll()
-    if c is None:
-        return []
-    query = {}
-    if kind:
-        query["kind"] = kind
-    try:
-        cursor = c.find(query).sort([("primary", -1), ("added_at", 1)])
-        docs = await cursor.to_list(length=200)
-        for d in docs:
-            d.pop("_id", None)
-        return docs
-    except Exception as e:
-        logger.warning(f"[CH] list: {e}")
-        return []
-
-
-async def _get_channel(chat_id: int) -> Optional[Dict[str, Any]]:
-    c = _coll()
-    if c is None:
-        return None
-    try:
-        d = await c.find_one({"chat_id": int(chat_id)})
-        if d:
-            d.pop("_id", None)
-        return d
-    except Exception:
-        return None
-
-
-async def _add_channel(
-    chat_id: int,
-    title: str,
-    kind: str,
-    added_by: int,
-) -> bool:
-    c = _coll()
-    if c is None:
-        return False
-    try:
-        now = datetime.utcnow()
-        await c.update_one(
-            {"chat_id": int(chat_id)},
-            {
-                "$setOnInsert": {
-                    "chat_id": int(chat_id),
-                    "added_at": now,
-                    "primary": False,
-                    "enabled": True,
-                    "added_by": int(added_by),
-                },
-                "$set": {
-                    "title": str(title)[:120],
-                    "kind": str(kind),
-                    "updated_at": now,
-                },
-            },
-            upsert=True,
-        )
-        return True
-    except Exception as e:
-        logger.warning(f"[CH] add: {e}")
-        return False
-
-
-async def _update_channel(chat_id: int, **fields) -> bool:
-    c = _coll()
-    if c is None:
-        return False
-    try:
-        fields["updated_at"] = datetime.utcnow()
-        r = await c.update_one(
-            {"chat_id": int(chat_id)},
-            {"$set": fields},
-        )
-        return r.matched_count > 0
-    except Exception:
-        return False
-
-
-async def _remove_channel(chat_id: int) -> bool:
-    c = _coll()
-    if c is None:
-        return False
-    try:
-        r = await c.delete_one({"chat_id": int(chat_id)})
-        return r.deleted_count > 0
-    except Exception:
-        return False
-
-
-async def _set_primary(chat_id: int, kind: str) -> bool:
-    c = _coll()
-    if c is None:
-        return False
-    try:
-        await c.update_many(
-            {"kind": str(kind), "chat_id": {"$ne": int(chat_id)}},
-            {"$set": {"primary": False}},
-        )
-        await c.update_one(
-            {"chat_id": int(chat_id)},
-            {"$set": {"primary": True, "updated_at": datetime.utcnow()}},
-        )
-        return True
-    except Exception:
-        return False
-
-
-async def _primary(kind: str) -> Optional[Dict[str, Any]]:
-    c = _coll()
-    if c is None:
-        return None
-    try:
-        d = await c.find_one(
-            {"kind": str(kind), "primary": True, "enabled": True}
-        )
-        if d:
-            d.pop("_id", None)
-            return d
-        d = await c.find_one({"kind": str(kind), "enabled": True})
-        if d:
-            d.pop("_id", None)
-            return d
-        return None
-    except Exception:
-        return None
-
-
-async def primary_backup_id() -> Optional[int]:
-    d = await _primary(KIND_BACKUP)
-    return int(d["chat_id"]) if d else None
-
-
-async def primary_storage_id() -> Optional[int]:
-    d = await _primary(KIND_STORAGE)
-    return int(d["chat_id"]) if d else None
-
-
-# ============================================================
-# SECTION 4 — RESOLVE CHANNEL
-# ============================================================
-
-async def _resolve_channel(client: Client, text: str) -> Dict[str, Any]:
-    out = {"ok": False, "chat_id": None, "title": "", "username": "",
-           "error": ""}
-    text = (text or "").strip()
-
-    try:
-        if text.startswith("@"):
-            chat = await client.get_chat(text)
-        else:
-            try:
-                chat_id = int(text)
-            except ValueError:
-                out["error"] = "send a channel id or @username"
-                return out
-            chat = await client.get_chat(chat_id)
-    except UsernameInvalid:
-        out["error"] = "invalid username"
-        return out
-    except UsernameNotOccupied:
-        out["error"] = "username not found"
-        return out
-    except ChannelPrivate:
-        out["error"] = "channel is private"
-        return out
-    except PeerIdInvalid:
-        out["error"] = "add the bot to the channel first"
-        return out
-    except Exception as e:
-        out["error"] = str(e)[:80]
-        return out
-
-    out["ok"] = True
-    out["chat_id"] = int(chat.id)
-    out["title"] = chat.title or str(chat.id)
-    out["username"] = chat.username or ""
-    return out
-
-
-# ============================================================
-# SECTION 5 — SESSIONS (text input state)
-# ============================================================
-
-_sessions: Dict[int, Dict[str, Any]] = {}
-SESSION_TTL = 300.0
-
-
-def _new_session(uid: int, action: str, **data) -> None:
-    _sessions[int(uid)] = {
-        "action": action,
-        "expires": time.time() + SESSION_TTL,
-        **data,
+def _register_panel(msg_id: int, chat_id: int, page: str, text: str) -> None:
+    _panels[msg_id] = {
+        "chat_id": chat_id,
+        "page": page,
+        "last_text": text,
+        "created": time.time(),
     }
 
 
-def _get_session(uid: int) -> Optional[Dict[str, Any]]:
-    s = _sessions.get(int(uid))
-    if not s:
-        return None
-    if time.time() > s["expires"]:
-        _sessions.pop(int(uid), None)
-        return None
-    return s
-
-
-def _drop_session(uid: int) -> None:
-    _sessions.pop(int(uid), None)
-
-
-def has_session(uid: int) -> bool:
-    return _get_session(uid) is not None
+def _unregister_panel(msg_id: int) -> None:
+    _panels.pop(msg_id, None)
 
 
 # ============================================================
-# SECTION 6 — KEYBOARDS
+# SECTION 4 — BUILD THE MAIN PANEL
 # ============================================================
 
-def _kb_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
+async def _build_main_panel() -> tuple:
+    """Build the main /backup panel."""
+    # Get state snapshot
+    stats = {}
+    state_ok = False
+    try:
+        from plugins.backup import state as ST
+        stats = await ST.stats()
+        state_ok = True
+    except Exception as e:
+        logger.debug(f"[BACKUP] stats: {e}")
+
+    # Worker status
+    worker_running = False
+    worker_paused = False
+    worker_mode = "idle"
+    worker_speed = 0.0
+    worker_eta = "—"
+    try:
+        from plugins.backup import worker as WK
+        w_status = WK.status()
+        worker_running = w_status.get("running", False)
+        worker_paused = w_status.get("paused", False)
+        worker_mode = w_status.get("mode", "idle")
+        worker_speed = w_status.get("speed", 0.0)
+        worker_eta = w_status.get("eta_text", "—")
+    except Exception:
+        pass
+
+    # Channel info
+    backup_ch = None
+    storage_ch = None
+    try:
+        from plugins.backup import channels as CH
+        backup_ch = await CH.primary_backup_id()
+        storage_ch = await CH.primary_storage_id()
+    except Exception:
+        pass
+
+    # Totals
+    totals = stats.get("totals", {}) if state_ok else {}
+    pending = totals.get("pending", 0)
+    uploaded = totals.get("uploaded", 0)
+    failed = totals.get("failed", 0)
+    uploading = totals.get("uploading", 0)
+    skipped = totals.get("skipped", 0)
+
+    grand_total = pending + uploaded + failed + uploading
+    pct = (uploaded / grand_total * 100) if grand_total > 0 else 0.0
+
+    # ────────── STATUS ICON ──────────
+    if worker_running and not worker_paused:
+        status_icon = "🟢"
+        status_text = "RUNNING"
+    elif worker_paused:
+        status_icon = "🟡"
+        status_text = "PAUSED"
+    else:
+        status_icon = "⚪"
+        status_text = "IDLE"
+
+    # ────────── RENDER ──────────
+    lines: List[str] = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"💾 <b>{F.fb('BACKUP CENTER')}</b>",
+        F.DIV,
+        "",
+        f"{status_icon} <b>{F.sc(status_text)}</b> · "
+        f"<i>{F.sc(worker_mode)}</i>",
+        "",
+    ]
+
+    # Channel info
+    if backup_ch:
+        lines.append(
+            f"📢 {F.sc('backup channel')} · <code>{backup_ch}</code>"
+        )
+    else:
+        lines.append(f"📢 {F.sc('backup channel')} · 🔴 {F.sc('not set')}")
+
+    if storage_ch:
+        lines.append(
+            f"📦 {F.sc('storage channel')} · <code>{storage_ch}</code>"
+        )
+    lines.append("")
+
+    # Progress
+    if grand_total > 0:
+        lines.append(F.DIV_S)
+        lines.append(f"{F.EMO['chart']} <b>{F.fb('PROGRESS')}</b>")
+        lines.append(F.DIV_S)
+        lines.append("")
+        lines.append(f"<code>{P.bar(pct, 'indexing', width=18)}</code>")
+        lines.append("")
+        lines.append(
+            f"✅ {F.sc('uploaded')} · <b>{FM.num(uploaded)}</b>"
+        )
+        lines.append(
+            f"⏳ {F.sc('pending')}  · <b>{FM.num(pending)}</b>"
+        )
+        lines.append(
+            f"🔄 {F.sc('uploading')} · <b>{FM.num(uploading)}</b>"
+        )
+        lines.append(
+            f"❌ {F.sc('failed')}   · <b>{FM.num(failed)}</b>"
+        )
+        lines.append(
+            f"⏭️ {F.sc('skipped')} · <b>{FM.num(skipped)}</b>"
+        )
+        lines.append("")
+
+        if worker_running and worker_speed > 0:
+            lines.append(
+                f"⚡ {F.sc('speed')} · <b>{FM.rate(worker_speed)}</b>"
+            )
+            lines.append(
+                f"⏱️ {F.sc('eta')} · <b>{worker_eta}</b>"
+            )
+            lines.append("")
+
+    # Per-source breakdown
+    if state_ok:
+        src_data = stats.get("by_source_db", {})
+        if any(v.get("uploaded", 0) or v.get("pending", 0)
+               for v in src_data.values()):
+            lines.append(F.DIV_S)
+            lines.append(f"{F.EMO['folder']} <b>{F.fb('BY SOURCE')}</b>")
+            lines.append(F.DIV_S)
+            lines.append("")
+            for src, s in src_data.items():
+                up = s.get("uploaded", 0)
+                pe = s.get("pending", 0)
+                fa = s.get("failed", 0)
+                tot = up + pe + fa
+                p_pct = (up / tot * 100) if tot > 0 else 0.0
+                lines.append(
+                    f"• <b>{F.sc(src)}</b> · "
+                    f"<code>{P.bar(p_pct, 'indexing', width=8, show_percent=False)}</code> "
+                    f"<b>{up}</b>/{tot}"
+                )
+                lines.append("")
+
+    # Per-shard breakdown
+    if state_ok:
+        shards = stats.get("shards", [])
+        if shards:
+            lines.append(F.DIV_S)
+            lines.append(
+                f"{F.EMO['db']} <b>{F.fb('BY SHARD')}</b> "
+                f"· <b>{len(shards)}</b>"
+            )
+            lines.append(F.DIV_S)
+            lines.append("")
+            for s in shards[:5]:
+                icon = "🟢" if s.get("online") else "🔴"
+                lines.append(
+                    f"{icon} <code>{str(s.get('label', '?'))[:20]}</code>"
+                )
+                lines.append(
+                    f"   ✅ <b>{FM.num(s.get('uploaded', 0))}</b> · "
+                    f"⏳ <b>{FM.num(s.get('pending', 0))}</b> · "
+                    f"❌ <b>{FM.num(s.get('failed', 0))}</b>"
+                )
+            if len(shards) > 5:
+                lines.append(f"<i>… +{len(shards) - 5} more</i>")
+            lines.append("")
+
+    lines += [
+        F.DIV_S,
+        f"🕒 <code>{FM.datetime_()}</code>",
+    ]
+
+    text = "\n".join(lines)[:4000]
+
+    # ────────── KEYBOARD ──────────
+    kb = _build_main_kb(
+        running=worker_running,
+        paused=worker_paused,
+    )
+
+    return text, kb
+
+
+def _build_main_kb(running: bool, paused: bool) -> InlineKeyboardMarkup:
+    """Build the main keyboard."""
+    rows: List[List[InlineKeyboardButton]] = []
+
+    # Row 1: START/PAUSE/STOP
+    if not running:
+        rows.append([
             InlineKeyboardButton(
-                f"💾 {F.sc('backup channels')}",
-                callback_data=f"{PFX}:list:{KIND_BACKUP}",
+                f"{F.EMO['play']} {F.sc('start')}",
+                callback_data=f"{PFX}:start",
+            ),
+        ])
+    elif paused:
+        rows.append([
+            InlineKeyboardButton(
+                f"{F.EMO['play']} {F.sc('resume')}",
+                callback_data=f"{PFX}:resume",
             ),
             InlineKeyboardButton(
-                f"📦 {F.sc('storage channels')}",
-                callback_data=f"{PFX}:list:{KIND_STORAGE}",
+                f"{F.EMO['stop']} {F.sc('stop')}",
+                callback_data=f"{PFX}:stop",
+            ),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                f"{F.EMO['pause']} {F.sc('pause')}",
+                callback_data=f"{PFX}:pause",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['stop']} {F.sc('stop')}",
+                callback_data=f"{PFX}:stop",
+            ),
+        ])
+
+    # Row 2: CHANNELS / STATUS
+    rows.append([
+        InlineKeyboardButton(
+            f"📢 {F.sc('channels')}",
+            callback_data=f"{PFX}:channels",
+        ),
+        InlineKeyboardButton(
+            f"📊 {F.sc('full status')}",
+            callback_data=f"{PFX}:status",
+        ),
+    ])
+
+    # Row 3: HISTORY / FAILURES
+    rows.append([
+        InlineKeyboardButton(
+            f"🧾 {F.sc('history')}",
+            callback_data=f"{PFX}:history",
+        ),
+        InlineKeyboardButton(
+            f"❌ {F.sc('failures')}",
+            callback_data=f"{PFX}:failures",
+        ),
+    ])
+
+    # Row 4: RECONCILE / RETRY FAILED
+    rows.append([
+        InlineKeyboardButton(
+            f"♻️ {F.sc('reconcile')}",
+            callback_data=f"{PFX}:reconcile",
+        ),
+        InlineKeyboardButton(
+            f"🔁 {F.sc('retry failed')}",
+            callback_data=f"{PFX}:retry_failed",
+        ),
+    ])
+
+    # Row 5: RESET
+    rows.append([
+        InlineKeyboardButton(
+            f"🗑️ {F.sc('reset all')}",
+            callback_data=f"{PFX}:reset",
+        ),
+    ])
+
+    # Row 6: REFRESH / CLOSE
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"{PFX}:refresh",
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data=f"{PFX}:close",
+        ),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
+# SECTION 5 — SUB-PANELS
+# ============================================================
+
+async def _build_status_panel() -> tuple:
+    """Detailed per-shard per-source status."""
+    try:
+        from plugins.backup import state as ST
+        stats = await ST.stats()
+    except Exception:
+        stats = {}
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📊 <b>{F.fb('FULL STATUS')}</b>",
+        F.DIV,
+        "",
+    ]
+
+    # Totals
+    totals = stats.get("totals", {})
+    for k, icon in (
+        ("uploaded", "✅"), ("pending", "⏳"),
+        ("uploading", "🔄"), ("failed", "❌"), ("skipped", "⏭️"),
+    ):
+        lines.append(
+            f"{icon} <b>{F.sc(k)}</b> · "
+            f"<b>{FM.num(totals.get(k, 0))}</b>"
+        )
+    lines.append("")
+
+    # Per-source
+    src_data = stats.get("by_source_db", {})
+    if src_data:
+        lines.append(F.DIV_S)
+        lines.append(f"{F.EMO['folder']} <b>{F.fb('BY SOURCE')}</b>")
+        lines.append(F.DIV_S)
+        lines.append("")
+        for src in ("Media", "Media2", "Media3"):
+            s = src_data.get(src, {})
+            up = s.get("uploaded", 0)
+            pe = s.get("pending", 0)
+            fa = s.get("failed", 0)
+            tot = up + pe + fa
+            p_pct = (up / tot * 100) if tot > 0 else 0.0
+            lines.append(f"<b>{F.sc(src)}</b>")
+            lines.append(
+                f"<code>{P.bar(p_pct, 'indexing', width=14)}</code>"
+            )
+            lines.append(
+                f"  ✅ <b>{FM.num(up)}</b> · "
+                f"⏳ <b>{FM.num(pe)}</b> · "
+                f"❌ <b>{FM.num(fa)}</b>"
+            )
+            lines.append("")
+
+    # Per-shard
+    shards = stats.get("shards", [])
+    if shards:
+        lines.append(F.DIV_S)
+        lines.append(f"{F.EMO['db']} <b>{F.fb('BY SHARD')}</b>")
+        lines.append(F.DIV_S)
+        lines.append("")
+        for s in shards:
+            icon = "🟢" if s.get("online") else "🔴"
+            lines.append(
+                f"{icon} <code>{str(s.get('label', '?'))[:24]}</code>"
+            )
+            lines.append(
+                f"   ✅ <b>{FM.num(s.get('uploaded', 0))}</b> · "
+                f"⏳ <b>{FM.num(s.get('pending', 0))}</b> · "
+                f"❌ <b>{FM.num(s.get('failed', 0))}</b>"
+            )
+            lines.append("")
+
+    lines.append(f"🕒 <code>{FM.datetime_()}</code>")
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data=f"{PFX}:status",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"{PFX}:back",
             ),
         ],
         [
             InlineKeyboardButton(
-                f"➕ {F.sc('add backup')}",
-                callback_data=f"{PFX}:add:{KIND_BACKUP}",
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data=f"{PFX}:close",
+            ),
+        ],
+    ])
+
+    return "\n".join(lines)[:4000], kb
+
+
+async def _build_history_panel() -> tuple:
+    """Backup run history."""
+    try:
+        from plugins.backup import state as ST
+        runs = await ST.list_runs(limit=12)
+    except Exception:
+        runs = []
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🧾 <b>{F.fb('BACKUP HISTORY')}</b>",
+        F.DIV,
+        "",
+    ]
+
+    if not runs:
+        lines.append(f"⚪ {F.sc('no runs yet')}")
+    else:
+        for r in runs:
+            status = str(r.get("status", "?"))
+            icon = {
+                "RUNNING": "🟢",
+                "COMPLETED": "✅",
+                "STOPPED": "🛑",
+                "FAILED": "❌",
+                "ERROR": "💥",
+            }.get(status, "⚪")
+
+            started = r.get("started_at")
+            finished = r.get("finished_at")
+
+            start_str = "?"
+            duration_str = "running"
+            if started:
+                try:
+                    start_str = started.strftime("%d %b · %H:%M")
+                    if finished:
+                        d = (finished - started).total_seconds()
+                        duration_str = FM.duration_short(d)
+                except Exception:
+                    pass
+
+            lines.append(
+                f"{icon} <b>{F.sc(status)}</b>"
+            )
+            lines.append(f"   🕒 <code>{start_str}</code> · "
+                         f"⏱️ {duration_str}")
+            lines.append(
+                f"   ✅ <b>{FM.num(r.get('uploaded', 0))}</b> · "
+                f"❌ <b>{FM.num(r.get('failed', 0))}</b>"
+            )
+            lines.append("")
+
+    lines.append(f"🕒 <code>{FM.datetime_()}</code>")
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data=f"{PFX}:history",
             ),
             InlineKeyboardButton(
-                f"➕ {F.sc('add storage')}",
-                callback_data=f"{PFX}:add:{KIND_STORAGE}",
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"{PFX}:back",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data=f"{PFX}:close",
+            ),
+        ],
+    ])
+
+    return "\n".join(lines)[:4000], kb
+
+
+async def _build_failures_panel() -> tuple:
+    """Failed files list."""
+    try:
+        from plugins.backup import state as ST
+        failures = await ST.list_failed(limit=15)
+    except Exception:
+        failures = []
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"❌ <b>{F.fb('FAILURES')}</b>",
+        F.DIV,
+        "",
+    ]
+
+    if not failures:
+        lines.append(f"🟢 {F.sc('no failures')}")
+        lines.append("")
+        lines.append(f"📌 {F.sc('everything is uploading cleanly')}")
+    else:
+        for i, f_ in enumerate(failures, 1):
+            name = str(f_.get("file_name", "?"))[:40]
+            src = str(f_.get("source_db", "?"))
+            attempts = f_.get("attempts", 0)
+            err = str(f_.get("last_error", ""))[:100]
+
+            lines.append(
+                f"<b>{i:02d}.</b> {F.EMO['film']} <code>{name}</code>"
+            )
+            lines.append(
+                f"   📁 {F.sc(src)} · "
+                f"🔁 attempts <b>{attempts}</b>"
+            )
+            if err:
+                lines.append(f"   ⚠️ <i>{F.sc(err)}</i>")
+            lines.append("")
+
+    lines.append(f"🕒 <code>{FM.datetime_()}</code>")
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"🔁 {F.sc('retry all failed')}",
+                callback_data=f"{PFX}:retry_failed",
             ),
         ],
         [
             InlineKeyboardButton(
                 f"{F.EMO['refresh']} {F.sc('refresh')}",
-                callback_data=f"{PFX}:home",
+                callback_data=f"{PFX}:failures",
             ),
-            InlineKeyboardButton(
-                f"{F.EMO['back']} {F.sc('back to backup')}",
-                callback_data="dtvb:back",  # goes back to /backup main
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"{F.EMO['cross']} {F.sc('close')}",
-                callback_data="dtvb:close",
-            ),
-        ],
-    ])
-
-
-def _kb_list(kind: str, channels: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-
-    for ch in channels:
-        icon = "🟢" if ch.get("enabled") else "🔴"
-        primary = "⭐ " if ch.get("primary") else ""
-        title = str(ch.get("title", "?"))[:32]
-        rows.append([InlineKeyboardButton(
-            f"{primary}{icon} {title}",
-            callback_data=f"{PFX}:view:{kind}:{ch['chat_id']}",
-        )])
-
-    rows.append([
-        InlineKeyboardButton(
-            f"➕ {F.sc('add new')}",
-            callback_data=f"{PFX}:add:{kind}",
-        ),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"{PFX}:home",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data="dtvb:close",
-        ),
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
-def _kb_view(kind: str, chat_id: int, ch: Dict[str, Any]) -> InlineKeyboardMarkup:
-    enabled = ch.get("enabled", True)
-    primary = ch.get("primary", False)
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                f"{'🔴 ' + F.sc('disable') if enabled else '🟢 ' + F.sc('enable')}",
-                callback_data=f"{PFX}:toggle:{kind}:{chat_id}",
-            ),
-            InlineKeyboardButton(
-                f"{'⭐ ' + F.sc('unset primary') if primary else '⭐ ' + F.sc('set primary')}",
-                callback_data=f"{PFX}:primary:{kind}:{chat_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"✏️ {F.sc('rename')}",
-                callback_data=f"{PFX}:rename:{kind}:{chat_id}",
-            ),
-            InlineKeyboardButton(
-                f"🧪 {F.sc('test')}",
-                callback_data=f"{PFX}:test:{kind}:{chat_id}",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"🗑️ {F.sc('remove')}",
-                callback_data=f"{PFX}:confirm_rm:{kind}:{chat_id}",
-            ),
-        ],
-        [
             InlineKeyboardButton(
                 f"{F.EMO['back']} {F.sc('back')}",
-                callback_data=f"{PFX}:list:{kind}",
+                callback_data=f"{PFX}:back",
             ),
+        ],
+        [
             InlineKeyboardButton(
                 f"{F.EMO['cross']} {F.sc('close')}",
-                callback_data="dtvb:close",
+                callback_data=f"{PFX}:close",
             ),
         ],
     ])
 
-
-def _kb_cancel(target: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data=target,
-        ),
-    ]])
+    return "\n".join(lines)[:4000], kb
 
 
 # ============================================================
-# SECTION 7 — PANEL TEXT RENDERERS
+# SECTION 6 — COMMAND
 # ============================================================
 
-def _home_text(ch_backup: List[Dict[str, Any]],
-               ch_storage: List[Dict[str, Any]]) -> str:
-    bcount = len(ch_backup)
-    scount = len(ch_storage)
-    b_primary = next((c for c in ch_backup if c.get("primary")), None)
-    s_primary = next((c for c in ch_storage if c.get("primary")), None)
-
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['channel']} <b>{F.fb('CHANNEL MANAGER')}</b>",
-        F.DIV,
-        "",
-        f"💾 <b>{F.sc('backup channels')}</b> · <b>{bcount}</b>",
-    ]
-    if b_primary:
-        lines.append(
-            f"   ⭐ {F.sc('primary')} · "
-            f"<code>{str(b_primary.get('title', '?'))[:32]}</code>"
+@Client.on_message(
+    filters.command(["backup"]) & filters.private,
+    group=-8300,
+)
+async def cmd_backup(client: Client, message: Message):
+    """THE one backup command."""
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} <b>{F.fb('ACCESS DENIED')}</b>\n"
+            f"<i>{F.sc('admins only')}</i>",
+            parse_mode=ParseMode.HTML,
         )
-    else:
-        lines.append(f"   ⚪ {F.sc('no primary set')}")
 
-    lines += [
-        "",
-        f"📦 <b>{F.sc('storage channels')}</b> · <b>{scount}</b>",
-    ]
-    if s_primary:
-        lines.append(
-            f"   ⭐ {F.sc('primary')} · "
-            f"<code>{str(s_primary.get('title', '?'))[:32]}</code>"
-        )
-    else:
-        lines.append(f"   ⚪ {F.sc('no primary set')}")
+    text, kb = await _build_main_panel()
 
-    lines += [
-        "",
-        F.DIV_S,
-        f"📌 {F.sc('everything is editable from Telegram')}",
-        f"📌 {F.sc('no env changes needed')}",
-    ]
-    return "\n".join(lines)
+    sent = await message.reply_text(
+        text,
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
+    _register_panel(sent.id, sent.chat.id, "main", text)
 
-def _list_text(kind: str, channels: List[Dict[str, Any]]) -> str:
-    icon = "💾" if kind == KIND_BACKUP else "📦"
-    label = "Backup" if kind == KIND_BACKUP else "Storage"
-
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{icon} <b>{F.fb(f'{label.upper()} CHANNELS')}</b>",
-        F.DIV,
-        "",
-        f"📊 {F.sc('total')} · <b>{len(channels)}</b>",
-        "",
-        F.DIV_S,
-        "",
-    ]
-
-    if not channels:
-        lines.append(f"⚪ {F.sc('no channels yet')}")
-        lines.append("")
-        lines.append(f"📌 {F.sc('tap ADD NEW to add one')}")
-        return "\n".join(lines)
-
-    for i, ch in enumerate(channels, 1):
-        enabled = ch.get("enabled", True)
-        primary = ch.get("primary", False)
-        title = str(ch.get("title", "?"))[:40]
-        cid = ch.get("chat_id")
-
-        status_icon = "🟢" if enabled else "🔴"
-        star = "⭐ " if primary else ""
-
-        lines.append(
-            f"<b>{i:02d}.</b> {status_icon} {star}<b>{F.sc(title)}</b>"
-        )
-        lines.append(f"    🆔 <code>{cid}</code>")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-def _view_text(kind: str, ch: Dict[str, Any]) -> str:
-    icon = "💾" if kind == KIND_BACKUP else "📦"
-    label = "Backup" if kind == KIND_BACKUP else "Storage"
-
-    enabled = ch.get("enabled", True)
-    primary = ch.get("primary", False)
-
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{icon} <b>{F.fb('CHANNEL DETAIL')}</b>",
-        F.DIV,
-        "",
-        f"📛 {F.sc('title')} · "
-        f"<b>{F.sc(str(ch.get('title', '?'))[:40])}</b>",
-        f"🏷️ {F.sc('kind')} · <code>{label}</code>",
-        f"🆔 {F.sc('chat id')} · <code>{ch.get('chat_id')}</code>",
-        "",
-        f"⚙️ {F.sc('status')} · "
-        f"{'🟢 ' + F.sc('enabled') if enabled else '🔴 ' + F.sc('disabled')}",
-        f"⭐ {F.sc('primary')} · "
-        f"{'🟢 yes' if primary else '🔴 no'}",
-        "",
-        F.DIV_S,
-        "",
-        f"📌 {F.sc('used for')} <b>{F.sc(label.lower())}</b> operations",
-    ]
-
-    added = ch.get("added_at")
-    if added:
-        try:
-            ts = added.timestamp() if hasattr(added, "timestamp") else 0
-            if ts:
-                lines.append(
-                    f"📅 {F.sc('added')} · "
-                    f"<code>{FM.datetime_(datetime.fromtimestamp(ts))}</code>"
-                )
-        except Exception:
-            pass
-
-    return "\n".join(lines)
+    # Start auto-refresh
+    _ensure_auto_refresh()
 
 
 # ============================================================
-# SECTION 8 — PUBLIC: OPEN PANEL (called from /backup)
+# SECTION 7 — CALLBACK ROUTER
 # ============================================================
 
-async def open_channels_panel(client: Client, q_or_msg) -> None:
-    """
-    Open the channel manager panel.
-    Called from /backup panel via callback or message.
-    """
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:"),
+    group=-8300,
+)
+async def backup_router(client: Client, q: CallbackQuery):
+    """Route every dtvb:* callback."""
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌ Admin only", show_alert=True)
+
+    action = str(q.data).split(":")[1] if ":" in q.data else ""
+
     try:
-        ch_backup = await _list_channels(KIND_BACKUP)
-        ch_storage = await _list_channels(KIND_STORAGE)
-        text = _home_text(ch_backup, ch_storage)
+        # ────────── CHANNEL MANAGER (delegate) ──────────
+        if action == "channels":
+            from plugins.backup import channels as CH
+            return await CH.open_channels_panel(client, q)
 
-        # If it's a callback, edit the message
-        if isinstance(q_or_msg, CallbackQuery):
+        # ────────── BACK TO MAIN ──────────
+        if action in ("back", "refresh"):
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "main", text)
+            return await q.answer()
+
+        # ────────── START ──────────
+        if action == "start":
             try:
-                await q_or_msg.message.edit_text(
-                    text,
-                    reply_markup=_kb_home(),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
+                from plugins.backup import worker as WK
+                ok = await WK.start_worker(owner=q.from_user.id)
+                await q.answer(
+                    "▶️ Backup started" if ok else "⚠️ Already running",
                 )
             except Exception as e:
-                if "not modified" not in str(e).lower():
-                    logger.debug(f"[CH] edit: {e}")
-            await q_or_msg.answer()
-        else:
-            # It's a Message
-            await q_or_msg.reply_text(
-                text,
-                reply_markup=_kb_home(),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    except Exception as e:
-        logger.exception(f"[CH] open panel: {e}")
-
-
-# ============================================================
-# SECTION 9 — PUBLIC: CALLBACK ROUTER
-# ============================================================
-
-async def router_handler(client: Client, q: CallbackQuery) -> bool:
-    """
-    Handle bch:* callbacks.
-    Returns True if handled.
-    """
-    if not str(q.data or "").startswith(f"{PFX}:"):
-        return False
-
-    if not q.from_user or not _is_admin(q.from_user.id):
-        await q.answer("❌ Admin only", show_alert=True)
-        return True
-
-    parts = str(q.data).split(":")
-    action = parts[1] if len(parts) > 1 else ""
-
-    try:
-        # ────────── HOME ──────────
-        if action == "home":
-            ch_backup = await _list_channels(KIND_BACKUP)
-            ch_storage = await _list_channels(KIND_STORAGE)
-            text = _home_text(ch_backup, ch_storage)
-            await _safe_edit(q, text, _kb_home())
-            return True
-
-        # ────────── LIST ──────────
-        if action == "list":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            channels = await _list_channels(kind)
-            text = _list_text(kind, channels)
-            await _safe_edit(q, text, _kb_list(kind, channels))
-            return True
-
-        # ────────── VIEW ──────────
-        if action == "view":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            ch = await _get_channel(cid)
-            if ch is None:
-                await q.answer("⚠️ Not found", show_alert=True)
-                return True
-            text = _view_text(kind, ch)
-            await _safe_edit(q, text, _kb_view(kind, cid, ch))
-            return True
-
-        # ────────── TOGGLE ──────────
-        if action == "toggle":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            ch = await _get_channel(cid)
-            if ch is None:
-                await q.answer("⚠️ Not found", show_alert=True)
-                return True
-            new_state = not ch.get("enabled", True)
-            await _update_channel(cid, enabled=new_state)
-            await q.answer("🟢 Enabled" if new_state else "🔴 Disabled")
-            ch = await _get_channel(cid)
-            text = _view_text(kind, ch)
-            await _safe_edit(q, text, _kb_view(kind, cid, ch))
-            return True
-
-        # ────────── PRIMARY ──────────
-        if action == "primary":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            ch = await _get_channel(cid)
-            if ch is None:
-                await q.answer("⚠️ Not found", show_alert=True)
-                return True
-
-            if ch.get("primary"):
-                await _update_channel(cid, primary=False)
-                await q.answer("⭐ Unset primary")
-            else:
-                await _set_primary(cid, kind)
-                await q.answer("⭐ Set as primary")
-
-            ch = await _get_channel(cid)
-            text = _view_text(kind, ch)
-            await _safe_edit(q, text, _kb_view(kind, cid, ch))
-            return True
-
-        # ────────── ADD ──────────
-        if action == "add":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            _new_session(q.from_user.id, "add_channel", kind=kind)
-            label = "Backup" if kind == KIND_BACKUP else "Storage"
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"➕ <b>{F.fb(f'ADD {label.upper()} CHANNEL')}</b>",
-                F.DIV,
-                "",
-                f"📝 {F.sc('send the channel id or @username')}",
-                "",
-                F.DIV_S,
-                "",
-                f"📌 {F.sc('examples')}",
-                f"• <code>-1001234567890</code>",
-                f"• <code>@mychannel</code>",
-                "",
-                f"{F.EMO['warn']} {F.sc('bot must be admin in the channel')}",
-            ])
-            await _safe_edit(q, text, _kb_cancel(f"{PFX}:home"))
-            return True
-
-        # ────────── RENAME ──────────
-        if action == "rename":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            _new_session(q.from_user.id, "rename", kind=kind, chat_id=cid)
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"✏️ <b>{F.fb('RENAME CHANNEL')}</b>",
-                F.DIV,
-                "",
-                f"📝 {F.sc('send the new title')}",
-                f"📌 {F.sc('max 60 characters')}",
-            ])
-            await _safe_edit(q, text, _kb_cancel(f"{PFX}:view:{kind}:{cid}"))
-            return True
-
-        # ────────── TEST ──────────
-        if action == "test":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            ok = await _test_channel(client, cid)
-            await q.answer(
-                "✅ Message sent!" if ok else "❌ Failed to send",
-                show_alert=True,
-            )
-            return True
-
-        # ────────── CONFIRM REMOVE ──────────
-        if action == "confirm_rm":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"{F.EMO['warn']} <b>{F.fb('REMOVE CHANNEL?')}</b>",
-                F.DIV,
-                "",
-                f"🆔 <code>{cid}</code>",
-                "",
-                f"{F.EMO['warn']} {F.sc('only removes from manager')}",
-                f"{F.EMO['info']} {F.sc('Telegram channel stays intact')}",
-            ])
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    f"🗑️ {F.sc('yes, remove')}",
-                    callback_data=f"{PFX}:do_rm:{kind}:{cid}",
-                )],
-                [InlineKeyboardButton(
-                    f"{F.EMO['back']} {F.sc('cancel')}",
-                    callback_data=f"{PFX}:view:{kind}:{cid}",
-                )],
-            ])
+                logger.exception(f"[BACKUP] start: {e}")
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+            text, kb = await _build_main_panel()
             await _safe_edit(q, text, kb)
-            return True
+            _ensure_auto_refresh()
+            return
 
-        # ────────── DO REMOVE ──────────
-        if action == "do_rm":
-            kind = parts[2] if len(parts) > 2 else KIND_BACKUP
-            cid = int(parts[3]) if len(parts) > 3 else 0
-            ok = await _remove_channel(cid)
-            await q.answer("✅ Removed" if ok else "⚠️ Not found")
-            channels = await _list_channels(kind)
-            text = _list_text(kind, channels)
-            await _safe_edit(q, text, _kb_list(kind, channels))
-            return True
+        # ────────── PAUSE ──────────
+        if action == "pause":
+            try:
+                from plugins.backup import worker as WK
+                ok = WK.pause_worker()
+                await q.answer("⏸️ Paused" if ok else "⚠️ Not running")
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            return
 
-        return False
+        # ────────── RESUME ──────────
+        if action == "resume":
+            try:
+                from plugins.backup import worker as WK
+                ok = WK.resume_worker()
+                await q.answer("▶️ Resumed" if ok else "⚠️ Not paused")
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            return
+
+        # ────────── STOP ──────────
+        if action == "stop":
+            try:
+                from plugins.backup import worker as WK
+                ok = WK.stop_worker()
+                await q.answer("⏹️ Stopping…" if ok else "⚠️ Not running")
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            return
+
+        # ────────── STATUS ──────────
+        if action == "status":
+            text, kb = await _build_status_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "status", text)
+            return await q.answer()
+
+        # ────────── HISTORY ──────────
+        if action == "history":
+            text, kb = await _build_history_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "history", text)
+            return await q.answer()
+
+        # ────────── FAILURES ──────────
+        if action == "failures":
+            text, kb = await _build_failures_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "failures", text)
+            return await q.answer()
+
+        # ────────── RETRY FAILED ──────────
+        if action == "retry_failed":
+            try:
+                from plugins.backup import state as ST
+                from plugins.backup import worker as WK
+
+                n = await ST.reset_failed()
+                await q.answer(f"🔁 {n} queued for retry")
+
+                if n > 0:
+                    await WK.start_worker(owner=q.from_user.id)
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            return
+
+        # ────────── RECONCILE ──────────
+        if action == "reconcile":
+            await q.answer("♻️ Reconciling…")
+            try:
+                from plugins.backup import reconcile as RC
+                result = await RC.reconcile_all(client=client)
+                await q.message.reply_text(
+                    "\n".join([
+                        f"{F.EMO['check']} <b>{F.fb('RECONCILE DONE')}</b>",
+                        F.DIV,
+                        "",
+                        f"🔍 {F.sc('scanned')} · "
+                        f"<b>{FM.num(result.get('scanned', 0))}</b>",
+                        f"✅ {F.sc('recovered')} · "
+                        f"<b>{FM.num(result.get('recovered', 0))}</b>",
+                        f"⏳ {F.sc('still pending')} · "
+                        f"<b>{FM.num(result.get('pending', 0))}</b>",
+                    ]),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.exception(f"[BACKUP] reconcile: {e}")
+                await q.message.reply_text(
+                    f"❌ {F.sc('reconcile failed')}: "
+                    f"<code>{type(e).__name__}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+
+        # ────────── RESET ──────────
+        if action == "reset":
+            try:
+                from plugins.backup import reset as RS
+                return await RS.open_reset_panel(client, q)
+            except Exception as e:
+                logger.exception(f"[BACKUP] reset: {e}")
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+
+        # ────────── CLOSE ──────────
+        if action == "close":
+            _unregister_panel(q.message.id)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            return await q.answer("Closed")
+
+        # ────────── UNKNOWN ──────────
+        await q.answer("❓ Unknown", show_alert=True)
 
     except Exception as e:
-        logger.exception(f"[CH] callback error: {e}")
+        logger.exception(f"[BACKUP] router: {e}")
         try:
             await q.answer(f"❌ {type(e).__name__}", show_alert=True)
         except Exception:
             pass
-        return True
 
 
 # ============================================================
-# SECTION 10 — PUBLIC: TEXT INPUT HANDLER
+# SECTION 8 — TEXT INPUT DELEGATION
 # ============================================================
 
-async def text_handler(client: Client, message: Message) -> bool:
+@Client.on_message(
+    filters.private & filters.text & ~filters.regex(r"^/"),
+    group=-8290,
+)
+async def backup_text_input(client: Client, message: Message):
+    """Route text input to channels.py (add/rename)."""
+    if not message.from_user:
+        return
+    try:
+        from plugins.backup import channels as CH
+        handled = await CH.text_handler(client, message)
+        if handled:
+            try:
+                message.stop_propagation()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"[BACKUP] text: {e}")
+
+
+# ============================================================
+# SECTION 9 — AUTO REFRESH
+# ============================================================
+
+_refresh_task: Optional[asyncio.Task] = None
+
+
+def _ensure_auto_refresh() -> None:
+    global _refresh_task
+    if _refresh_task and not _refresh_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _refresh_task = loop.create_task(_auto_refresh_loop())
+    except RuntimeError:
+        pass
+
+
+async def _auto_refresh_loop() -> None:
+    """Refresh every open panel every 5s (only if worker is active)."""
+    while True:
+        try:
+            await asyncio.sleep(AUTO_REFRESH_SEC)
+
+            if not _panels:
+                continue
+
+            # Check if worker is running
+            running = False
+            try:
+                from plugins.backup import worker as WK
+                running = WK.status().get("running", False)
+            except Exception:
+                pass
+
+            # Only auto-refresh main panel when worker is active
+            if not running:
+                continue
+
+            from core.client import client as C
+            if C is None:
+                continue
+
+            for msg_id, panel in list(_panels.items()):
+                if panel.get("page") != "main":
+                    continue
+
+                try:
+                    text, kb = await _build_main_panel()
+                    if text == panel.get("last_text"):
+                        continue
+
+                    await C.edit_message_text(
+                        chat_id=panel["chat_id"],
+                        message_id=msg_id,
+                        text=text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    panel["last_text"] = text
+                except Exception as e:
+                    if "not modified" in str(e).lower():
+                        continue
+                    if "message to edit not found" in str(e).lower():
+                        _unregister_panel(msg_id)
+                        continue
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug(f"[BACKUP] auto-refresh: {e}")
+
+
+# ============================================================
+# SECTION 10 — PUBLIC: OPEN PANEL FOR ADMIN
+# ============================================================
+
+async def open_panel_for_admin(client: Client, message: Message) -> None:
     """
-    Handle text input for add / rename.
-    Returns True if handled (caller should stop_propagation).
+    Called from /admin panel when user taps [💾 BACKUP].
+    Opens the same /backup panel.
     """
-    if not message.from_user or not _is_admin(message.from_user.id):
-        return False
-
-    s = _get_session(message.from_user.id)
-    if not s:
-        return False
-
-    action = s.get("action")
-    if action not in ("add_channel", "rename"):
-        return False
-
-    text = (message.text or "").strip()
-    if not text:
-        return False
-
-    # ────────── ADD ──────────
-    if action == "add_channel":
-        kind = s.get("kind", KIND_BACKUP)
-        resolved = await _resolve_channel(client, text)
-        _drop_session(message.from_user.id)
-
-        if not resolved["ok"]:
-            await message.reply_text(
-                f"{F.EMO['cross']} <b>{F.fb('FAILED')}</b>\n"
-                f"<i>{F.sc(resolved.get('error', '?'))}</i>",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        ok = await _add_channel(
-            chat_id=resolved["chat_id"],
-            title=resolved["title"],
-            kind=kind,
-            added_by=message.from_user.id,
-        )
-
-        if not ok:
-            await message.reply_text(
-                f"{F.EMO['cross']} {F.sc('could not save')}",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        # Auto-test
-        await _test_channel(client, resolved["chat_id"])
-
-        label = "Backup" if kind == KIND_BACKUP else "Storage"
-        await message.reply_text(
-            "\n".join([
-                f"{F.EMO['check']} <b>{F.fb('CHANNEL ADDED')}</b>",
-                F.DIV,
-                "",
-                f"📛 <b>{F.sc(resolved['title'][:40])}</b>",
-                f"🆔 <code>{resolved['chat_id']}</code>",
-                f"🏷️ {F.sc('kind')} · <code>{label}</code>",
-                "",
-                f"{F.EMO['spark']} {F.sc('test message sent')}",
-                "",
-                F.DIV_S,
-                f"📌 {F.sc('open /backup → channels to manage')}",
-            ]),
+    try:
+        text, kb = await _build_main_panel()
+        sent = await message.reply_text(
+            text,
+            reply_markup=kb,
             parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-        return True
-
-    # ────────── RENAME ──────────
-    if action == "rename":
-        cid = int(s.get("chat_id", 0))
-        _drop_session(message.from_user.id)
-
-        if len(text) < 2:
-            await message.reply_text(
-                f"{F.EMO['cross']} {F.sc('too short')}",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        ok = await _update_channel(cid, title=text[:60])
-        await message.reply_text(
-            f"{F.EMO['check'] if ok else F.EMO['cross']} "
-            f"{F.sc('renamed') if ok else F.sc('failed')}",
-            parse_mode=ParseMode.HTML,
-        )
-        return True
-
-    return False
+        _register_panel(sent.id, sent.chat.id, "main", text)
+        _ensure_auto_refresh()
+    except Exception as e:
+        logger.exception(f"[BACKUP] open panel: {e}")
 
 
 # ============================================================
 # SECTION 11 — HELPERS
 # ============================================================
-
-async def _test_channel(client: Client, chat_id: int) -> bool:
-    try:
-        await client.send_message(
-            chat_id=chat_id,
-            text=(
-                f"{F.EMO['check']} <b>{F.fb('CHANNEL TEST')}</b>\n"
-                f"{F.DIV}\n"
-                f"<i>{F.sc('if you see this, the bot can post here.')}</i>"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        return True
-    except Exception as e:
-        logger.warning(f"[CH] test failed: {e}")
-        return False
-
 
 async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
     try:
@@ -899,22 +961,21 @@ async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
             disable_web_page_preview=True,
         )
     except Exception as e:
-        if "not modified" not in str(e).lower():
-            logger.debug(f"[CH] edit: {e}")
+        if "not modified" in str(e).lower():
+            return
+        logger.debug(f"[BACKUP] edit: {e}")
 
 
 # ============================================================
 # SECTION 12 — SNAPSHOT
 # ============================================================
 
-async def snapshot() -> Dict[str, Any]:
-    b = await _list_channels(KIND_BACKUP)
-    s = await _list_channels(KIND_STORAGE)
+def snapshot() -> Dict[str, Any]:
     return {
-        "backup_channels": len(b),
-        "storage_channels": len(s),
-        "primary_backup": await primary_backup_id(),
-        "primary_storage": await primary_storage_id(),
+        "panels": len(_panels),
+        "auto_refresh": bool(
+            _refresh_task and not _refresh_task.done()
+        ),
     }
 
 
@@ -923,13 +984,7 @@ async def snapshot() -> Dict[str, Any]:
 # ============================================================
 
 __all__ = [
-    # Called from /backup
-    "open_channels_panel",
-    "router_handler",
-    "text_handler",
-    "has_session",
-    # Helpers
-    "primary_backup_id",
-    "primary_storage_id",
+    "cmd_backup",
+    "open_panel_for_admin",
     "snapshot",
 ]
