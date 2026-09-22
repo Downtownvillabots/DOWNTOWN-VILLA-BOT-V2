@@ -18,7 +18,7 @@ def discover() -> None:
     pkg_dir = Path(__file__).parent
     for mod in pkgutil.iter_modules([str(pkg_dir)]):
         if mod.name.startswith("_"): continue
-        full = f"{__name__}.{mod.name}"
+        full = f"{__package__}.{mod.name}"       # ← FIXED: __name__ → __package__
         try:
             importlib.import_module(full)
             _loaded.append(mod.name)
