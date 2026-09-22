@@ -140,6 +140,17 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
     except Exception:
         pass
 
+    # ── AUTO-SUMMARY: if last job finished, show summary only ──
+    started = w.get("started_at") or 0
+    finished = w.get("finished_at") or 0
+    if (
+        not w.get("running")
+        and started
+        and finished
+        and finished >= started
+    ):
+        return await _build_summary_panel()
+
     auto_mode = await _get_auto_mode()
 
     running = w.get("running", False)
@@ -264,41 +275,53 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
 
 
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
-    total = int(w.get("total_messages", 0) or 0)
-    scanned = int(w.get("scanned_ids", 0) or 0)
-    current = int(w.get("current_message_id", 0) or 0)
-    saved = int(w.get("saved", 0) or 0)
-    dup = int(w.get("duplicate_id", 0) or 0)
-    skipped = int(w.get("skipped_no_media", 0) or 0)
-    failed = int(w.get("failed", 0) or 0)
-    movies = int(w.get("movies", 0) or 0)
-    series = int(w.get("series", 0) or 0)
-    processed = int(w.get("processed", 0) or 0)
+    scanned = int(w.get("scanned_ids", 0))
+    max_seen = int(w.get("current_message_id", 0))
+    saved = int(w.get("saved", 0))
+    dup = int(w.get("duplicate_id", 0))
+    skipped = int(w.get("skipped_no_media", 0))
+    failed = int(w.get("failed", 0))
+    movies = int(w.get("movies", 0))
+    series = int(w.get("series", 0))
+    processed = int(w.get("processed", 0))
 
-    # Progress % from scanned / total
-    if total > 0:
-        pct = min(100.0, (scanned / total) * 100)
+    started = w.get("started_at") or 0
+    finished = w.get("finished_at") or 0
+    is_finished = bool(finished and started and finished >= started)
+
+    # Progress calculation (dynamic total)
+    if is_finished:
+        pct = 100.0
+    elif max_seen > 0:
+        # Estimate: highest id seen + buffer for trailing IDs
+        est_total = max_seen + 500
+        pct = min(95.0, (scanned / max(1, est_total)) * 100)
     else:
-        pct = 0.0
+        pct = min(30.0, (scanned / 500) * 30.0)
 
-    color = P.storage_color(100 - pct)  # low = green, high = red
-    bar = P.bar(pct, "storage", width=14, show_percent=False)
+    # Progress bar uses INDEXING mode (red → green)
+    bar = P.bar(pct, "indexing", width=14, show_percent=False)
 
-    lines = [
+    # Elapsed
+    if started:
+        elapsed = (finished or time.time()) - started
+        elapsed_str = FM.duration_short(elapsed)
+    else:
+        elapsed_str = "—"
+
+    return [
         F.DIV_S,
         f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
         F.DIV_S, "",
-        f"{color} <code>{bar}</code> {pct:.1f}%",
+        f"<code>{bar}</code> {pct:.1f}%",
         "",
         f"📡 {F.sc('channel')} · "
         f"<code>{str(w.get('channel_title', '?'))[:30]}</code>",
         f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
         f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
-        f"📄 {F.sc('metadata')} · "
-        f"<b>{str(w.get('metadata_source', 'both'))}</b>",
+        f"⏱️ {F.sc('elapsed')} · <b>{elapsed_str}</b>",
         "",
-        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b> / "
-        f"<code>{FM.num(total)}</code>",
+        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
         f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
         "",
         F.DIV_S,
@@ -314,7 +337,6 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"⏱️ {F.sc('eta')} · <b>{w.get('eta_text', '—')}</b>",
         "",
     ]
-    return lines
 
 # ============================================================
 # STEP 1/6 — CHANNEL
