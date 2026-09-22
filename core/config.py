@@ -280,6 +280,7 @@ MOVIE_UPDATE_CHANNEL: Optional[int] = env_int("MOVIE_UPDATE_CHANNEL", 0) or None
 
 AUTH_CHANNELS: List[int] = env_id_list("AUTH_CHANNELS")
 AUTH_REQ_CHANNELS: List[int] = env_id_list("AUTH_REQ_CHANNELS")
+SERIES_GROUP_ID: Optional[int] = env_int("SERIES_GROUP_ID", 0) or None
 
 
 # ============================================================
@@ -428,7 +429,7 @@ __all__ = [
     "DATABASE_CHANNEL_IDS", "DATABASE_CHANNEL_ID",
     "BACKUP_CHANNEL_ID", "BACKUP_STORAGE_CHANNEL_ID",
     "REQST_CHANNEL", "BROADCAST_CHANNEL_ID", "MOVIE_UPDATE_CHANNEL",
-    "AUTH_CHANNELS", "AUTH_REQ_CHANNELS",
+    "AUTH_CHANNELS", "AUTH_REQ_CHANNELS", "SERIES_GROUP_ID",
     # Links
     "SUPPORT_CHAT", "SUPPORT_CHAT_ID",
     "UPDATE_CHNL_LNK", "OWNER_LNK", "GRP_LNK",
