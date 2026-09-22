@@ -174,7 +174,7 @@ async def _handle(client: Client, message) -> None:
         metadata_source = await _get_default_metadata_source()
 
         try:
-            from indexing.pipeline import process_message
+            from plugins.indexing.pipeline import process_message
             result = await process_message(
                 message,
                 mode="auto",
