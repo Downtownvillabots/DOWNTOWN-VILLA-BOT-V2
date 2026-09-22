@@ -405,6 +405,13 @@ async def start_bot() -> None:
     logger.info(f"  🏨 {APP_NAME} v{APP_VERSION} — starting…")
     logger.info("=" * 60)
 
+        # ── 0. Register core message handlers ──
+    try:
+        from core import start_router  # noqa: F401
+        logger.info("[BOOT] ✅ start_router loaded")
+    except Exception as e:
+        logger.warning(f"[BOOT] start_router: {e}")
+
     # ── 1. Validate config ──
     try:
         errors = config.validate()
