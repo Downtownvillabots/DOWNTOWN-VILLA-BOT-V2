@@ -6,6 +6,7 @@
 # ============================================================
 
 from __future__ import annotations
+
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -27,15 +28,16 @@ def _coll():
 
 
 # ── DEFAULT TEMPLATES ──
+
 DEFAULT_HEADER = (
     "🏨 <b>𝗗𝗢𝗪𝗡𝗧𝗢𝗪𝗡 𝗩𝗜𝗟𝗟𝗔</b>\n"
     "🔍 <b>𝗠𝗜𝗦𝗦𝗜𝗡𝗚 {TYPE}</b>\n"
     "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "📅 𝗣𝗲𝗿𝗶𝗼𝗱 · <code>{PERIOD}</code>\n"
-    "🌍 𝗜𝗻𝗱𝘂𝘀𝘁𝗿𝘆 · <b>{INDUSTRY}</b>\n\n"
-    "📥 𝗙𝗲𝘁𝗰𝗵𝗲𝗱 · <code>{FETCHED}</code>\n"
-    "✅ 𝗜𝗻 𝗬𝗼𝘂𝗿 𝗗𝗕 · <code>{IN_DB}</code>\n"
-    "❌ 𝗠𝗶𝘀𝘀𝗶𝗻𝗴 · <code>{MISSING}</code>\n"
+    "📅 {F.sc_word('period')} · <code>{PERIOD}</code>\n"
+    "🌍 {F.sc_word('industry')} · <b>{INDUSTRY}</b>\n\n"
+    "📥 {F.sc_word('fetched')} · <code>{FETCHED}</code>\n"
+    "✅ {F.sc_word('in db')} · <code>{IN_DB}</code>\n"
+    "❌ {F.sc_word('missing')} · <code>{MISSING}</code>\n"
 )
 
 DEFAULT_FOOTER = (
@@ -60,26 +62,34 @@ TEMPLATES = {
     },
     "fancy": {
         "header": (
-            "╔══════════════════════════╗\n"
-            "║ 🏨 <b>DOWNTOWN VILLA</b>      ║\n"
+            "╔══════════════════════════════════╗\n"
+            "║ 🏨 <b>DOWNTOWN VILLA</b>          ║\n"
             "║ 🔍 <b>MISSING {TYPE}</b>          ║\n"
-            "╚══════════════════════════╝\n\n"
+            "╚══════════════════════════════════╝\n\n"
             "📅 {PERIOD}\n🌍 {INDUSTRY}\n\n"
-            "📥 <code>{FETCHED}</code> · ✅ <code>{IN_DB}</code> · ❌ <code>{MISSING}</code>\n"
+            "📥 <code>{FETCHED}</code> · "
+            "✅ <code>{IN_DB}</code> · "
+            "❌ <code>{MISSING}</code>\n"
         ),
-        "footer": "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n🕒 <code>{TIME}</code>",
-        "item_line": "▫️ <b>{N}.</b> <code>{NAME}</code>\n",
+        "footer": (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🕒 <code>{TIME}</code>"
+        ),
+        "item_line": "◪ <b>{N}.</b> <code>{NAME}</code>\n",
     },
 }
 
 
 # ── GET / SET ──
+
 async def get_template(key: str = "template") -> Optional[Dict[str, Any]]:
     c = _coll()
-    if c is None: return None
+    if c is None:
+        return None
     try:
         d = await c.find_one({"_id": key})
-        if d: d.pop("_id", None)
+        if d:
+            d.pop("_id", None)
         return d
     except Exception:
         return None
@@ -87,7 +97,8 @@ async def get_template(key: str = "template") -> Optional[Dict[str, Any]]:
 
 async def set_template(key: str, value: Dict[str, Any]) -> bool:
     c = _coll()
-    if c is None: return False
+    if c is None:
+        return False
     try:
         value["updated_at"] = datetime.utcnow()
         await c.update_one({"_id": key}, {"$set": value}, upsert=True)
@@ -97,9 +108,11 @@ async def set_template(key: str, value: Dict[str, Any]) -> bool:
 
 
 # ── BUTTONS ──
+
 async def get_buttons() -> List[Dict[str, Any]]:
     c = _coll()
-    if c is None: return []
+    if c is None:
+        return []
     try:
         d = await c.find_one({"_id": "buttons"})
         return list(d.get("list") or []) if d else []
@@ -109,7 +122,8 @@ async def get_buttons() -> List[Dict[str, Any]]:
 
 async def set_buttons(buttons: List[Dict[str, Any]]) -> bool:
     c = _coll()
-    if c is None: return False
+    if c is None:
+        return False
     try:
         await c.update_one(
             {"_id": "buttons"},
@@ -122,21 +136,29 @@ async def set_buttons(buttons: List[Dict[str, Any]]) -> bool:
 
 
 def build_button_kb(buttons: List[Dict]) -> Optional[InlineKeyboardMarkup]:
-    if not buttons: return None
+    if not buttons:
+        return None
     rows: List[List[InlineKeyboardButton]] = []
     for b in buttons:
         name = (b.get("name") or "").strip()
         url = (b.get("url") or "").strip()
-        if not name or not url: continue
-        if url.startswith("@"): url = f"https://t.me/{url[1:]}"
-        elif not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
-            if "." in url and " " not in url: url = f"https://{url}"
-            else: continue
+        if not name or not url:
+            continue
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif not (url.startswith("http://")
+                  or url.startswith("https://")
+                  or url.startswith("tg://")):
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                continue
         rows.append([InlineKeyboardButton(name[:60], url=url)])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
 # ── RENDER ──
+
 def render_header(t: Dict[str, Any], ctx: Dict[str, Any]) -> str:
     try:
         return t.get("header", DEFAULT_HEADER).format(**ctx)
