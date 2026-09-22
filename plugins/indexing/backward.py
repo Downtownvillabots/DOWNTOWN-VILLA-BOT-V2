@@ -53,6 +53,19 @@ def _coll():
 
 
 # ============================================================
+# CACHE INVALIDATION HELPER
+# ============================================================
+
+async def _notify_watch_cache() -> None:
+    """Tell auto.py to reload its watched-channel set immediately."""
+    try:
+        from plugins.indexing import auto as A
+        await A.force_refresh()
+    except Exception as e:
+        logger.debug(f"[CH-AUTO] watch cache refresh: {e}")
+
+
+# ============================================================
 # REGISTER / LIST / UPDATE / REMOVE
 # ============================================================
 
@@ -91,6 +104,7 @@ async def register_channel(
             f"[CH-AUTO] registered chat_id={chat_id} "
             f"title='{title[:40]}' kind={kind}"
         )
+        await _notify_watch_cache()
         return True
     except Exception as e:
         logger.warning(f"[CH-AUTO] register: {e}")
@@ -130,6 +144,8 @@ async def unregister_channel(chat_id: int) -> bool:
         return False
     try:
         r = await c.delete_one({"chat_id": int(chat_id)})
+        if r.deleted_count > 0:
+            await _notify_watch_cache()
         return r.deleted_count > 0
     except Exception:
         return False
@@ -145,6 +161,8 @@ async def set_enabled(chat_id: int, enabled: bool) -> bool:
             {"$set": {"enabled": bool(enabled),
                       "updated_at": datetime.utcnow()}},
         )
+        if r.matched_count > 0:
+            await _notify_watch_cache()
         return r.matched_count > 0
     except Exception:
         return False
@@ -177,13 +195,12 @@ async def on_chat_member_update(client: Client, update: ChatMemberUpdated):
         if not new_member:
             return
 
+        # ── resolve bot identity ──
         try:
-            me = await client.identity()
-        except Exception:
-            try:
-                me = await client.get_me()
-            except Exception:
-                return
+            me = await client.get_me()
+        except Exception as e:
+            logger.warning(f"[CH-AUTO] get_me failed: {e}")
+            return
 
         user = getattr(new_member, "user", None)
         if not user or getattr(user, "id", None) != me.id:
