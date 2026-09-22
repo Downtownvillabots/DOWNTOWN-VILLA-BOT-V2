@@ -4,8 +4,8 @@
 #
 # ONE command: /admin
 # Everything else is buttons inside.
-#
-# Menu:
+
+Menu:
 #   📊 Dashboard        → live metrics
 #   🗄️ Databases        → browse / clear / delete
 #   🖥️ Server           → CPU / RAM / disk / net
@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -113,12 +114,8 @@ def _quick_stats() -> Dict[str, Any]:
         "panels": active_panel_count(),
         "tasks": 0,
         "cache": 0,
+        "flows": 0,
     }
-    try:
-        from utils import locks as LK
-        pass
-    except Exception:
-        pass
 
     try:
         from utils import cache as CA
@@ -134,11 +131,10 @@ def _quick_stats() -> Dict[str, Any]:
         pass
 
     try:
-        from core import flow_engine as FE
         from core.flow_engine import list_flows
         out["flows"] = len(list_flows())
     except Exception:
-        out["flows"] = 0
+        pass
 
     return out
 
@@ -150,9 +146,9 @@ def _render_main() -> tuple:
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"{F.EMO['gear']} <b>{F.fb('ADMIN CONTROL CENTER')}</b>",
-        F.DIV,
-        "",
-        f"{F.EMO['clock']} {F.sc('uptime')} · <b>{FM.duration_short(s['uptime'])}</b>",
+        F.DIV, "",
+        f"{F.EMO['clock']} {F.sc('uptime')} · "
+        f"<b>{FM.duration_short(s['uptime'])}</b>",
         f"{F.EMO['crown']} {F.sc('admins')} · <b>{s['admins']}</b>",
         f"{F.EMO['bar']} {F.sc('panels')} · <b>{s['panels']}</b>",
         f"{F.EMO['package']} {F.sc('cache')} · <b>{FM.num(s['cache'])}</b>",
@@ -307,7 +303,411 @@ async def cmd_admin(client: Client, message: Message):
 
 
 # ============================================================
-# SECTION 6 — CALLBACK ROUTER
+# SECTION 6 — SUB-ROUTERS (priority -9510, run BEFORE main)
+# ============================================================
+
+# ── DATABASES (adm:db_*) ──
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:db_"), group=-9510,
+)
+async def admin_db_router(client: Client, q: CallbackQuery):
+    if not q.from_user or not is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    from plugins.admin import databases as DB
+
+    parts = str(q.data).split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    try:
+        # ── POOL ──
+        if action == "db_pool":
+            pool = parts[2] if len(parts) > 2 else ""
+            text, kb = await DB.build_pool(pool)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── SHARD ──
+        if action == "db_shard":
+            pool = parts[2] if len(parts) > 2 else ""
+            idx = int(parts[3]) if len(parts) > 3 else 0
+            text, kb = await DB.build_shard(pool, idx)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── CLEAR SHARD → step 1 ──
+        if action == "db_clear_shard":
+            pool = parts[2]
+            idx = int(parts[3])
+            text, kb = DB.build_clear_shard_confirm(pool, idx, step=1)
+            await _safe_edit(q, text, kb)
+            return await q.answer("⚠️")
+
+        # ── CLEAR POOL → step 1 ──
+        if action == "db_clear_pool":
+            pool = parts[2]
+            text, kb = DB.build_clear_pool_confirm(pool, step=1)
+            await _safe_edit(q, text, kb)
+            return await q.answer("⚠️")
+
+        # ── NUKE ALL → step 1 ──
+        if action == "db_nuke_all":
+            text, kb = DB.build_nuke_all_confirm(step=1)
+            await _safe_edit(q, text, kb)
+            return await q.answer("☢️")
+
+        # ── CONFIRM (advance the token) ──
+        if action == "db_confirm":
+            token = parts[2] if len(parts) > 2 else ""
+            confirm = DB._get_confirm(token)
+            if not confirm:
+                return await q.answer("⏱️ Expired", show_alert=True)
+
+            kind = confirm.get("kind")
+            step = int(confirm.get("step", 1))
+
+            # Advance step
+            DB._advance_confirm(token)
+
+            # ── SHARD ──
+            if kind == "shard":
+                pool = confirm.get("pool")
+                idx = int(confirm.get("index", 0))
+                if step < 3:
+                    text, kb = DB.build_clear_shard_confirm(
+                        pool, idx, step=step + 1
+                    )
+                    await _safe_edit(q, text, kb)
+                    DB._drop_confirm(token)
+                    return await q.answer(f"⚠️ Step {step + 1}/3")
+
+                DB._drop_confirm(token)
+                await q.answer("🗑️ Wiping…")
+                result = await DB.do_clear_shard(pool, idx)
+                text, kb = DB.build_result_card(
+                    "SHARD CLEARED", result,
+                    back_cb=f"adm:db_shard:{pool}:{idx}",
+                )
+                await _safe_edit(q, text, kb)
+                return
+
+            # ── POOL ──
+            if kind == "pool":
+                pool = confirm.get("pool")
+                if step < 3:
+                    text, kb = DB.build_clear_pool_confirm(
+                        pool, step=step + 1
+                    )
+                    await _safe_edit(q, text, kb)
+                    DB._drop_confirm(token)
+                    return await q.answer(f"⚠️ Step {step + 1}/3")
+
+                DB._drop_confirm(token)
+                await q.answer("🗑️ Wiping pool…")
+                result = await DB.do_clear_pool(pool)
+                text, kb = DB.build_result_card(
+                    "POOL CLEARED", result,
+                    back_cb=f"adm:db_pool:{pool}",
+                )
+                await _safe_edit(q, text, kb)
+                return
+
+            # ── NUKE ──
+            if kind == "nuke":
+                if step < 10:
+                    text, kb = DB.build_nuke_all_confirm(step=step + 1)
+                    await _safe_edit(q, text, kb)
+                    DB._drop_confirm(token)
+                    return await q.answer(f"☢️ {step + 1}/10")
+
+                DB._drop_confirm(token)
+                await q.answer("💀 NUKE IN PROGRESS…")
+                result = await DB.do_nuke_all()
+                text, kb = DB.build_result_card(
+                    "ALL DATA NUKE", result,
+                    back_cb="adm:page:databases",
+                )
+                await _safe_edit(q, text, kb)
+                return
+
+            return await q.answer("❓ Unknown kind")
+
+        # ── CANCEL ──
+        if action == "db_cancel":
+            token = parts[2] if len(parts) > 2 else ""
+            DB._drop_confirm(token)
+            text, kb = await DB.build_index()
+            await _safe_edit(q, text, kb)
+            return await q.answer("❌ Cancelled")
+
+    except Exception as e:
+        logger.exception(f"[ADMIN] db router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+# ── SERVER (adm:sv:*) ──
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:sv:"), group=-9510,
+)
+async def admin_sv_router(client: Client, q: CallbackQuery):
+    if not q.from_user or not is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    try:
+        from plugins.admin import server as SV
+
+        parts = str(q.data).split(":")
+        page = parts[2] if len(parts) > 2 else "overview"
+        arg = parts[3] if len(parts) > 3 else None
+
+        text, kb = await SV.route(page, arg)
+        await _safe_edit(q, text, kb)
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[ADMIN] sv router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+# ── LOGS (adm:lg:*) ──
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:lg:"), group=-9510,
+)
+async def admin_lg_router(client: Client, q: CallbackQuery):
+    if not q.from_user or not is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    try:
+        from plugins.admin import logs as LG
+
+        parts = str(q.data).split(":")
+        action = parts[2] if len(parts) > 2 else ""
+
+        # ── FILTER ──
+        if action == "filter":
+            key = parts[3] if len(parts) > 3 else ""
+            val = parts[4] if len(parts) > 4 else ""
+            LG._set_filter(key, val)
+            LG._set_filter("page", 0)
+            text, kb = await LG.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer(f"✅ {key}={val}")
+
+        # ── PAGE ──
+        if action == "page":
+            try:
+                page = int(parts[3])
+            except (ValueError, IndexError):
+                page = 0
+            LG._set_filter("page", page)
+            text, kb = await LG.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── REFRESH ──
+        if action == "refresh":
+            text, kb = await LG.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── RESET FILTERS ──
+        if action == "reset":
+            LG._reset_filters()
+            text, kb = await LG.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer("♻️ Reset")
+
+        # ── SEARCH ──
+        if action == "search":
+            text = "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"{F.EMO['search']} <b>{F.fb('SEARCH LOGS')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('send a keyword to search')}",
+                "",
+                f"📌 {F.sc('send')} <code>-</code> {F.sc('to clear search')}",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{F.EMO['cross']} {F.sc('cancel')}",
+                    callback_data="adm:lg:refresh",
+                ),
+            ]])
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── EXPORT ──
+        if action == "export":
+            bio = await LG.export_logs()
+            if not bio:
+                return await q.answer("⚠️ No logs", show_alert=True)
+            try:
+                await client.send_document(
+                    chat_id=q.from_user.id,
+                    document=bio,
+                    caption=f"{F.EMO['file']} <b>Logs export</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+                await q.answer("📤 Sent to PM")
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+            return
+
+        # ── CONFIRM CLEAR ──
+        if action == "confirm_clear":
+            text, kb = await LG.build_clear_confirm()
+            await _safe_edit(q, text, kb)
+            return await q.answer("⚠️")
+
+        # ── DO CLEAR ──
+        if action == "do_clear":
+            try:
+                from core import logger as CL
+                CL.clear_logs()
+                await q.answer("🗑️ Cleared")
+            except Exception:
+                await q.answer("❌")
+            text, kb = await LG.build()
+            await _safe_edit(q, text, kb)
+            return
+
+    except Exception as e:
+        logger.exception(f"[ADMIN] lg router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+# ── STATS (adm:st:*) ──
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:st:"), group=-9510,
+)
+async def admin_st_router(client: Client, q: CallbackQuery):
+    if not q.from_user or not is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    try:
+        from plugins.admin import stats as ST
+
+        parts = str(q.data).split(":")
+        action = parts[2] if len(parts) > 2 else ""
+
+        # ── VIEW ──
+        if action == "view":
+            sub = parts[3] if len(parts) > 3 else ""
+            if sub == "users":
+                text, kb = await ST.build_top_users()
+            else:
+                text, kb = await ST.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── CONFIRM RESET ──
+        if action == "confirm_reset":
+            text, kb = await ST.build_reset_confirm()
+            await _safe_edit(q, text, kb)
+            return await q.answer("⚠️")
+
+        # ── DO RESET ──
+        if action == "do_reset":
+            try:
+                ST.do_reset()
+                await q.answer("♻️ Reset")
+            except Exception:
+                await q.answer("❌")
+            text, kb = await ST.build()
+            await _safe_edit(q, text, kb)
+            return
+
+    except Exception as e:
+        logger.exception(f"[ADMIN] st router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+# ── TASKS (adm:tk:*) ──
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:tk:"), group=-9510,
+)
+async def admin_tk_router(client: Client, q: CallbackQuery):
+    if not q.from_user or not is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    try:
+        from plugins.admin import tasks as TK
+
+        parts = str(q.data).split(":")
+        action = parts[2] if len(parts) > 2 else ""
+
+        # ── FILTER ──
+        if action == "filter":
+            key = parts[3] if len(parts) > 3 else ""
+            val = parts[4] if len(parts) > 4 else ""
+            TK._set_filter(key, val)
+            text, kb = await TK.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer(f"✅ {key}={val}")
+
+        # ── REFRESH ──
+        if action == "refresh":
+            text, kb = await TK.build()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── CLEAR DONE ──
+        if action == "clear_done":
+            n = TK._clear_finished()
+            await q.answer(f"🗑️ Cleared {n}")
+            text, kb = await TK.build()
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── DETAIL ──
+        if action == "detail":
+            tid = parts[3] if len(parts) > 3 else ""
+            text, kb = await TK.build_task_detail(tid)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── CONFIRM CANCEL ──
+        if action == "confirm_cancel":
+            tid = parts[3] if len(parts) > 3 else ""
+            text, kb = await TK.build_cancel_confirm(tid)
+            await _safe_edit(q, text, kb)
+            return await q.answer("⚠️")
+
+        # ── DO CANCEL ──
+        if action == "do_cancel":
+            tid = parts[3] if len(parts) > 3 else ""
+            ok = await TK.cancel_task(tid)
+            await q.answer("🛑 Cancelled" if ok else "⚠️ Failed")
+            text, kb = await TK.build()
+            await _safe_edit(q, text, kb)
+            return
+
+    except Exception as e:
+        logger.exception(f"[ADMIN] tk router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# SECTION 7 — MAIN CALLBACK ROUTER
 # ============================================================
 
 @Client.on_callback_query(
@@ -347,7 +747,7 @@ async def admin_router(client: Client, q: CallbackQuery):
         module = parts[2] if len(parts) > 2 else ""
         return await _open_module(client, q, module)
 
-    # ────────── UNIVERSAL CANCEL ──────────
+    # ────────── CANCEL ──────────
     if action == "cancel":
         unregister_panel(q.message.id)
         try:
@@ -360,7 +760,7 @@ async def admin_router(client: Client, q: CallbackQuery):
 
 
 # ============================================================
-# SECTION 7 — PAGE OPENER
+# SECTION 8 — PAGE OPENER
 # ============================================================
 
 async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
@@ -393,8 +793,7 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
         elif page == "flow":
             text = "\n".join([
                 f"{F.EMO['spark']} <b>{F.fb('FLOW EDITOR')}</b>",
-                F.DIV,
-                "",
+                F.DIV, "",
                 f"📌 {F.sc('use /flow to edit')}",
                 f"📌 {F.sc('or tap a flow below')}",
             ])
@@ -411,8 +810,7 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
         elif page == "groups":
             text = "\n".join([
                 f"{F.EMO['users']} <b>{F.fb('GROUPS')}</b>",
-                F.DIV,
-                "",
+                F.DIV, "",
                 f"📌 {F.sc('manage groups from /settings in group')}",
                 f"📌 {F.sc('or /flow to edit search flow per group')}",
             ])
@@ -420,16 +818,14 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
         elif page == "ban":
             text = "\n".join([
                 f"{F.EMO['warn']} <b>{F.fb('BAN / FILTER')}</b>",
-                F.DIV,
-                "",
+                F.DIV, "",
                 f"📌 {F.sc('coming soon')}",
             ])
             kb = _back_kb()
         elif page == "maintenance":
             text = "\n".join([
                 f"🛠️ <b>{F.fb('MAINTENANCE')}</b>",
-                F.DIV,
-                "",
+                F.DIV, "",
                 f"📌 {F.sc('current')} · "
                 f"{'🟢 ON' if config.MAINTENANCE_MODE else '🔴 OFF'}",
             ])
@@ -446,8 +842,7 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
         elif page == "settings":
             text = "\n".join([
                 f"{F.EMO['gear']} <b>{F.fb('BOT SETTINGS')}</b>",
-                F.DIV,
-                "",
+                F.DIV, "",
                 f"{F.EMO['info']} {F.sc('edit settings via env')}",
                 f"{F.EMO['info']} {F.sc('or use /flow for search flows')}",
                 "",
@@ -479,7 +874,7 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
 
 
 # ============================================================
-# SECTION 8 — MODULE OPENER
+# SECTION 9 — MODULE OPENER
 # ============================================================
 
 async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
@@ -518,7 +913,7 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             if fn is not None:
                 await fn(client, q.message)
             else:
-                await q.answer("Use /seriesgroupsettings", show_alert=True)
+                await q.answer("Use /premium", show_alert=True)
             return
 
         if module == "ott":
@@ -551,18 +946,17 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
 
 
 # ============================================================
-# SECTION 9 — TOGGLES
+# SECTION 10 — TOGGLES
 # ============================================================
 
 @Client.on_callback_query(
     filters.regex(rf"^{PFX}:toggle_maint$"),
-    group=-9500,
+    group=-9510,
 )
 async def toggle_maintenance(client: Client, q: CallbackQuery):
     if not q.from_user or not is_admin(q.from_user.id):
         return await q.answer("❌", show_alert=True)
     try:
-        # Runtime toggle only (persist via env for permanent)
         config.MAINTENANCE_MODE = not config.MAINTENANCE_MODE
         await q.answer(
             f"{'🟢 ON' if config.MAINTENANCE_MODE else '🔴 OFF'}"
@@ -573,7 +967,7 @@ async def toggle_maintenance(client: Client, q: CallbackQuery):
 
 
 # ============================================================
-# SECTION 10 — HELPERS
+# SECTION 11 — HELPERS
 # ============================================================
 
 def _back_kb() -> InlineKeyboardMarkup:
@@ -607,16 +1001,15 @@ async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
 
 
 # ============================================================
-# SECTION 11 — LIVE UPDATER (optional)
+# SECTION 12 — LIVE UPDATER
 # ============================================================
 
 async def _live_loop(interval: float = 5.0) -> None:
-    """Refresh every open panel every N seconds."""
+    """Refresh every open dashboard panel every N seconds."""
     while True:
         try:
             await asyncio.sleep(interval)
             for panel_id, panel in list(_panels.items()):
-                # Only auto-refresh dashboard
                 if panel.get("page") != "dashboard":
                     continue
                 try:
@@ -659,7 +1052,7 @@ def ensure_live() -> None:
 
 
 # ============================================================
-# SECTION 12 — SNAPSHOT
+# SECTION 13 — SNAPSHOT
 # ============================================================
 
 def snapshot() -> Dict[str, Any]:
@@ -667,13 +1060,6 @@ def snapshot() -> Dict[str, Any]:
         "panels": active_panel_count(),
         "admins": len(config.ADMINS),
     }
-
-
-# ============================================================
-# SECTION 13 — IMPORTS
-# ============================================================
-
-import asyncio  # noqa: E402
 
 
 # ============================================================
