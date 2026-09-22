@@ -387,12 +387,21 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
         if STATE["stop_requested"]:
             break
 
+        # ── Pause loop with flood auto-recovery ──
         while STATE["paused"] and not STATE["stop_requested"]:
+            fu = float(STATE.get("flood_until") or 0.0)
+            # Auto-resume once the flood window expires
+            if fu and fu <= time.time():
+                STATE["flood_until"] = 0.0
+                STATE["paused"] = False
+                logger.info("[INDEX-WORKER] auto-resumed after flood")
+                break
             await asyncio.sleep(1.0)
 
         if STATE["stop_requested"]:
             break
 
+        # ── Pre-fetch guard: if still in flood, wait ──
         if STATE["flood_until"] > time.time():
             await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
             continue
