@@ -510,7 +510,7 @@ async def _handle_message(C: Client, msg) -> None:
 
         # Pipeline
         try:
-            from indexing.pipeline import process_message
+            from plugins.indexing.pipeline import process_message
             result = await process_message(
                 msg,
                 mode="manual",
