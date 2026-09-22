@@ -37,18 +37,32 @@ def discover() -> None:
         name = mod.name
         if name.startswith("_"):
             continue
+
         full = f"{__package__}.{name}"
         try:
             importlib.import_module(full)
             _loaded.append(name)
+            logger.info(f"[INDEXING] ✅ loaded: {name}")
         except Exception as e:
-            logger.exception(f"[INDEXING] failed: {full}: {e}")
+            logger.error(
+                f"[INDEXING] ❌ FAILED: {full} "
+                f"({type(e).__name__}: {e})"
+            )
+            logger.exception(f"[INDEXING] traceback for {full}")
             _failed.append(name)
 
     logger.info(
         f"[INDEXING] loaded {len(_loaded)} modules "
         f"({len(_failed)} failed)"
     )
+
+    if _loaded:
+        logger.info(f"[INDEXING] loaded modules → {sorted(_loaded)}")
+
+    if _failed:
+        logger.error(
+            f"[INDEXING] ⚠️ FAILED MODULES → {sorted(_failed)}"
+        )
 
 
 def loaded() -> List[str]:
@@ -59,7 +73,16 @@ def failed() -> List[str]:
     return list(_failed)
 
 
+def summary() -> str:
+    """One-line summary for startup banner."""
+    return (
+        f"indexing: {len(_loaded)} loaded, "
+        f"{len(_failed)} failed"
+        + (f" ({_failed})" if _failed else "")
+    )
+
+
 discover()
 
 
-__all__ = ["discover", "loaded", "failed"]
+__all__ = ["discover", "loaded", "failed", "summary"]
