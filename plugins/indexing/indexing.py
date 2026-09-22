@@ -4,20 +4,6 @@
 #
 # ONE COMMAND: /index
 #
-# FULL CONFIGURATION FLOW:
-#   STEP 1/6 — Channel       (pick registered or forward)
-#   STEP 2/6 — Mode          (movies / series / both)
-#   STEP 3/6 — Direction     (forward / backward)
-#   STEP 4/6 — Range         (full scan / first / last / custom)
-#   STEP 5/6 — Metadata      (caption / filename / both)
-#   STEP 6/6 — Advanced      (batch, conc, delay, options)
-#   CONFIRM  → START
-#
-# RULES:
-#   • Only skip if SAME file_id
-#   • Every other file is imported
-#   • Nothing blocks on bad metadata
-#
 # ============================================================
 
 from __future__ import annotations
@@ -92,7 +78,6 @@ def _update_step(uid: int, **data) -> None:
 
 
 def _set_step(uid: int, step: str, **data) -> None:
-    """Explicitly change the wizard step and merge data."""
     s = _steps.get(uid)
     if not s:
         return
@@ -111,10 +96,13 @@ def _drop_step(uid: int) -> None:
 
 _panels: Dict[int, Dict[str, Any]] = {}
 
-# Per-chat live refresh interval
 _live_intervals: Dict[int, int] = {}
 LIVE_OPTIONS = [3, 5, 10, 30]
 DEFAULT_LIVE = 3
+
+# Job id whose report has already been dismissed (so /index
+# returns to idle home after tapping ✅ Done)
+_dismissed_job_id: Optional[str] = None
 
 
 def _register_panel(msg_id: int, chat_id: int, page: str, text: str) -> None:
@@ -129,10 +117,12 @@ def _unregister_panel(msg_id: int) -> None:
 
 
 # ============================================================
-# MAIN PANEL (dispatcher — decides which panel to show)
+# MAIN PANEL (dispatcher)
 # ============================================================
 
 async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
+    global _dismissed_job_id
+
     w = {}
     try:
         from plugins.indexing import worker as WK
@@ -143,21 +133,19 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
     running = bool(w.get("running"))
     paused = bool(w.get("paused"))
     processed = int(w.get("processed", 0) or 0)
+    job_id = w.get("job_id")
 
-    # 1. Live job in progress → live progress panel
     if running or paused:
         return await _build_live_panel(w)
 
-    # 2. Job finished → 100% report
-    if processed > 0:
+    if processed > 0 and job_id and job_id != _dismissed_job_id:
         return await _build_report_panel(w)
 
-    # 3. Fresh / idle → empty control panel
     return await _build_idle_panel(w)
 
 
 # ============================================================
-# LIVE PANEL (running / paused)
+# LIVE PANEL
 # ============================================================
 
 async def _build_live_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
@@ -208,7 +196,6 @@ async def _build_live_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarku
             ),
         ])
 
-    # Live refresh rate selector
     cur_iv = _live_intervals.get(0, DEFAULT_LIVE)
     rows.append([InlineKeyboardButton(
         f"🔄 {F.sc('refresh rate')}",
@@ -238,6 +225,7 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     max_seen = int(w.get("current_message_id", 0))
     saved = int(w.get("saved", 0))
     dup = int(w.get("duplicate_id", 0))
+    checked = int(w.get("dups_checked", 0))
     skipped = int(w.get("skipped_no_media", 0))
     failed = int(w.get("failed", 0))
     movies = int(w.get("movies", 0))
@@ -249,7 +237,6 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     if started:
         elapsed_str = FM.duration_short(time.time() - started)
 
-    # Progress %
     if max_seen > 0:
         pct = min(95.0, (scanned / max(1, max_seen + 500)) * 100)
     elif scanned > 0:
@@ -277,6 +264,7 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
         f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+        f"🔍 {F.sc('checked')} · <b>{FM.num(checked)}</b>",
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
         "",
@@ -290,12 +278,13 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
 
 
 # ============================================================
-# REPORT PANEL (finished — 100% full green bar)
+# REPORT PANEL
 # ============================================================
 
 async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
     saved = int(w.get("saved", 0))
     dup = int(w.get("duplicate_id", 0))
+    checked = int(w.get("dups_checked", 0))
     skipped = int(w.get("skipped_no_media", 0))
     failed = int(w.get("failed", 0))
     movies = int(w.get("movies", 0))
@@ -309,7 +298,6 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     if started:
         duration = int(finished - started)
 
-    # 100% full GREEN bar (indexing mode = 🟩 at 100)
     bar = P.bar(100, "indexing", width=14, show_percent=False)
 
     total_files = saved + dup + failed
@@ -333,6 +321,7 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
         f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+        f"🔍 {F.sc('checked')} · <b>{FM.num(checked)}</b>",
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
         "",
@@ -347,6 +336,10 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     ]
 
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"✅ {F.sc('done — back to home')}",
+            callback_data=f"{PFX}:dismiss_report",
+        )],
         [InlineKeyboardButton(
             f"📤 {F.sc('save report')}",
             callback_data=f"{PFX}:save_report",
@@ -371,7 +364,7 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
 
 
 # ============================================================
-# IDLE PANEL (fresh — no active job)
+# IDLE PANEL
 # ============================================================
 
 async def _build_idle_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
@@ -423,7 +416,7 @@ async def _build_idle_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarku
                 callback_data=f"{PFX}:refresh",
             ),
             InlineKeyboardButton(
-                f"{F.EMO['cross']} {F.sc('close')}",
+                f"{F.EMO['close']} {F.sc('close')}",
                 callback_data=f"{PFX}:close",
             ),
         ],
@@ -838,7 +831,7 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
 
 
 # ============================================================
-# HISTORY / DATABASES / DUPLICATES
+# HISTORY
 # ============================================================
 
 async def _build_history() -> Tuple[str, InlineKeyboardMarkup]:
@@ -889,12 +882,16 @@ async def _build_history() -> Tuple[str, InlineKeyboardMarkup]:
             ),
         ],
         [InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
+            f"{F.EMO['close']} {F.sc('close')}",
             callback_data=f"{PFX}:close",
         )],
     ]
     return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
 
+
+# ============================================================
+# DATABASES
+# ============================================================
 
 async def _build_databases() -> Tuple[str, InlineKeyboardMarkup]:
     lines = [
@@ -946,11 +943,15 @@ async def _build_databases() -> Tuple[str, InlineKeyboardMarkup]:
             callback_data=f"{PFX}:back",
         ),
     ], [InlineKeyboardButton(
-        f"{F.EMO['cross']} {F.sc('close')}",
+        f"{F.EMO['close']} {F.sc('close')}",
         callback_data=f"{PFX}:close",
     )]]
     return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
 
+
+# ============================================================
+# DUPLICATES
+# ============================================================
 
 async def _build_duplicates() -> Tuple[str, InlineKeyboardMarkup]:
     lines = [
@@ -974,7 +975,7 @@ async def _build_duplicates() -> Tuple[str, InlineKeyboardMarkup]:
             callback_data=f"{PFX}:back",
         ),
     ], [InlineKeyboardButton(
-        f"{F.EMO['cross']} {F.sc('close')}",
+        f"{F.EMO['close']} {F.sc('close')}",
         callback_data=f"{PFX}:close",
     )]]
     return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
@@ -1034,6 +1035,8 @@ async def cmd_index(client: Client, message: Message):
     group=-8200,
 )
 async def router_handler(client: Client, q: CallbackQuery):
+    global _dismissed_job_id
+
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("❌ Admin only", show_alert=True)
 
@@ -1050,7 +1053,7 @@ async def router_handler(client: Client, q: CallbackQuery):
             _register_panel(q.message.id, q.message.chat.id, "main", text)
             return await q.answer()
 
-        # ── CHANNELS PANEL ──
+        # ── CHANNELS ──
         if action == "channels":
             from plugins.indexing import backward as BW
             return await BW.open_channel_manager(client, q)
@@ -1173,7 +1176,6 @@ async def router_handler(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return await q.answer()
 
-        # ── ADVANCED SETTERS ──
         if action == "set_batch":
             _update_step(uid, batch_size=int(arg))
             text, kb = await _build_step_advanced(uid)
@@ -1253,6 +1255,9 @@ async def router_handler(client: Client, q: CallbackQuery):
                 logger.exception(f"[INDEX] start: {e}")
                 await q.answer(f"❌ {type(e).__name__}", show_alert=True)
                 return
+
+            _dismissed_job_id = None
+
             text, kb = await _build_main_panel()
             await _safe_edit(q, text, kb)
             _ensure_auto_refresh()
@@ -1303,6 +1308,19 @@ async def router_handler(client: Client, q: CallbackQuery):
         if action == "noop":
             return await q.answer()
 
+        # ── DISMISS REPORT ──
+        if action == "dismiss_report":
+            try:
+                from plugins.indexing import worker as WK
+                w = WK.status()
+                _dismissed_job_id = w.get("job_id")
+            except Exception:
+                _dismissed_job_id = None
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "main", text)
+            return await q.answer("✅ Done")
+
         # ── CANCEL CONFIRM ──
         if action == "cancel_confirm":
             text = "\n".join([
@@ -1326,7 +1344,7 @@ async def router_handler(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return await q.answer()
 
-        # ── SEND REPORT AS MESSAGE ──
+        # ── SAVE REPORT AS MESSAGE ──
         if action == "save_report":
             try:
                 from plugins.indexing import worker as WK
@@ -1334,9 +1352,9 @@ async def router_handler(client: Client, q: CallbackQuery):
             except Exception:
                 w = {}
 
-            # Build plain-text report (no HTML formatting that could break)
             saved = int(w.get("saved", 0))
             dup = int(w.get("duplicate_id", 0))
+            checked = int(w.get("dups_checked", 0))
             skipped = int(w.get("skipped_no_media", 0))
             failed = int(w.get("failed", 0))
             movies = int(w.get("movies", 0))
@@ -1350,7 +1368,6 @@ async def router_handler(client: Client, q: CallbackQuery):
             if started:
                 duration = int(finished - started)
 
-            # 100% green bar
             bar = P.bar(100, "indexing", width=14, show_percent=False)
 
             total_files = saved + dup + failed
@@ -1376,6 +1393,7 @@ async def router_handler(client: Client, q: CallbackQuery):
                 F.DIV_S,
                 f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
                 f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+                f"🔍 {F.sc('checked')} · <b>{FM.num(checked)}</b>",
                 f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
                 f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
                 "",
@@ -1389,7 +1407,6 @@ async def router_handler(client: Client, q: CallbackQuery):
                 f"🕒 <code>{FM.datetime_()}</code>",
             ]
 
-            # Send as a NEW message (so it stays in chat)
             try:
                 await client.send_message(
                     chat_id=q.message.chat.id,
@@ -1415,7 +1432,6 @@ async def router_handler(client: Client, q: CallbackQuery):
                 await q.answer(f"❌ {type(e).__name__}", show_alert=True)
                 return
 
-            # Wait for worker to fully stop (max 5s)
             try:
                 from plugins.indexing import worker as WK
                 for _ in range(10):
@@ -1425,9 +1441,7 @@ async def router_handler(client: Client, q: CallbackQuery):
             except Exception:
                 pass
 
-            text, kb = await _build_report_panel(
-                _safe_worker_status()
-            )
+            text, kb = await _build_report_panel(_safe_worker_status())
             await _safe_edit(q, text, kb)
             _register_panel(q.message.id, q.message.chat.id, "main", text)
             return
@@ -1590,7 +1604,6 @@ _DEFAULT_KEYS = (
 
 
 async def _save_default_config(data: Dict[str, Any]) -> bool:
-    """Persist only reusable keys — never session-specific ones."""
     try:
         from database import db_registry
         db = db_registry.get_system_db()
@@ -1632,7 +1645,6 @@ def _ensure_auto_refresh() -> None:
 
 
 async def _auto_refresh_loop() -> None:
-    """Refresh every open main panel at its chosen interval."""
     last_refresh: Dict[int, float] = {}
 
     while True:
@@ -1725,7 +1737,7 @@ def snapshot() -> Dict[str, Any]:
 
 
 # ============================================================
-# FORWARD DETECTION (continues the wizard)
+# FORWARD DETECTION
 # ============================================================
 
 @Client.on_message(
@@ -1735,7 +1747,6 @@ def snapshot() -> Dict[str, Any]:
     group=-8199,
 )
 async def idx_forward_handler(client: Client, message: Message):
-    """User forwarded a message from a channel → register it → step 2."""
     if not message.from_user or not _is_admin(message.from_user.id):
         return
 
@@ -1803,7 +1814,6 @@ async def idx_forward_handler(client: Client, message: Message):
     group=-8199,
 )
 async def idx_media_handler(client: Client, message: Message):
-    """User sent a bare media file (not forwarded)."""
     if not message.from_user or not _is_admin(message.from_user.id):
         return
 
