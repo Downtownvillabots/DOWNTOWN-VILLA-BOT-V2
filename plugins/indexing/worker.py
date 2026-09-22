@@ -5,11 +5,9 @@
 # Bots cannot use messages.GetHistory (BOT_METHOD_INVALID).
 # So we NEVER call get_chat_history.
 #
-# Instead we walk message IDs directly with get_messages(
-# message_ids=[...]) — which IS allowed for bots.
-#
-# Stop condition: N consecutive empty batches (default 5 = 500 IDs)
-# so we don't scan 100k IDs on a 500-message channel.
+# Duplicate detection ALWAYS walks every online media shard
+# directly (no bloom shortcut) to confirm a file_id /
+# file_unique_id does not already exist anywhere.
 #
 # ============================================================
 
@@ -41,21 +39,18 @@ PROGRESS_UPDATE_EVERY = 5.0
 MAX_RUNTIME = 24 * 3600
 FLOOD_HARD_SLEEP = 3600
 
-# Max message ID we ever probe (upper bound for full scans)
 try:
     MAX_PROBE_ID = int(os.getenv("INDEXING_MAX_ID", "100000"))
 except (TypeError, ValueError):
     MAX_PROBE_ID = 100000
 MAX_PROBE_ID = max(1000, MAX_PROBE_ID)
 
-# Stop after this many consecutive empty batches (= * 100 IDs scanned)
 try:
     EMPTY_BATCH_LIMIT = int(os.getenv("INDEXING_EMPTY_BATCH_LIMIT", "5"))
 except (TypeError, ValueError):
     EMPTY_BATCH_LIMIT = 5
 EMPTY_BATCH_LIMIT = max(2, EMPTY_BATCH_LIMIT)
 
-# Summary log every N processed messages
 SUMMARY_EVERY = 100
 
 
@@ -94,6 +89,7 @@ STATE: Dict[str, Any] = {
     "processed": 0,
     "saved": 0,
     "duplicate_id": 0,
+    "dups_checked": 0,
     "skipped_no_media": 0,
     "skipped_no_file_id": 0,
     "failed": 0,
@@ -138,6 +134,7 @@ def status() -> Dict[str, Any]:
         "processed": STATE["processed"],
         "saved": STATE["saved"],
         "duplicate_id": STATE["duplicate_id"],
+        "dups_checked": STATE["dups_checked"],
         "skipped_no_media": STATE["skipped_no_media"],
         "skipped_no_file_id": STATE["skipped_no_file_id"],
         "failed": STATE["failed"],
@@ -147,6 +144,7 @@ def status() -> Dict[str, Any]:
         "eta_seconds": STATE["eta_seconds"],
         "eta_text": STATE["eta_text"],
         "started_at": STATE["started_at"],
+        "finished_at": STATE["finished_at"],
         "last_error": STATE["last_error"],
     }
 
@@ -212,6 +210,7 @@ async def start_worker(
             "processed": 0,
             "saved": 0,
             "duplicate_id": 0,
+            "dups_checked": 0,
             "skipped_no_media": 0,
             "skipped_no_file_id": 0,
             "failed": 0,
@@ -322,7 +321,8 @@ async def _run() -> None:
 
         logger.info(
             f"[INDEX-WORKER] 📊 range: {start_id} → {end_id} "
-            f"({total_ids} IDs to scan, step={'+1' if start_id < end_id else '-1'})"
+            f"({total_ids} IDs to scan, "
+            f"step={'+1' if start_id < end_id else '-1'})"
         )
 
         logger.info("[INDEX-WORKER] ▶️ walking...")
@@ -345,20 +345,17 @@ async def _run() -> None:
             f"[INDEX-WORKER] 🏁 DONE — "
             f"scanned={STATE['scanned_ids']} processed={STATE['processed']} "
             f"saved={STATE['saved']} dup={STATE['duplicate_id']} "
+            f"checked={STATE['dups_checked']} "
             f"no_media={STATE['skipped_no_media']} failed={STATE['failed']} "
             f"movies={STATE['movies']} series={STATE['series']}"
         )
 
 
 # ============================================================
-# RESOLVE RANGE (no bot-incompatible API calls)
+# RESOLVE RANGE
 # ============================================================
 
 def _resolve_range() -> Tuple[int, int]:
-    """
-    Return (start_id, end_id) for the ID walk.
-    Never calls get_chat_history.
-    """
     range_mode = STATE["range_mode"]
     direction = STATE["direction"]
     user_start = STATE["start_msg_id"]
@@ -366,16 +363,12 @@ def _resolve_range() -> Tuple[int, int]:
     if range_mode == "custom" and user_start:
         start = max(1, int(user_start))
     elif range_mode == "last":
-        # Backward from top probe
         start = MAX_PROBE_ID
     else:
-        # full / first
         start = 1
 
-    # Forward direction
     if direction == "forward":
         end = MAX_PROBE_ID
-    # Backward direction
     else:
         end = 1
 
@@ -415,7 +408,6 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             logger.info("[INDEX-WORKER] stop requested")
             break
 
-        # Pause loop
         while STATE["paused"] and not STATE["stop_requested"]:
             fu = float(STATE.get("flood_until") or 0.0)
             if fu and fu <= time.time():
@@ -432,7 +424,6 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
             continue
 
-        # Build batch
         batch: List[int] = []
         for _ in range(batch_size):
             if stop_when(next_id):
@@ -453,20 +444,16 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             seen_any = True
         else:
             consecutive_empty += 1
-            # Early stop if the channel is short
             if seen_any and consecutive_empty >= EMPTY_BATCH_LIMIT:
                 logger.info(
                     f"[INDEX-WORKER] ⏹️ {consecutive_empty} empty "
                     f"batches in a row → stopping early"
                 )
                 break
-            # If we've never seen content and we're already deep, keep going
-            # for up to 3x the limit before giving up
             if not seen_any and consecutive_empty >= EMPTY_BATCH_LIMIT * 3:
                 logger.warning(
                     f"[INDEX-WORKER] ⚠️ {consecutive_empty} empty "
-                    f"batches from the start → channel may be empty "
-                    f"or IDs start high. Stopping."
+                    f"batches from start → channel empty or IDs high. Stop."
                 )
                 break
 
@@ -488,6 +475,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
                 f"[INDEX-WORKER] 📈 scanned={STATE['scanned_ids']} "
                 f"processed={STATE['processed']} saved={STATE['saved']} "
                 f"dup={STATE['duplicate_id']} "
+                f"checked={STATE['dups_checked']} "
                 f"no_media={STATE['skipped_no_media']} "
                 f"failed={STATE['failed']}"
             )
@@ -497,11 +485,10 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 
 
 # ============================================================
-# PROCESS BATCH (uses get_messages — bot-safe)
+# PROCESS BATCH
 # ============================================================
 
 async def _process_batch(C: Client, batch: List[int]) -> bool:
-    """Returns True if at least one message in the batch was non-empty."""
     try:
         msgs = await C.get_messages(STATE["channel_id"], message_ids=batch)
         if not isinstance(msgs, list):
@@ -573,7 +560,7 @@ async def _handle_message(C: Client, msg) -> None:
             return
 
         if STATE["skip_duplicate"]:
-            STATE["dups_checked"] = STATE.get("dups_checked", 0) + 1
+            STATE["dups_checked"] += 1
             try:
                 file_unique_id = media.get("file_unique_id")
                 if await _is_exact_duplicate(file_id, file_unique_id):
@@ -617,7 +604,6 @@ async def _handle_message(C: Client, msg) -> None:
             elif rtype == "series":
                 STATE["series"] += 1
             else:
-                # DEBUG — shows what the pipeline actually stored
                 logger.warning(
                     f"[INDEX-WORKER] ⚠️ SAVED but type={rtype!r} "
                     f"keys={list(rec.keys())[:10]}"
@@ -628,7 +614,6 @@ async def _handle_message(C: Client, msg) -> None:
                 f"type={rtype or 'unknown'} "
                 f"title='{str(title_dbg)[:60]}'"
             )
-            
         elif status == "skipped":
             reason = str(result.get("reason") or "")
             if "file_id" in reason:
@@ -644,11 +629,11 @@ async def _handle_message(C: Client, msg) -> None:
                 f"reason={result.get('reason')}"
             )
 
-        # Periodic summary
         if STATE["processed"] % SUMMARY_EVERY == 0:
             logger.info(
                 f"[INDEX-WORKER] 📊 summary @{STATE['processed']} — "
                 f"saved={STATE['saved']} dup={STATE['duplicate_id']} "
+                f"checked={STATE['dups_checked']} "
                 f"fail={STATE['failed']}"
             )
 
@@ -689,58 +674,66 @@ async def _is_exact_duplicate(
     file_unique_id: Optional[str] = None,
 ) -> bool:
     """
-    Robust duplicate check.
-    Checks (in order):
-      1. Bloom filter (fast in-memory)
-      2. DB across every media shard, trying:
-           - _id = fingerprint
-           - file_id
-           - file_unique_id
+    ALWAYS checks every online media shard directly.
+
+    NO bloom shortcut. Walks all shared DBs to confirm
+    file_id / file_unique_id does not already exist anywhere.
+
+    Keys tried per shard:
+      • _id            = sha256 fingerprint of file_id
+      • file_id        = raw telegram file_id
+      • file_unique_id = telegram unique id
     """
+    if not file_id and not file_unique_id:
+        return False
+
     fp: Optional[str] = None
-
-    # 1. Bloom
     try:
-        from services.duplicate import compute_fingerprint, _bloom_check
-        fp = compute_fingerprint(file_id)
-        if fp and _bloom_check(fp):
-            logger.debug(f"[INDEX-WORKER] dup bloom hit fp={fp[:12]}")
-            return True
+        from services.duplicate import compute_fingerprint
+        fp = compute_fingerprint(file_id) if file_id else None
     except Exception as e:
-        logger.debug(f"[INDEX-WORKER] bloom check: {e}")
+        logger.debug(f"[INDEX-WORKER] fingerprint: {e}")
 
-    # 2. DB
+    queries: List[Dict[str, Any]] = []
+    if fp:
+        queries.append({"_id": fp})
+    if file_id:
+        queries.append({"file_id": file_id})
+    if file_unique_id:
+        queries.append({"file_unique_id": file_unique_id})
+
+    if not queries:
+        return False
+
     try:
         from database import db_registry
-        for entry in db_registry.media_entries():
-            try:
-                queries: List[Dict[str, Any]] = []
-                if fp:
-                    queries.append({"_id": fp})
-                if file_id:
-                    queries.append({"file_id": file_id})
-                if file_unique_id:
-                    queries.append({"file_unique_id": file_unique_id})
+        entries = db_registry.media_entries()
+    except Exception as e:
+        logger.debug(f"[INDEX-WORKER] registry error: {e}")
+        return False
 
-                for q in queries:
-                    doc = await entry.db["media_files"].find_one(
-                        q, {"_id": 1, "file_id": 1}
+    for entry in entries:
+        if not entry.online:
+            continue
+        for q in queries:
+            try:
+                doc = await entry.db["media_files"].find_one(q, {"_id": 1})
+                if doc:
+                    key_name = list(q.keys())[0]
+                    logger.info(
+                        f"[INDEX-WORKER] ♻️ DUP found "
+                        f"shard={entry.index} key={key_name}"
                     )
-                    if doc:
-                        logger.debug(
-                            f"[INDEX-WORKER] dup db hit "
-                            f"shard={entry.index} q={list(q.keys())}"
-                        )
-                        return True
+                    return True
             except Exception as e:
                 logger.debug(
-                    f"[INDEX-WORKER] shard {entry.index} query: {e}"
+                    f"[INDEX-WORKER] shard {entry.index} "
+                    f"q={list(q.keys())}: {e}"
                 )
                 continue
-    except Exception as e:
-        logger.debug(f"[INDEX-WORKER] db check: {e}")
 
     return False
+
 
 def _update_speed() -> None:
     try:
@@ -781,6 +774,7 @@ async def _finalize(status: Optional[str] = None) -> None:
             "processed": STATE["processed"],
             "saved": STATE["saved"],
             "duplicate_id": STATE["duplicate_id"],
+            "dups_checked": STATE["dups_checked"],
             "skipped_no_media": STATE["skipped_no_media"],
             "skipped_no_file_id": STATE["skipped_no_file_id"],
             "failed": STATE["failed"],
