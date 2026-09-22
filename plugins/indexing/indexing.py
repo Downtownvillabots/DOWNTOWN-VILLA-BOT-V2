@@ -111,6 +111,11 @@ def _drop_step(uid: int) -> None:
 
 _panels: Dict[int, Dict[str, Any]] = {}
 
+# Per-chat live refresh interval
+_live_intervals: Dict[int, int] = {}
+LIVE_OPTIONS = [3, 5, 10, 30]
+DEFAULT_LIVE = 3
+
 
 def _register_panel(msg_id: int, chat_id: int, page: str, text: str) -> None:
     _panels[msg_id] = {
@@ -144,6 +149,8 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         s_icon, s_text = "🟢", "RUNNING"
     elif paused:
         s_icon, s_text = "🟡", "PAUSED"
+    elif w.get("started_at") and not running:
+        s_icon, s_text = "✅", "FINISHED"
     else:
         s_icon, s_text = "⚪", "IDLE"
 
@@ -157,7 +164,8 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         "",
     ]
 
-    if running or paused:
+    # Live progress when running/paused/finished
+    if running or paused or w.get("started_at"):
         lines.extend(await _render_live_progress(w))
 
     lines += [F.DIV_S, f"🕒 <code>{FM.datetime_()}</code>"]
@@ -178,8 +186,8 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
                 callback_data=f"{PFX}:resume",
             ),
             InlineKeyboardButton(
-                f"{F.EMO['stop']} {F.sc('stop')}",
-                callback_data=f"{PFX}:stop",
+                f"{F.EMO['cross']} {F.sc('cancel job')}",
+                callback_data=f"{PFX}:cancel_confirm",
             ),
         ])
     else:
@@ -189,10 +197,23 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
                 callback_data=f"{PFX}:pause",
             ),
             InlineKeyboardButton(
-                f"{F.EMO['stop']} {F.sc('stop')}",
-                callback_data=f"{PFX}:stop",
+                f"{F.EMO['cross']} {F.sc('cancel job')}",
+                callback_data=f"{PFX}:cancel_confirm",
             ),
         ])
+
+    # Live refresh rate selector
+    if running or paused:
+        cur_iv = _live_intervals.get(0, DEFAULT_LIVE)
+        live_row = [InlineKeyboardButton(
+            f"{'✅ ' if iv == cur_iv else ''}{iv}s",
+            callback_data=f"{PFX}:live:{iv}",
+        ) for iv in LIVE_OPTIONS]
+        rows.append([InlineKeyboardButton(
+            f"🔄 {F.sc('refresh rate')}",
+            callback_data=f"{PFX}:noop",
+        )])
+        rows.append(live_row)
 
     rows.append([
         InlineKeyboardButton(
@@ -201,7 +222,7 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
         ),
         InlineKeyboardButton(
             f"📊 {F.sc('live')}",
-            callback_data=f"{PFX}:live",
+            callback_data=f"{PFX}:live_now",
         ),
     ])
     rows.append([
@@ -244,7 +265,7 @@ async def _build_main_panel() -> Tuple[str, InlineKeyboardMarkup]:
 
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     total = int(w.get("total_messages", 0) or 0)
-    processed = int(w.get("processed", 0) or 0)
+    scanned = int(w.get("scanned_ids", 0) or 0)
     current = int(w.get("current_message_id", 0) or 0)
     saved = int(w.get("saved", 0) or 0)
     dup = int(w.get("duplicate_id", 0) or 0)
@@ -252,39 +273,48 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     failed = int(w.get("failed", 0) or 0)
     movies = int(w.get("movies", 0) or 0)
     series = int(w.get("series", 0) or 0)
-    speed = float(w.get("speed", 0.0) or 0.0)
-    eta_text = w.get("eta_text", "—")
+    processed = int(w.get("processed", 0) or 0)
 
-    # ── Progress: use real processed counter, not msg-id ratio ──
-    if total > 0 and processed > 0:
-        pct = min(100.0, (processed / total) * 100.0)
+    # Progress % from scanned / total
+    if total > 0:
+        pct = min(100.0, (scanned / total) * 100)
     else:
         pct = 0.0
 
-    return [
-        F.DIV_S, f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>", F.DIV_S, "",
-        f"<code>{P.bar(pct, 'indexing', width=18)}</code>", "",
-        f"📢 {F.sc('channel')} · "
+    color = P.storage_color(100 - pct)  # low = green, high = red
+    bar = P.bar(pct, "storage", width=14, show_percent=False)
+
+    lines = [
+        F.DIV_S,
+        f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
+        F.DIV_S, "",
+        f"{color} <code>{bar}</code> {pct:.1f}%",
+        "",
+        f"📡 {F.sc('channel')} · "
         f"<code>{str(w.get('channel_title', '?'))[:30]}</code>",
         f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
         f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
         f"📄 {F.sc('metadata')} · "
         f"<b>{str(w.get('metadata_source', 'both'))}</b>",
         "",
+        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b> / "
+        f"<code>{FM.num(total)}</code>",
+        f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
+        "",
+        F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
-        f"⏭️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+        f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
         "",
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
         f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
         "",
-        f"⚡ {F.sc('speed')} · <b>{FM.rate(speed)}</b>",
-        f"⏱️ {F.sc('eta')} · <b>{eta_text}</b>",
-        f"📍 {F.sc('current')} · <code>{FM.num(current)}</code>",
+        f"⚡ {F.sc('speed')} · <b>{w.get('speed', 0):.1f}/s</b>",
+        f"⏱️ {F.sc('eta')} · <b>{w.get('eta_text', '—')}</b>",
         "",
     ]
-
+    return lines
 
 # ============================================================
 # STEP 1/6 — CHANNEL
@@ -689,6 +719,74 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     ]
 
     return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
+
+async def _build_summary_panel() -> Tuple[str, InlineKeyboardMarkup]:
+    """Final summary after a job completes."""
+    w = {}
+    try:
+        from plugins.indexing import worker as WK
+        w = WK.status()
+    except Exception:
+        pass
+
+    saved = int(w.get("saved", 0))
+    dup = int(w.get("duplicate_id", 0))
+    skipped = int(w.get("skipped_no_media", 0))
+    failed = int(w.get("failed", 0))
+    movies = int(w.get("movies", 0))
+    series = int(w.get("series", 0))
+    processed = int(w.get("processed", 0))
+    scanned = int(w.get("scanned_ids", 0))
+
+    started = w.get("started_at") or 0
+    duration = 0
+    if started:
+        duration = int(time.time() - started)
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"✅ <b>{F.fb('INDEXING SUMMARY')}</b>",
+        F.DIV, "",
+        f"📡 {F.sc('channel')} · "
+        f"<code>{str(w.get('channel_title', '?'))[:40]}</code>",
+        f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
+        f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
+        f"⏱️ {F.sc('duration')} · <b>{FM.duration_short(duration)}</b>",
+        "",
+        F.DIV_S,
+        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
+        f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
+        "",
+        f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
+        f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+        f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
+        f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
+        "",
+        f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
+        f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
+        "",
+        F.DIV,
+        f"🕒 <code>{FM.datetime_()}</code>",
+    ]
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{F.EMO['play']} {F.sc('start new job')}",
+            callback_data=f"{PFX}:start",
+        )],
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back to panel')}",
+                callback_data=f"{PFX}:back",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data=f"{PFX}:close",
+            ),
+        ],
+    ])
+
+    return "\n".join(lines)[:4000], kb
 
 
 # ============================================================
@@ -1144,10 +1242,79 @@ async def router_handler(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
+        # ── LIVE REFRESH RATE ──
+        if action == "live":
+            try:
+                iv = int(arg)
+            except ValueError:
+                iv = DEFAULT_LIVE
+            _live_intervals[q.message.chat.id] = iv
+            await q.answer(f"🔄 {iv}s")
+            text, kb = await _build_main_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "main", text)
+            return
+
+        if action == "noop":
+            return await q.answer()
+
+        # ── CANCEL CONFIRM ──
+        if action == "cancel_confirm":
+            text = "\n".join([
+                f"{F.EMO['warn']} <b>{F.fb('CANCEL JOB?')}</b>",
+                F.DIV, "",
+                f"{F.EMO['warn']} {F.sc('this stops the indexing job')}",
+                f"{F.EMO['info']} {F.sc('files already saved are kept')}",
+                "",
+                f"📌 {F.sc('continue?')}",
+            ])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"🛑 {F.sc('yes, cancel')}",
+                    callback_data=f"{PFX}:cancel_do",
+                )],
+                [InlineKeyboardButton(
+                    f"{F.EMO['back']} {F.sc('no, keep running')}",
+                    callback_data=f"{PFX}:back",
+                )],
+            ])
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cancel_do":
+            try:
+                from plugins.indexing import worker as WK
+                await WK.stop_worker()
+                await q.answer("🛑 Cancelling…")
+            except Exception as e:
+                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+                return
+
+            # Wait for worker to fully stop (max 5s)
+            try:
+                from plugins.indexing import worker as WK
+                for _ in range(10):
+                    if not WK.is_running():
+                        break
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+            text, kb = await _build_summary_panel()
+            await _safe_edit(q, text, kb)
+            _register_panel(q.message.id, q.message.chat.id, "summary", text)
+            return
+
+        # ── SUMMARY (manual view) ──
+        if action == "summary":
+            text, kb = await _build_summary_panel()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
         if action == "stop":
             try:
                 from plugins.indexing import worker as WK
-                ok = WK.stop_worker()
+                ok = await WK.stop_worker()
                 await q.answer("⏹️ Stopping" if ok else "⚠️")
             except Exception:
                 pass
@@ -1155,12 +1322,7 @@ async def router_handler(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
-        # ── VIEWS ──
-        if action == "live":
-            text, kb = await _build_main_panel()
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
+    
         if action == "history":
             text, kb = await _build_history()
             await _safe_edit(q, text, kb)
@@ -1345,36 +1507,46 @@ def _ensure_auto_refresh() -> None:
     try:
         loop = asyncio.get_running_loop()
         _refresh_task = loop.create_task(_auto_refresh_loop())
+        logger.info("[INDEX] auto-refresh loop started")
     except RuntimeError:
         pass
 
 
 async def _auto_refresh_loop() -> None:
+    """Refresh every open main panel at its chosen interval."""
+    last_refresh: Dict[int, float] = {}
+
     while True:
         try:
-            await asyncio.sleep(AUTO_REFRESH_SEC)
+            await asyncio.sleep(1.0)
             if not _panels:
                 continue
-            running = False
-            try:
-                from plugins.indexing import worker as WK
-                running = WK.status().get("running", False)
-            except Exception:
-                pass
-            if not running:
-                continue
+
             from core.client import client as C
             if C is None:
                 continue
+
+            now = time.time()
+
             for msg_id, panel in list(_panels.items()):
                 if panel.get("page") not in ("main", "live"):
                     continue
+
+                chat_id = panel["chat_id"]
+                iv = _live_intervals.get(chat_id, DEFAULT_LIVE)
+
+                # Time to refresh?
+                if now - last_refresh.get(msg_id, 0) < iv:
+                    continue
+                last_refresh[msg_id] = now
+
                 try:
                     text, kb = await _build_main_panel()
                     if text == panel.get("last_text"):
                         continue
+
                     await C.edit_message_text(
-                        chat_id=panel["chat_id"],
+                        chat_id=chat_id,
                         message_id=msg_id,
                         text=text, reply_markup=kb,
                         parse_mode=ParseMode.HTML,
@@ -1382,14 +1554,17 @@ async def _auto_refresh_loop() -> None:
                     )
                     panel["last_text"] = text
                 except Exception as e:
-                    if "not found" in str(e).lower():
+                    err = str(e).lower()
+                    if "not modified" in err:
+                        continue
+                    if "message to edit not found" in err:
                         _unregister_panel(msg_id)
-                    continue
+                        last_refresh.pop(msg_id, None)
+                        continue
         except asyncio.CancelledError:
             return
         except Exception:
             pass
-
 
 # ============================================================
 # HELPERS
