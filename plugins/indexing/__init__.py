@@ -37,7 +37,7 @@ def discover() -> None:
         name = mod.name
         if name.startswith("_"):
             continue
-        full = f"{__name__}.{name}"
+        full = f"{__package__}.{name}"
         try:
             importlib.import_module(full)
             _loaded.append(name)
