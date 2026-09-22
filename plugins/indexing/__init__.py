@@ -2,7 +2,7 @@
 # 🏨 DOWNTOWN VILLA — INDEXING PLUGIN AUTO-DISCOVERY
 # ============================================================
 #
-# Imports every module in this package.
+# Imports every .py in this package.
 # Each module registers its own handlers.
 #
 # To add a new indexing module:
