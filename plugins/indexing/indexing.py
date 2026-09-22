@@ -348,8 +348,8 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"✅ {F.sc('completed')}",
-            callback_data=f"{PFX}:noop",
+            f"📤 {F.sc('save report')}",
+            callback_data=f"{PFX}:save_report",
         )],
         [InlineKeyboardButton(
             f"{F.EMO['play']} {F.sc('start new job')}",
@@ -1325,6 +1325,86 @@ async def router_handler(client: Client, q: CallbackQuery):
             ])
             await _safe_edit(q, text, kb)
             return await q.answer()
+
+        # ── SEND REPORT AS MESSAGE ──
+        if action == "save_report":
+            try:
+                from plugins.indexing import worker as WK
+                w = WK.status()
+            except Exception:
+                w = {}
+
+            # Build plain-text report (no HTML formatting that could break)
+            saved = int(w.get("saved", 0))
+            dup = int(w.get("duplicate_id", 0))
+            skipped = int(w.get("skipped_no_media", 0))
+            failed = int(w.get("failed", 0))
+            movies = int(w.get("movies", 0))
+            series = int(w.get("series", 0))
+            processed = int(w.get("processed", 0))
+            scanned = int(w.get("scanned_ids", 0))
+
+            started = w.get("started_at") or 0
+            finished = w.get("finished_at") or time.time()
+            duration = 0
+            if started:
+                duration = int(finished - started)
+
+            # 100% green bar
+            bar = P.bar(100, "indexing", width=14, show_percent=False)
+
+            total_files = saved + dup + failed
+
+            report_lines = [
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"✅ <b>{F.fb('INDEXING REPORT')}</b>",
+                F.DIV, "",
+                f"<code>{bar}</code> 100%",
+                "",
+                f"📡 {F.sc('channel')} · "
+                f"<code>{str(w.get('channel_title', '?'))[:40]}</code>",
+                f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
+                f"⬇️ {F.sc('direction')} · "
+                f"<b>{str(w.get('direction', '?'))}</b>",
+                f"⏱️ {F.sc('duration')} · "
+                f"<b>{FM.duration_short(duration)}</b>",
+                "",
+                F.DIV_S,
+                f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
+                f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
+                "",
+                F.DIV_S,
+                f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
+                f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
+                f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
+                f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
+                "",
+                f"📁 {F.sc('total files')} · <b>{FM.num(total_files)}</b>",
+                "",
+                F.DIV_S,
+                f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
+                f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
+                "",
+                F.DIV,
+                f"🕒 <code>{FM.datetime_()}</code>",
+            ]
+
+            # Send as a NEW message (so it stays in chat)
+            try:
+                await client.send_message(
+                    chat_id=q.message.chat.id,
+                    text="\n".join(report_lines),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await q.answer("📤 Report sent")
+            except Exception as e:
+                logger.exception(f"[INDEX] save_report: {e}")
+                await q.answer(
+                    f"❌ {type(e).__name__}",
+                    show_alert=True,
+                )
+            return
 
         if action == "cancel_do":
             try:
