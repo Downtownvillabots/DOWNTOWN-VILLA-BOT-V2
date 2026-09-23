@@ -6,16 +6,16 @@
 #   DB1 until threshold → DB2 until threshold → DB3 ...
 #
 # Logs show the ACTUAL MongoDB database label from your env
-# (e.g. 'DATA-BASE-01'), not a random hard-coded name.
+# (e.g. 'DATA-BASE-01').
+#
+# Writes search-ready fields:
+#   title · normalized_title
+#   series_title · normalized_series_title
+#   type (never empty) · year · quality · codec · languages
 #
 # Cache: current shard cached 30s. On write failure cache is
 # invalidated and shard is re-picked.
 #
-# Returns:
-#   saved      → {"status": "saved",     "record": {...}}
-#   duplicate  → {"status": "duplicate", "reason": "same file_id"}
-#   skipped    → {"status": "skipped",   "reason": "..."}
-#   error      → {"status": "error",     "reason": "..."}
 # ============================================================
 
 from __future__ import annotations
@@ -98,6 +98,25 @@ _LANGS = {
     "turkish": "Turkish",
     "thai": "Thai",
 }
+
+
+# ============================================================
+# NORMALIZER (imported lazily to avoid circular imports)
+# ============================================================
+
+def _normalize(text: str) -> str:
+    """Lowercase, collapse separators, strip punctuation."""
+    try:
+        from media_search.normalizer import normalize
+        return normalize(text or "")
+    except Exception:
+        if not text:
+            return ""
+        t = str(text).lower()
+        t = re.sub(r"[.\-_/,;:\\]+", " ", t)
+        t = re.sub(r"[^\w\s]+", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
 
 
 # ============================================================
@@ -358,6 +377,28 @@ def _build_record(
     source_channel_id = getattr(chat, "id", None) if chat else None
     source_msg_id = getattr(message, "id", None) if message else None
 
+    # ── Compute normalized fields for search ──
+    title_clean = parsed["title"] or ""
+    normalized_title = _normalize(title_clean)
+
+    # ── Guarantee type is set ──
+    rtype = parsed["type"]
+    if rtype not in ("movie", "series"):
+        if parsed.get("season") is not None or parsed.get("episode") is not None:
+            rtype = "series"
+        else:
+            rtype = "movie"
+
+    # Series-specific
+    is_series = (rtype == "series")
+    series_title_val = title_clean if is_series else None
+    normalized_series_title = normalized_title if is_series else None
+
+    # If no title could be extracted, fall back to cleaned file_name
+    if not title_clean and fname:
+        title_clean = _fallback_title(fname)
+        normalized_title = _normalize(title_clean)
+
     rec: Dict[str, Any] = {
         "_id": fingerprint,
         "fingerprint": fingerprint,
@@ -370,16 +411,24 @@ def _build_record(
         "duration": int(getattr(media, "duration", 0) or 0),
         "file_type": getattr(media, "file_type", None),
 
-        "title": parsed["title"],
-        "series_title": parsed["title"] if parsed["type"] == "series" else None,
-        "type": parsed["type"],
+        # ── Search fields ──
+        "title": title_clean,
+        "normalized_title": normalized_title,
+        "series_title": series_title_val,
+        "normalized_series_title": normalized_series_title,
+        "type": rtype,
+
+        # ── Metadata ──
         "year": parsed["year"],
         "season": parsed["season"],
         "episode": parsed["episode"],
         "quality": parsed["quality"] or "UNKNOWN",
+        "codec": parsed["codec"] or None,
         "audio_languages": parsed["languages"],
         "languages": parsed["languages"],
+        "subtitle_languages": [],
 
+        # ── Provenance ──
         "source_channel_id": source_channel_id,
         "source_message_id": source_msg_id,
         "caption": caption[:1000],
@@ -389,6 +438,18 @@ def _build_record(
         "created_at": datetime.utcnow(),
     }
     return rec
+
+
+def _fallback_title(fname: str) -> str:
+    """Best-effort title from a raw filename."""
+    try:
+        t = _RE_EXT.sub("", str(fname))
+        t = re.sub(r"[._\-]+", " ", t)
+        t = re.split(r"[\[\{\(]", t, maxsplit=1)[0]
+        t = re.sub(r"\s+", " ", t).strip(" -_|·")
+        return t[:200]
+    except Exception:
+        return str(fname)[:200]
 
 
 # ============================================================
@@ -403,6 +464,7 @@ def _parse(text: str) -> Dict[str, Any]:
         "season": None,
         "episode": None,
         "quality": None,
+        "codec": None,
         "languages": [],
     }
     if not text:
@@ -426,6 +488,7 @@ def _parse(text: str) -> Dict[str, Any]:
         out["type"] = "series"
 
     out["languages"] = _extract_languages(t)
+    out["codec"] = _extract_codec(t)
 
     title = t
     cut = None
@@ -456,6 +519,20 @@ def _extract_languages(text: str) -> List[str]:
             if name not in found:
                 found.append(name)
     return found
+
+
+_RE_CODEC = re.compile(
+    r"\b(hevc|h\.?265|x265|h\.?264|x264|avc|av1|vp9|"
+    r"xvid|divx|mpeg-?4|mpeg-?2)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_codec(text: str) -> Optional[str]:
+    m = _RE_CODEC.search(text)
+    if not m:
+        return None
+    return m.group(1).upper().replace(".", "").replace("-", "")
 
 
 __all__ = ["process_message", "save_file"]
