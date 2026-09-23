@@ -175,7 +175,7 @@ async def _handle_updated(client, q, req, token):
         except Exception as e:
             logger.debug(f"[REQ] DM updated: {e}")
 
-    await RS.update_status(token, "updated")
+    await RS.delete_request(token)
 
     # Strike through the original message
     try:
@@ -232,7 +232,7 @@ async def _handle_notreleased(client, q, req, token):
     except Exception as e:
         logger.debug(f"[REQ] DM notreleased: {e}")
 
-    await RS.update_status(token, "not_released")
+        await RS.delete_request(token)
 
     try:
         original = q.message.text or q.message.caption or ""
@@ -279,7 +279,7 @@ async def _handle_notfound(client, q, req, token):
     except Exception as e:
         logger.debug(f"[REQ] DM notfound: {e}")
 
-    await RS.update_status(token, "not_found")
+    await RS.delete_request(token)
 
     try:
         original = q.message.text or q.message.caption or ""
@@ -296,7 +296,7 @@ async def _handle_notfound(client, q, req, token):
 
 
 async def _handle_cancel(client, q, req, token):
-    await RS.update_status(token, "cancelled")
+    await RS.delete_request(token)
 
     try:
         original = q.message.text or q.message.caption or ""
