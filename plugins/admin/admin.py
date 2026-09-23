@@ -24,6 +24,7 @@
 #   🚫 Ban / Filter     → ban + filter
 #   🛠️ Maintenance      → toggle
 #   ⚙️ Settings         → bot config
+#   🔍 PM SEARCH        → pm settings
 #
 # Every panel has ❌ CANCEL button.
 #
@@ -229,6 +230,12 @@ def _render_main() -> tuple:
             InlineKeyboardButton(
                 f"🔎 {F.sc('missing')}",
                 callback_data=cb("mod", "missing"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🔍 {F.sc('pm search')}",
+                callback_data=cb("mod", "pmsearch"),
             ),
         ],
         [
@@ -934,6 +941,15 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
                 await q.answer("Use /missing", show_alert=True)
             return
 
+        if module == "pmsearch":
+            try:
+                from plugins.pm_search import admin as PMA
+                await PMA.cmd_pmsearch(client, q.message)
+            except Exception as e:
+                logger.exception(f"[ADMIN] pmsearch: {e}")
+                await q.answer("❌ Failed", show_alert=True)
+            return
+            
         await q.answer(f"❓ Unknown module", show_alert=True)
     except ImportError:
         await q.answer(f"Use /{module} command", show_alert=True)
