@@ -2,11 +2,10 @@
 # 🏨 DOWNTOWN VILLA — AUTO FILTER (PM SEARCH)
 # ============================================================
 #
-# Every non-command PM text triggers a search.
-# Uses core/flow_engine for the pm_search flow.
+# DEPRECATED — PM search text is now handled by
+# plugins.pm_search.handlers.pm_text_handler.
 #
-# TOGGLE:
-#   • bot_settings.pm_search (via /pm_search)
+# This file only keeps the /pm_search toggle command.
 #
 # ============================================================
 
@@ -39,6 +38,12 @@ def _is_admin(uid) -> bool:
 
 async def _is_pm_search_enabled() -> bool:
     try:
+        from plugins.pm_search import state as CFG
+        cfg = await CFG.get_cfg()
+        return bool(cfg.get("enabled", True))
+    except Exception:
+        pass
+    try:
         from database import db_registry
         db = db_registry.get_system_db()
         if db is None:
@@ -52,7 +57,12 @@ async def _is_pm_search_enabled() -> bool:
 
 
 # ============================================================
-# HANDLER
+# HANDLER — DISABLED
+# ============================================================
+#
+# New PM search flow lives in plugins/pm_search/handlers.py.
+# This handler is a no-op to avoid double replies.
+#
 # ============================================================
 
 @Client.on_message(
@@ -60,58 +70,20 @@ async def _is_pm_search_enabled() -> bool:
     & filters.text
     & ~filters.regex(r"^/")
     & ~filters.regex(r"^sr:")
+    & ~filters.regex(r"^pms:")
+    & ~filters.regex(r"^pmsa:")
     & ~filters.regex(r"^idx:")
     & ~filters.regex(r"^dtvb:")
     & ~filters.regex(r"^adm:"),
     group=-500,
 )
 async def pm_text_handler(client: Client, message: Message):
-    """Any PM text triggers a search flow."""
-    try:
-        if not message.from_user:
-            return
-
-        txt = (message.text or "").strip()
-        if not txt or len(txt) < 2 or len(txt) > 120:
-            return
-        if "http://" in txt.lower() or "https://" in txt.lower():
-            return
-
-        # PM search gate
-        if not await _is_pm_search_enabled():
-            return
-
-        # Cooldown
-        uid = message.from_user.id
-        now = time.time()
-        if now - _last_seen.get(uid, 0) < PM_COOLDOWN:
-            return
-        _last_seen[uid] = now
-
-        # Start the flow
-        from plugins.search import handlers as H
-        started = await H.start_search(
-            client=client,
-            user_id=uid,
-            chat_id=message.chat.id,
-            query=txt,
-            is_group=False,
-            message=message,
-        )
-        if started:
-            H.track_search_event()
-
-        try:
-            message.stop_propagation()
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.exception(f"[PM-SEARCH] handler: {e}")
+    """Deprecated — plugins.pm_search.handlers handles PM text now."""
+    return
 
 
 # ============================================================
-# /pm_search toggle (admin)
+# /pm_search toggle (admin) — legacy quick toggle
 # ============================================================
 
 @Client.on_message(
@@ -130,26 +102,44 @@ async def cmd_pm_search(client: Client, message: Message):
         "on", "off", "true", "false"
     ):
         return await message.reply_text(
-            f"ᴜꜱᴀɢᴇ: <code>/pm_search on</code> ᴏʀ <code>off</code>",
+            f"ᴜꜱᴀɢᴇ: <code>/pm_search on</code> ᴏʀ <code>off</code>\n"
+            f"📌 ꜰᴜʟʟ ᴘᴀɴᴇʟ · <code>/pmsearch</code>",
             parse_mode=ParseMode.HTML,
         )
 
     enable = parts[1].strip().lower() in ("on", "true")
+
+    # Save to new config
+    saved = False
+    try:
+        from plugins.pm_search import state as CFG
+        await CFG.set_cfg(enabled=enable)
+        saved = True
+    except Exception as e:
+        logger.debug(f"[PM-SEARCH] cfg save: {e}")
+
+    # Keep legacy doc in sync
     try:
         from database import db_registry
         db = db_registry.get_system_db()
-        await db["bot_settings"].update_one(
-            {"_id": "pm_search"},
-            {"$set": {"enabled": enable}},
-            upsert=True,
-        )
-        await message.reply_text(
-            f"{F.EMO['check']} ᴘᴍ ꜱᴇᴀʀᴄʜ · "
-            f"<b>{'ᴏɴ' if enable else 'ᴏꜰꜰ'}</b>",
-            parse_mode=ParseMode.HTML,
-        )
+        if db is not None:
+            await db["bot_settings"].update_one(
+                {"_id": "pm_search"},
+                {"$set": {"enabled": enable}},
+                upsert=True,
+            )
+            saved = True
     except Exception as e:
-        await message.reply_text(f"❌ {e}")
+        logger.debug(f"[PM-SEARCH] legacy save: {e}")
+
+    if not saved:
+        return await message.reply_text("❌ Save failed")
+
+    await message.reply_text(
+        f"{F.EMO['check']} ᴘᴍ ꜱᴇᴀʀᴄʜ · "
+        f"<b>{'ᴏɴ' if enable else 'ᴏꜰꜰ'}</b>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 __all__ = ["pm_text_handler", "cmd_pm_search"]
