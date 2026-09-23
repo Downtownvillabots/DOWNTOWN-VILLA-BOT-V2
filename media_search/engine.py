@@ -1,26 +1,15 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — SEARCH ENGINE
+# 🏨 DOWNTOWN VILLA — SEARCH ENGINE (v2)
 # ============================================================
 #
-# Multi-shard search core.
+# Multi-shard search — v2 schema aware.
 #
-# Public API (singleton):
-#   engine.search_movie(query, year=None)   → SearchResult
-#   engine.search_series(query, year=None)  → SearchResult
-#   engine.search_any(query, year=None)     → SearchResult
-#   engine.search_all(query)                → SearchResult
+# Matches against:
+#   title · normalized_title · series_title
+#   normalized_series_title · file_name · caption
 #
-# HOW IT WORKS:
-#   1. Normalize the query
-#   2. Cache lookup (instant_cache)
-#   3. Query every online media shard in parallel
-#   4. Merge + dedupe + rank
-#   5. Cache store + return
-#
-# PERFORMANCE:
-#   • Shards queried in parallel via asyncio.gather
-#   • Per-shard timeout (config.SHARD_TIMEOUT, default 6s)
-#   • Concurrency-limited (config.SHARD_CONCURRENCY, default 10)
+# No hard `type` filter at query time — v2 docs may have
+# empty type from old indexing. Filter happens after merge.
 #
 # ============================================================
 
@@ -30,7 +19,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from core import config
 from media_search.models import FileHit, SearchResult
@@ -53,7 +42,7 @@ CACHE_TTL = float(getattr(config, "SEARCH_CACHE_TTL", 300) or 300)
 # ============================================================
 
 class SearchEngine:
-    """Searches across all media shards."""
+    """Searches across all media shards (v2 aware)."""
 
     def __init__(self) -> None:
         self._sem: Optional[asyncio.Semaphore] = None
@@ -136,6 +125,7 @@ class SearchEngine:
         if not shards:
             result.complete = True
             result.elapsed_ms = (time.time() - t0) * 1000
+            logger.warning("[ENGINE] no online shards")
             return result
 
         # ── Parallel query ──
@@ -149,12 +139,12 @@ class SearchEngine:
                         timeout=SHARD_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug(
+                    logger.warning(
                         f"[ENGINE] shard timeout: {entry.label}"
                     )
                     return None
                 except Exception as e:
-                    logger.debug(
+                    logger.exception(
                         f"[ENGINE] shard error {entry.label}: {e}"
                     )
                     return None
@@ -192,18 +182,19 @@ class SearchEngine:
         result.elapsed_ms = (time.time() - t0) * 1000
 
         # ── Cache store ──
-        try:
-            from plugins.search import instant_cache as IC
-            IC.set(
-                cache_key,
-                {
-                    "hits": [h.to_dict() for h in deduped],
-                    "complete": result.complete,
-                },
-                ttl=CACHE_TTL,
-            )
-        except Exception:
-            pass
+        if deduped:
+            try:
+                from plugins.search import instant_cache as IC
+                IC.set(
+                    cache_key,
+                    {
+                        "hits": [h.to_dict() for h in deduped],
+                        "complete": result.complete,
+                    },
+                    ttl=CACHE_TTL,
+                )
+            except Exception:
+                pass
 
         logger.info(
             f"[ENGINE] '{norm}' kind={kind} year={use_year} → "
@@ -212,7 +203,7 @@ class SearchEngine:
         )
         return result
 
-    # ── SHARD QUERY ──
+    # ── SHARD QUERY (v2 aware) ──
 
     async def _query_shard(
         self,
@@ -221,61 +212,95 @@ class SearchEngine:
         year: Optional[int],
         kind: str,
     ) -> List[FileHit]:
-        """Query one media shard."""
+        """Query one media shard — matches title, file_name, caption."""
         try:
             coll = entry.db["media_files"]
         except Exception:
             return []
 
-        # Build regex-based query
-        pattern = self._build_pattern(norm)
-        or_clauses: List[Dict[str, Any]] = [
-            {"title": pattern},
-            {"series_title": pattern},
-            {"normalized_title": pattern},
-            {"file_name": pattern},
-        ]
-
-        query: Dict[str, Any] = {"$or": or_clauses}
-
-        # Year filter (loose — allow None too)
-        if year:
-            query = {"$and": [
-                {"$or": or_clauses},
-                {"$or": [
-                    {"year": str(year)},
-                    {"year": int(year)},
-                    {"year": None},
-                ]},
-            ]}
+        query = self._build_query(norm, year, kind)
 
         hits: List[FileHit] = []
         try:
             cursor = coll.find(query).limit(MAX_RESULTS)
             docs = await cursor.to_list(length=MAX_RESULTS)
         except Exception as e:
-            logger.debug(f"[ENGINE] {entry.label} find: {e}")
+            logger.exception(f"[ENGINE] {entry.label} find: {e}")
             return []
 
         for doc in docs:
             h = self._doc_to_hit(doc, entry)
             if h:
                 hits.append(h)
+
+        logger.debug(
+            f"[ENGINE] shard {entry.label} → {len(hits)} hits "
+            f"(query={list(query.keys())})"
+        )
         return hits
 
-    def _build_pattern(self, norm: str) -> re.Pattern:
-        """Loose regex — matches if title contains the words."""
+    # ── QUERY BUILDER ──
+
+    def _build_query(
+        self,
+        norm: str,
+        year: Optional[int],
+        kind: str,
+    ) -> Dict[str, Any]:
+        """
+        Build a MongoDB query that works on v2 schema:
+          • title           (clean extracted)
+          • normalized_title
+          • series_title
+          • normalized_series_title
+          • file_name       (full original)
+          • caption         (raw caption text)
+
+        Uses plain string $regex with $options:'i' — safest
+        across MongoDB drivers.
+        """
+        # Escape user input for regex safety
+        safe = re.escape(norm.strip())
+
+        # Loose word-boundary match if multiple words
         words = [re.escape(w) for w in norm.split() if w]
         if not words:
-            return re.compile(r"$^")
+            words = [safe]
+
+        # Single-word: match anywhere (case-insensitive)
+        # Multi-word: all words must appear (any order)
         if len(words) == 1:
-            return re.compile(re.escape(words[0]), re.IGNORECASE)
-        # All words present, in any order
-        pattern = r"(?=.*" + r")(?=.*".join(words) + ")"
-        try:
-            return re.compile(pattern, re.IGNORECASE)
-        except re.error:
-            return re.compile(re.escape(norm), re.IGNORECASE)
+            pattern = safe
+        else:
+            pattern = "".join(f"(?=.*{w})" for w in words)
+
+        title_or: List[Dict[str, Any]] = [
+            {"title":                  {"$regex": pattern, "$options": "i"}},
+            {"normalized_title":       {"$regex": pattern, "$options": "i"}},
+            {"series_title":           {"$regex": pattern, "$options": "i"}},
+            {"normalized_series_title":{"$regex": pattern, "$options": "i"}},
+            {"file_name":              {"$regex": pattern, "$options": "i"}},
+            {"caption":                {"$regex": pattern, "$options": "i"}},
+        ]
+
+        clauses: List[Dict[str, Any]] = [{"$or": title_or}]
+
+        # Year filter — accept int, str, or empty
+        if year:
+            try:
+                y_int = int(year)
+                clauses.append({"$or": [
+                    {"year": y_int},
+                    {"year": str(year)},
+                    {"year": None},
+                    {"year": ""},
+                ]})
+            except (TypeError, ValueError):
+                pass
+
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
 
     # ── DOC → HIT ──
 
@@ -289,15 +314,23 @@ class SearchEngine:
             if not file_id:
                 return None
 
+            # Clean title fallback
+            title = str(
+                doc.get("title")
+                or doc.get("series_title")
+                or _clean_from_filename(doc.get("file_name"))
+                or ""
+            )
+
             return FileHit(
                 file_id=str(file_id),
                 file_unique_id=doc.get("file_unique_id"),
                 file_name=doc.get("file_name") or "",
                 file_size=int(doc.get("file_size") or 0),
-                title=str(doc.get("title") or doc.get("series_title") or ""),
+                title=title,
                 normalized_title=str(doc.get("normalized_title") or ""),
                 year=_to_int(doc.get("year")),
-                type=str(doc.get("type") or "movie"),
+                type=str(doc.get("type") or ""),
                 quality=doc.get("quality"),
                 codec=doc.get("codec"),
                 audio_languages=list(
@@ -334,7 +367,6 @@ class SearchEngine:
         if kind == "series":
             out = [h for h in hits if h.is_series()]
             return out or hits
-        # any
         if is_series_hint:
             series = [h for h in hits if h.is_series()]
             if series:
@@ -342,7 +374,6 @@ class SearchEngine:
         return hits
 
     def _dedupe(self, hits: List[FileHit]) -> List[FileHit]:
-        """Same file_id → keep first (highest ranked source wins)."""
         seen: set = set()
         out: List[FileHit] = []
         for h in hits:
@@ -378,14 +409,14 @@ class SearchEngine:
     ) -> str:
         return f"search|{kind}|{norm}|{year or ''}"
 
-    # ── MANUAL INVALIDATE ──
+    # ── INVALIDATE ──
 
     def invalidate(self, norm: str = "") -> int:
         try:
             from plugins.search import instant_cache as IC
             if not norm:
                 return IC.clear()
-            return IC.invalidate_prefix(f"search|")
+            return IC.invalidate_prefix("search|")
         except Exception:
             return 0
 
@@ -412,6 +443,37 @@ def _to_int(v: Any) -> Optional[int]:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+_JUNK_FROM_FILENAME = re.compile(
+    r"\b(?:"
+    r"www\.[a-z0-9.-]+|t\.me/[a-z0-9_]+|@[a-z0-9_]+|"
+    r"x264|x265|h\.?264|h\.?265|hevc|avc|aac|ac3|dts|"
+    r"\d{1,2}bit|10bit|8bit|hdr|sdr|"
+    r"web-?dl|webrip|bluray|brrip|bdrip|hdrip|dvdrip|"
+    r"1080p|720p|480p|2160p|4k|uhd|fhd|hd|sd"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_from_filename(name: Any) -> str:
+    """Best-effort title from a raw filename (used when title missing)."""
+    if not name:
+        return ""
+    try:
+        t = str(name)
+        # strip extension
+        t = re.sub(r"\.[a-z0-9]{2,5}$", "", t, flags=re.IGNORECASE)
+        # replace separators
+        t = re.sub(r"[._\-]+", " ", t)
+        # remove junk
+        t = _JUNK_FROM_FILENAME.sub(" ", t)
+        # collapse
+        t = re.sub(r"\s+", " ", t).strip(" -_")
+        return t[:200]
+    except Exception:
+        return ""
 
 
 # ============================================================
