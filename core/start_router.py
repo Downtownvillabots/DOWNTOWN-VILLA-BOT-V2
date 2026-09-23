@@ -537,8 +537,24 @@ async def _handle_group_settings(client, message, payload, extra):
         logger.debug(f"[START] gs route: {e}")
         return False
 
+async def _handle_deferred_request(client, message, payload, extra):
+    """
+    req_{token} — user tapped "send request" from a group.
+    Posts the deferred request to admin channel.
+    """
+    try:
+        from plugins.search import deferred as DF
+        token = str(extra or "").strip()
+        if not token:
+            return False
+        handled = await DF.handle_req_token(client, message, token)
+        return bool(handled)
+    except Exception as e:
+        logger.debug(f"[START] req route: {e}")
+        return False
 
 # Register default routes
+register_route("req",     _handle_deferred_request)
 register_route("file",    _handle_file)
 register_route("deliver", _handle_deliver)
 register_route("prem",    _handle_premium)
