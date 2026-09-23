@@ -130,20 +130,50 @@ async def _handle_updated(client, q, req, token):
         )],
     ])
 
-    try:
-        await client.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except UserIsBlocked:
-        pass
-    except FloodWait as e:
-        await asyncio.sleep(e.value + 2)
-    except Exception as e:
-        logger.debug(f"[REQ] DM updated: {e}")
+    # ── Try to send with poster ──
+    sent = False
+    poster_path = req.get("poster")
+    tmdb_id = req.get("tmdb_id")
+    year = req.get("year")
+
+    if not poster_path and tmdb_id:
+        try:
+            from plugins.pm_search import enrich as IE
+            meta = await IE.enrich(movie_name, year=int(year) if year and str(year).isdigit() else None)
+            if meta:
+                poster_path = meta.get("poster")
+        except Exception as e:
+            logger.debug(f"[REQ] poster fetch: {e}")
+
+    if poster_path:
+        url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+        try:
+            await client.send_photo(
+                chat_id=user_id,
+                photo=url,
+                caption=text[:1024],
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+            sent = True
+        except Exception as e:
+            logger.debug(f"[REQ] DM photo: {e}")
+
+    if not sent:
+        try:
+            await client.send_message(
+                chat_id=user_id,
+                text=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except UserIsBlocked:
+            pass
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 2)
+        except Exception as e:
+            logger.debug(f"[REQ] DM updated: {e}")
 
     await RS.update_status(token, "updated")
 
@@ -283,7 +313,10 @@ async def _handle_cancel(client, q, req, token):
 
 
 async def _handle_getfile(client, q, req, token):
-    """User clicked get-file in their PM."""
+    """
+    User clicked get-file in their PM.
+    Routes to PM search panel — shows all matching files as buttons.
+    """
     user_id = int(req.get("user_id", 0))
     if q.from_user.id != user_id:
         return await q.answer("⛔ Not your request", show_alert=True)
@@ -294,27 +327,21 @@ async def _handle_getfile(client, q, req, token):
     await q.answer("🔎 Searching…")
 
     try:
-        from media_search import engine as _eng
-        from media_search.normalizer import normalize, parse_query
-        from media_search.ranker import ranker
-        from media_search.delivery import delivery
-
-        norm, y, is_series = parse_query(movie_name)
-        engine = getattr(_eng, "engine", None)
-        if engine is None:
-            return await q.answer("❌ Engine unavailable", show_alert=True)
-
-        result = await engine.search_any(norm, year=y or year)
-        hits = list(result.hits or []) if result else []
-
-        if not hits:
-            return await q.answer("⏳ Not yet available", show_alert=True)
-
-        best = ranker.rank(hits)[0]
-        ok, err = await delivery.send_file(client, user_id, best)
+        from plugins.pm_search import handlers as PMH
+        ok = await PMH.show_results_for_request(
+            client=client,
+            user_id=user_id,
+            chat_id=q.message.chat.id,
+            query=movie_name,
+            year=str(year) if year else None,
+        )
         if ok:
-            await RS.update_status(token, "fulfilled")
-            await RS.delete_request(token)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+        else:
+            await q.answer("⏳ Still not uploaded", show_alert=True)
     except Exception as e:
         logger.exception(f"[REQ] getfile: {e}")
         await q.answer(f"❌ {type(e).__name__}", show_alert=True)
