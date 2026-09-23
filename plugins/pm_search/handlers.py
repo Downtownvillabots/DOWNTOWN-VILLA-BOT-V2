@@ -102,7 +102,6 @@ async def pm_text_handler(client: Client, message: Message):
             return
         _last_seen[uid] = now
 
-        # Track search
         try:
             from plugins.admin import stats as S
             S.track_search(uid, txt)
@@ -121,7 +120,7 @@ async def pm_text_handler(client: Client, message: Message):
 
 
 # ============================================================
-# SEARCH CORE
+# SEARCH CORE (DB → spell check → suggestions → request)
 # ============================================================
 
 async def _do_search(
@@ -133,7 +132,7 @@ async def _do_search(
     uid = message.from_user.id
     chat_id = message.chat.id
 
-    # ── Step 1: query DB ──
+    # ── 1. DB query ──
     hits: List[Any] = []
     complete = True
     try:
@@ -150,42 +149,75 @@ async def _do_search(
                 meta = await IE.enrich(query)
             except Exception:
                 meta = None
-        await PN.send_panel(
-            client, uid, chat_id, query, hits, sid, cfg, meta,
-        )
+        await PN.send_panel(client, uid, chat_id, query, hits, sid, cfg, meta)
         return
 
     if not complete:
-        await client.send_message(
-            chat_id=chat_id,
-            text=(
-                f"{F.EMO['warn']} <b>{F.fb('ONE OR MORE DBs OFFLINE')}</b>\n"
-                f"{F.EMO['info']} {F.sc('try again in a moment')}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await client.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{F.EMO['warn']} <b>{F.fb('ONE OR MORE DBs OFFLINE')}</b>\n"
+                    f"{F.EMO['info']} {F.sc('try again in a moment')}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
-    # ── Step 2: no hits → try suggestions (if enabled) ──
+    # ── 2. Spell check → retry DB ──
+    corrected: Optional[str] = None
+    try:
+        from media_search.spell_check import ai_spell_check
+        corrected = await ai_spell_check(query)
+    except Exception as e:
+        logger.debug(f"[PM-SEARCH] spell_check: {e}")
+
+    if corrected and corrected.strip().lower() != query.strip().lower():
+        try:
+            from plugins.search import handlers as H
+            hits2, _ = await H.quick_search(corrected)
+        except Exception:
+            hits2 = []
+
+        if hits2:
+            sid = _new_session(uid, corrected, hits2)
+            meta = None
+            try:
+                meta = await IE.enrich(corrected)
+            except Exception:
+                meta = None
+            if meta:
+                meta["_corrected_from"] = query
+            else:
+                meta = {"_corrected_from": query}
+            await PN.send_panel(
+                client, uid, chat_id, corrected, hits2, sid, cfg, meta,
+            )
+            return
+
+    # ── 3. Suggestions ──
     if not cfg.get("suggestion_enabled", True):
         await _send_request_flow(client, message, query, None, cfg)
         return
 
+    items: List[Dict[str, Any]] = []
     try:
         items = await IE.suggestions(
             query,
             limit=int(cfg.get("suggestion_count", 6)),
         )
-    except Exception:
-        items = []
+    except Exception as e:
+        logger.debug(f"[PM-SEARCH] suggestions: {e}")
 
-    if not items:
-        await _send_request_flow(client, message, query, None, cfg)
+    if items:
+        sid = _new_session(uid, query, [], extra={"suggestions": items})
+        await PN.send_suggestions(client, chat_id, query, items, sid)
         return
 
-    # Save suggestions in session
-    sid = _new_session(uid, query, [], extra={"suggestions": items})
-    await PN.send_suggestions(client, chat_id, query, items, sid)
+    # ── 4. No suggestions → request ──
+    await _send_request_flow(client, message, query, None, cfg)
 
 
 # ============================================================
@@ -200,7 +232,6 @@ async def _send_request_flow(
     cfg: Dict[str, Any],
     user=None,
 ):
-    # Prefer explicit user (from callback) over message.from_user
     if user is not None:
         uid = user.id
         u = user
@@ -209,14 +240,17 @@ async def _send_request_flow(
         u = message.from_user
 
     if not cfg.get("request_enabled", True):
-        await client.send_message(
-            chat_id=message.chat.id,
-            text=(
-                f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>\n\n"
-                f"📌 <code>{query[:60]}</code>"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await client.send_message(
+                chat_id=message.chat.id,
+                text=(
+                    f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>\n\n"
+                    f"📌 <code>{query[:60]}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
         return
 
     title = meta.get("title") if meta else query
@@ -238,14 +272,17 @@ async def _send_request_flow(
     if token:
         await RQ.notify_sent(client, uid, str(title or query), year)
     else:
-        await client.send_message(
-            chat_id=message.chat.id,
-            text=(
-                f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>\n\n"
-                f"📌 <code>{query[:60]}</code>"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await client.send_message(
+                chat_id=message.chat.id,
+                text=(
+                    f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>\n\n"
+                    f"📌 <code>{query[:60]}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -278,7 +315,6 @@ async def pms_router(client: Client, q: CallbackQuery):
                 pass
             return await q.answer("Closed")
 
-        # ── PICK FILE ──
         if action == "get":
             try:
                 idx = int(idx_str)
@@ -293,7 +329,6 @@ async def pms_router(client: Client, q: CallbackQuery):
 
             cfg = await CFG.get_cfg()
 
-            # Force-sub check
             subscribed, missing = await FS.check_fsub(client, uid, cfg)
             if not subscribed:
                 await q.answer("🔒 Join required")
@@ -318,7 +353,6 @@ async def pms_router(client: Client, q: CallbackQuery):
                 await q.answer("❌ Could not send", show_alert=True)
             return
 
-        # ── TRY AGAIN (after fsub) ──
         if action == "try":
             try:
                 idx = int(idx_str)
@@ -360,7 +394,6 @@ async def pms_router(client: Client, q: CallbackQuery):
                     pass
             return
 
-        # ── SUGGESTION PICK ──
         if action == "sug":
             try:
                 idx = int(idx_str)
@@ -391,7 +424,6 @@ async def pms_router(client: Client, q: CallbackQuery):
 
             _drop_session(sid)
 
-            # Query DB by exact title+year
             cfg = await CFG.get_cfg()
             query_text = title
             if year_str:
@@ -421,7 +453,6 @@ async def pms_router(client: Client, q: CallbackQuery):
                     query_text, hits, new_sid, cfg, meta,
                 )
             else:
-                # Send request — use q.from_user (the actual searcher)
                 meta = {
                     "title": title, "year": year_str,
                     "tmdb_id": tmdb_id,
@@ -454,7 +485,6 @@ async def show_results_for_request(
     query: str,
     year: Optional[str] = None,
 ) -> bool:
-    """Called by requests/request.py::_handle_getfile."""
     try:
         cfg = await CFG.get_cfg()
 
