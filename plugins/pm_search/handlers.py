@@ -198,9 +198,15 @@ async def _send_request_flow(
     query: str,
     meta: Optional[Dict[str, Any]],
     cfg: Dict[str, Any],
+    user=None,
 ):
-    uid = message.from_user.id
-    u = message.from_user
+    # Prefer explicit user (from callback) over message.from_user
+    if user is not None:
+        uid = user.id
+        u = user
+    else:
+        uid = message.from_user.id if message.from_user else 0
+        u = message.from_user
 
     if not cfg.get("request_enabled", True):
         await client.send_message(
@@ -415,7 +421,7 @@ async def pms_router(client: Client, q: CallbackQuery):
                     query_text, hits, new_sid, cfg, meta,
                 )
             else:
-                # Send request
+                # Send request — use q.from_user (the actual searcher)
                 meta = {
                     "title": title, "year": year_str,
                     "tmdb_id": tmdb_id,
@@ -423,6 +429,7 @@ async def pms_router(client: Client, q: CallbackQuery):
                 }
                 await _send_request_flow(
                     client, q.message, title, meta, cfg,
+                    user=q.from_user,
                 )
             return
 
