@@ -944,7 +944,11 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
         if module == "pmsearch":
             try:
                 from plugins.pm_search import admin as PMA
-                await PMA.cmd_pmsearch(client, q.message)
+                fn = getattr(PMA, "open_panel_for_admin", None)
+                if fn is not None:
+                    await fn(client, q.message)
+                else:
+                    await q.answer("Use /pmsearch", show_alert=True)
             except Exception as e:
                 logger.exception(f"[ADMIN] pmsearch: {e}")
                 await q.answer("❌ Failed", show_alert=True)
