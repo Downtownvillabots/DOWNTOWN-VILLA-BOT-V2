@@ -1,11 +1,6 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — REQUEST POSTER
 # ============================================================
-#
-# Posts a request to the admin channel with action buttons.
-# Format matches the screenshot: title, tmdb, user, token.
-#
-# ============================================================
 
 from __future__ import annotations
 import logging
@@ -20,7 +15,6 @@ from plugins.requests import state as RS
 from utils import fonts as F
 
 logger = logging.getLogger(__name__)
-
 DIV = "━" * 26
 
 
@@ -36,33 +30,44 @@ async def post_request(
     username: str = "",
     full_name: str = "",
     movie_name: str = "",
-    kind: str = "movie",           # "movie" | "series"
+    kind: str = "movie",
     imdb_id: Optional[str] = None,
     tmdb_id: Optional[int] = None,
     year: Optional[str] = None,
     user_query: str = "",
+    existing_token: Optional[str] = None,
 ) -> Optional[str]:
-    """Post a request to REQST_CHANNEL. Returns the token_id."""
+    """
+    Post a request to REQST_CHANNEL.
+    If existing_token is provided, uses it instead of creating a new one.
+    Returns token_id.
+    """
     ch = getattr(config, "REQST_CHANNEL", None)
     if not ch:
         logger.debug("[REQ] REQST_CHANNEL not configured")
         return None
 
-    token = await RS.create_request(
-        user_id=user_id,
-        username=username,
-        full_name=full_name,
-        movie_name=movie_name,
-        kind=kind,
-        imdb_id=imdb_id,
-        tmdb_id=tmdb_id,
-        year=year,
-        user_query=user_query,
-    )
-    if not token:
-        return None
+    if existing_token:
+        existing = await RS.get_request(existing_token)
+        if not existing:
+            logger.warning(f"[REQ] existing_token not found: {existing_token}")
+            return None
+        token = existing_token
+    else:
+        token = await RS.create_request(
+            user_id=user_id,
+            username=username,
+            full_name=full_name,
+            movie_name=movie_name,
+            kind=kind,
+            imdb_id=imdb_id,
+            tmdb_id=tmdb_id,
+            year=year,
+            user_query=user_query,
+        )
+        if not token:
+            return None
 
-    # Title display
     title_disp = _esc(movie_name)
     if year:
         title_disp += f" ({_esc(year)})"
@@ -74,8 +79,7 @@ async def post_request(
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"{kind_icon} <b>{F.fb(f'NEW {kind_label} REQUEST')}</b>",
-        DIV,
-        "",
+        DIV, "",
         f"{kind_icon} {F.sc(kind_label.lower())} · <b>{title_disp}</b>",
     ]
     if imdb_id:
@@ -83,7 +87,6 @@ async def post_request(
     if tmdb_id:
         lines.append(f"{F.EMO['id']} ᴛᴍᴅʙ · <code>{tmdb_id}</code>")
 
-    # User mention
     user_mention = f"<a href='tg://user?id={user_id}'>{_esc(full_name or 'user')}</a>"
 
     lines += [
@@ -99,12 +102,10 @@ async def post_request(
     lines += [
         "",
         f"{F.EMO['key']} ᴛᴏᴋᴇɴ · <code>{token}</code>",
-        DIV,
-        "",
+        DIV, "",
         f"<i>{F.sc('admin')} · {F.sc('choose an action below')}</i>",
     ]
 
-    # Buttons
     kind_btn_label = "📺 SERIES UPDATED ✅" if is_series else "🎬 MOVIE UPDATED ✅"
 
     kb = InlineKeyboardMarkup([
@@ -140,7 +141,8 @@ async def post_request(
         return token
     except Exception as e:
         logger.warning(f"[REQ] post failed: {e}")
-        await RS.delete_request(token)
+        if not existing_token:
+            await RS.delete_request(token)
         return None
 
 
