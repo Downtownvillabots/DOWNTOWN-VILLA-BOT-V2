@@ -343,25 +343,21 @@ async def sr_more(client: Client, q: CallbackQuery):
     group=-8097,
 )
 async def sr_sug(client: Client, q: CallbackQuery):
-    """
-    User picked a suggestion from the "did you mean?" list.
-    Re-run the search with the chosen title.
-    """
+    """User picked a suggestion from the group 'did you mean?'."""
     try:
         parts = str(q.data).split(":")
         if len(parts) < 4:
             return await q.answer("❌")
-
         sid = parts[2]
         try:
             idx = int(parts[3])
         except ValueError:
-            return await q.answer("❌ Invalid index")
+            return await q.answer("❌")
 
         from media_search import sessions as _sess_mod
         session = await _sess_mod.sessions.get(sid)
         if not session:
-            return await q.answer("⏱️ Session expired", show_alert=True)
+            return await q.answer("⏱️ Expired", show_alert=True)
 
         candidates = session.candidates or []
         if idx < 0 or idx >= len(candidates):
@@ -369,60 +365,126 @@ async def sr_sug(client: Client, q: CallbackQuery):
 
         chosen = candidates[idx]
         title = chosen.get("title") or ""
-        year = chosen.get("year")
+        year_str = chosen.get("year") or ""
+        tmdb_id = chosen.get("tmdb_id")
+        kind = chosen.get("kind") or "movie"
 
         if not title:
-            return await q.answer("❌ Empty title", show_alert=True)
+            return await q.answer("❌ Empty", show_alert=True)
 
         await q.answer(f"🔎 Searching {title}…")
 
-        # Re-run search with the chosen title
+        # Re-query DB with exact title + year
         from media_search.engine import engine
         from media_search.normalizer import parse_query
 
-        norm, _, is_series = parse_query(title)
-        yr = int(year) if (year and str(year).isdigit()) else None
+        norm, _, _ = parse_query(title)
+        y = int(year_str) if str(year_str).isdigit() else None
 
-        if is_series:
-            result = await engine.search_series(norm, year=yr)
-        else:
-            result = await engine.search_movie(norm, year=yr)
-            if not (result and result.hits):
-                result = await engine.search_series(norm, year=yr)
-
+        result = await engine.search_any(norm, year=y)
         hits = list(result.hits or []) if result else []
 
         if not hits:
-            await q.answer("❌ No files for this title", show_alert=True)
+            # Retry without year
+            result = await engine.search_any(norm, year=None)
+            hits = list(result.hits or []) if result else []
+
+        # ── HITS FOUND → show file list ──
+        if hits:
+            new_candidates = []
+            for h in hits[:30]:
+                try:
+                    new_candidates.append(h.to_dict())
+                except Exception:
+                    if isinstance(h, dict):
+                        new_candidates.append(h)
+            new_candidates.sort(key=lambda x: x.get("file_size", 0) or 0)
+
+            await _sess_mod.sessions.update(
+                sid,
+                query=title,
+                normalized_query=norm,
+                candidates=new_candidates,
+            )
+            try:
+                from plugins.search.group_search import _show_file_list  # type: ignore
+                await _show_file_list(q.message, title, sid, hits)
+            except Exception as e:
+                logger.debug(f"[SEARCH-CB] show: {e}")
             return
 
-        # Update session with new hits
-        new_candidates = []
-        for h in hits[:30]:
-            try:
-                new_candidates.append(h.to_dict())
-            except Exception:
-                if isinstance(h, dict):
-                    new_candidates.append(h)
+        # ── NO HITS → request flow ──
+        user = q.from_user
+        user_id = user.id
+        username = user.username or ""
+        full_name = user.first_name or ""
 
-        # Sort small → big
-        new_candidates.sort(
-            key=lambda x: x.get("file_size", 0) or 0
-        )
-
-        await _sess_mod.sessions.update(
-            sid,
-            query=title,
-            normalized_query=norm,
-            candidates=new_candidates,
-        )
-
-        # Render the file list
-        from plugins.search.group_search import _show_file_list  # type: ignore
         try:
-            await _show_file_list(q.message, title, sid, hits)
+            from plugins.search import deferred as DF
+            is_reg = await DF.is_registered(user_id)
+        except Exception:
+            is_reg = True  # assume registered on error → safest
+
+        # ── Registered user → post request normally ──
+        if is_reg:
+            try:
+                from plugins.requests import poster as RP
+                token = await RP.post_request(
+                    client=client,
+                    user_id=user_id,
+                    username=username,
+                    full_name=full_name,
+                    movie_name=title,
+                    kind=kind,
+                    tmdb_id=tmdb_id,
+                    year=str(year_str) if year_str else None,
+                    user_query=title,
+                )
+                if token:
+                    await q.message.edit_text(
+                        "\n".join([
+                            f"{F.EMO['check']} <b>{F.fb('REQUEST SENT')}</b>",
+                            F.DIV, "",
+                            f"🎬 <b>{F.sc(title[:60])}</b>",
+                            "",
+                            f"📌 {F.sc('admins have been notified')}",
+                            f"📌 {F.sc('you will be messaged once uploaded')}",
+                        ]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                else:
+                    await q.answer("⚠️ Could not send", show_alert=True)
+            except Exception as e:
+                logger.exception(f"[SEARCH-CB] req post: {e}")
+                await q.answer("❌ Error", show_alert=True)
+            return
+
+        # ── New user → create deferred request + redirect ──
+        try:
+            from plugins.search import deferred as DF
+            token = await DF.create_deferred_request(
+                user_id=user_id,
+                username=username,
+                full_name=full_name,
+                title=title,
+                year=str(year_str) if year_str else None,
+                kind=kind,
+                tmdb_id=tmdb_id,
+                user_query=title,
+            )
+            if not token:
+                return await q.answer("⚠️ Could not create request", show_alert=True)
+
+            await DF.send_redirect_panel(
+                client=client,
+                target=q.message,
+                title=title,
+                year=str(year_str) if year_str else None,
+                token=token,
+            )
         except Exception as e:
-            logger.debug(f"[SEARCH-CB] sug render: {e}")
+            logger.exception(f"[SEARCH-CB] deferred: {e}")
+            await q.answer("❌ Error", show_alert=True)
 
     except Exception as e:
         logger.exception(f"[SEARCH-CB] sug: {e}")
@@ -430,7 +492,6 @@ async def sr_sug(client: Client, q: CallbackQuery):
             await q.answer("❌ Error", show_alert=True)
         except Exception:
             pass
-
 
 # ============================================================
 # SEARCH CANCEL
