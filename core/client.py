@@ -26,6 +26,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from pyrogram import Client as _PyroClient
+from pyrogram.enums import ParseMode
 from pyrogram.types import User
 
 from core import config
@@ -58,7 +59,7 @@ class VillaClient(_PyroClient):
             workers=50,
             plugins=dict(root="plugins"),
             sleep_threshold=5,
-            parse_mode="html",
+            parse_mode=ParseMode.HTML,
             # Disable Pyrogram's noisy update logs
             no_updates=False,
         )
