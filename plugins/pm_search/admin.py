@@ -16,6 +16,7 @@ from core import config
 from utils import fonts as F
 from utils import format as FM
 from plugins.pm_search import state as CFG
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -871,5 +872,97 @@ async def _edit(q: CallbackQuery, text: str, kb) -> None:
         if "not modified" not in str(e).lower():
             logger.debug(f"[PMSA] edit: {e}")
 
+# ============================================================
+# ADMIN PANEL ENTRY — called from /admin router
+# ============================================================
 
-__all__ = ["cmd_pmsearch"]
+async def open_panel_for_admin(client: Client, message: Message) -> None:
+    """
+    Called by plugins/admin/admin.py when the PM Search button is tapped.
+    Sends the main panel as a new message.
+    """
+    try:
+        text, kb = await _render_main()
+        await message.reply_text(
+            text, reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.exception(f"[PMSA] open_panel: {e}")
+
+
+# ============================================================
+# BACKFILL — recompute normalized_title for old docs
+# ============================================================
+
+@Client.on_message(
+    filters.command(["pmbackfill"]) & filters.private,
+    group=-8151,
+)
+async def cmd_backfill(client: Client, message: Message):
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+
+    status = await message.reply_text("🧬 backfilling normalized fields…")
+
+    try:
+        from media_search.normalizer import normalize
+    except Exception:
+        return await status.edit_text("❌ normalizer missing")
+
+    from database import db_registry
+
+    total = 0
+    updated = 0
+    per: List[str] = []
+
+    for e in db_registry.media_entries():
+        if not e.online:
+            continue
+        shard_n = 0
+        try:
+            coll = e.db["media_files"]
+            cursor = coll.find({}, {
+                "_id": 1, "title": 1, "type": 1,
+                "normalized_title": 1,
+                "normalized_series_title": 1,
+            })
+            async for doc in cursor:
+                total += 1
+                tid = doc.get("_id")
+                title = doc.get("title") or ""
+                if not title:
+                    continue
+
+                n = normalize(title)
+                patch: Dict[str, Any] = {"normalized_title": n}
+
+                rtype = doc.get("type") or ""
+                if rtype not in ("movie", "series"):
+                    patch["type"] = "movie"
+                if patch.get("type") == "series":
+                    patch["normalized_series_title"] = n
+
+                try:
+                    await coll.update_one({"_id": tid}, {"$set": patch})
+                    shard_n += 1
+                except Exception:
+                    continue
+
+            per.append(f"• DB{e.index} <code>{e.label}</code> · <b>{shard_n}</b>")
+            updated += shard_n
+        except Exception as ex:
+            per.append(f"❌ DB{e.index}: <code>{ex}</code>")
+
+    lines = [
+        "🧬 <b>BACKFILL COMPLETE</b>",
+        "━" * 22,
+        f"📄 scanned · <b>{total}</b>",
+        f"✅ updated · <b>{updated}</b>",
+        "",
+    ] + per
+    await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+__all__ = ["cmd_pmsearch", "open_panel_for_admin", "cmd_backfill"]
