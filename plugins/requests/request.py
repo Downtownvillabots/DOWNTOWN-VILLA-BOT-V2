@@ -1,17 +1,6 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — REQUEST CALLBACKS
 # ============================================================
-#
-# Admin clicks a button in the request channel:
-#   📺 SERIES UPDATED ✅ / 🎬 MOVIE UPDATED ✅
-#   📅 NOT RELEASED
-#   🔎 NOT FOUND
-#   ❌ CANCEL
-#
-# → user gets notified in PM
-# → channel message is struck through
-#
-# ============================================================
 
 from __future__ import annotations
 import logging
@@ -27,7 +16,6 @@ from plugins.requests import state as RS
 from utils import fonts as F
 
 logger = logging.getLogger(__name__)
-
 DIV = "━" * 26
 
 
@@ -50,10 +38,6 @@ async def _is_channel_admin(client, chat_id, user_id) -> bool:
         return False
 
 
-# ============================================================
-# CALLBACK ROUTER
-# ============================================================
-
 @Client.on_callback_query(
     filters.regex(r"^req:"),
     group=-8600,
@@ -68,15 +52,13 @@ async def request_router(client: Client, q: CallbackQuery):
     except Exception:
         return await q.answer("❌")
 
-    # Auth
     if not await _is_channel_admin(client, q.message.chat.id, q.from_user.id):
         return await q.answer("⛔ Admins only", show_alert=True)
 
     req = await RS.get_request(token)
     if not req:
-        return await q.answer("⏱️ Request not found", show_alert=True)
+        return await q.answer("⏱️ Request expired", show_alert=True)
 
-    # Dispatch
     if action == "updated":
         await _handle_updated(client, q, req, token)
     elif action == "notreleased":
@@ -93,9 +75,7 @@ async def request_router(client: Client, q: CallbackQuery):
         await q.answer("❓")
 
 
-# ============================================================
-# HANDLERS
-# ============================================================
+# ────────────── UPDATED ──────────────
 
 async def _handle_updated(client, q, req, token):
     user_id = int(req.get("user_id", 0))
@@ -113,8 +93,7 @@ async def _handle_updated(client, q, req, token):
         f"{F.EMO['check']} Your requested {kind_label.lower()} "
         f"has been <b>uploaded</b>!",
         "",
-        DIV,
-        "",
+        DIV, "",
         f"{F.EMO['search']} Search it in the group to get it",
         f"{F.EMO['spark']} Or tap the button below",
     ])
@@ -130,7 +109,7 @@ async def _handle_updated(client, q, req, token):
         )],
     ])
 
-    # ── Try to send with poster ──
+    # Try poster
     sent = False
     poster_path = req.get("poster")
     tmdb_id = req.get("tmdb_id")
@@ -139,11 +118,11 @@ async def _handle_updated(client, q, req, token):
     if not poster_path and tmdb_id:
         try:
             from plugins.pm_search import enrich as IE
-            meta = await IE.enrich(movie_name, year=int(year) if year and str(year).isdigit() else None)
+            meta = await IE.enrich(movie_name)
             if meta:
                 poster_path = meta.get("poster")
-        except Exception as e:
-            logger.debug(f"[REQ] poster fetch: {e}")
+        except Exception:
+            pass
 
     if poster_path:
         url = f"https://image.tmdb.org/t/p/w500{poster_path}"
@@ -156,8 +135,8 @@ async def _handle_updated(client, q, req, token):
                 parse_mode=ParseMode.HTML,
             )
             sent = True
-        except Exception as e:
-            logger.debug(f"[REQ] DM photo: {e}")
+        except Exception:
+            pass
 
     if not sent:
         try:
@@ -170,33 +149,28 @@ async def _handle_updated(client, q, req, token):
             )
         except UserIsBlocked:
             pass
-        except FloodWait as e:
-            await asyncio.sleep(e.value + 2)
         except Exception as e:
             logger.debug(f"[REQ] DM updated: {e}")
 
+    # Delete token after action — frees bot space
     await RS.delete_request(token)
 
-    # Strike through the original message
     try:
         original = q.message.text or q.message.caption or ""
-        new_text = (
-            f"<b><strike>{original}</strike></b>\n\n"
-            f"<b>{kind_icon} {kind_label} UPDATED ✅</b>"
-        )
         await q.message.edit_text(
-            new_text,
+            f"<b><strike>{original}</strike></b>\n\n"
+            f"<b>{kind_icon} {kind_label} UPDATED ✅</b>",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     f"✅ {F.sc('notified')}",
-                    callback_data=f"req:noop:{token}",
+                    callback_data=f"req:noop:done",
                 ),
             ]]),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except Exception as e:
-        logger.debug(f"[REQ] edit updated: {e}")
+    except Exception:
+        pass
 
     await q.answer("✅ User notified")
 
@@ -213,7 +187,6 @@ async def _handle_notreleased(client, q, req, token):
         f"📌 Your request hasn't been released yet.",
         f"{F.EMO['bell']} We'll notify you when it arrives.",
     ])
-
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"📢 {F.sc('updates')}",
@@ -223,16 +196,13 @@ async def _handle_notreleased(client, q, req, token):
 
     try:
         await client.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            chat_id=user_id, text=text, reply_markup=kb,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         )
-    except Exception as e:
-        logger.debug(f"[REQ] DM notreleased: {e}")
+    except Exception:
+        pass
 
-        await RS.delete_request(token)
+    await RS.delete_request(token)
 
     try:
         original = q.message.text or q.message.caption or ""
@@ -244,7 +214,6 @@ async def _handle_notreleased(client, q, req, token):
         )
     except Exception:
         pass
-
     await q.answer("✅ Notified")
 
 
@@ -260,7 +229,6 @@ async def _handle_notfound(client, q, req, token):
         f"📌 We couldn't find this title.",
         f"{F.EMO['spark']} Please check the spelling and try again.",
     ])
-
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"💬 {F.sc('support')}",
@@ -270,14 +238,11 @@ async def _handle_notfound(client, q, req, token):
 
     try:
         await client.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            chat_id=user_id, text=text, reply_markup=kb,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         )
-    except Exception as e:
-        logger.debug(f"[REQ] DM notfound: {e}")
+    except Exception:
+        pass
 
     await RS.delete_request(token)
 
@@ -291,13 +256,11 @@ async def _handle_notfound(client, q, req, token):
         )
     except Exception:
         pass
-
     await q.answer("✅ Notified")
 
 
 async def _handle_cancel(client, q, req, token):
     await RS.delete_request(token)
-
     try:
         original = q.message.text or q.message.caption or ""
         await q.message.edit_text(
@@ -308,15 +271,10 @@ async def _handle_cancel(client, q, req, token):
         )
     except Exception:
         pass
-
     await q.answer("✅ Cancelled")
 
 
 async def _handle_getfile(client, q, req, token):
-    """
-    User clicked get-file in their PM.
-    Routes to PM search panel — shows all matching files as buttons.
-    """
     user_id = int(req.get("user_id", 0))
     if q.from_user.id != user_id:
         return await q.answer("⛔ Not your request", show_alert=True)
@@ -340,18 +298,11 @@ async def _handle_getfile(client, q, req, token):
                 await q.message.delete()
             except Exception:
                 pass
-        else:
-            await q.answer("⏳ Still not uploaded", show_alert=True)
     except Exception as e:
         logger.exception(f"[REQ] getfile: {e}")
         await q.answer(f"❌ {type(e).__name__}", show_alert=True)
 
 
-# ============================================================
-# IMPORTS AT END
-# ============================================================
-
 import asyncio  # noqa: E402
-
 
 __all__ = ["request_router"]
