@@ -1,17 +1,15 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — INDEXING PIPELINE (fill-first routing)
+# 🏨 DOWNTOWN VILLA — INDEXING PIPELINE (fill-first, self-contained)
 # ============================================================
 #
 # Writes to media shards in FILL-FIRST order:
 #   DB1 until threshold → DB2 until threshold → DB3 ...
-# Never hashes / distributes.
 #
-# Duplicate check across EVERY online shard:
-#   _id · fingerprint · file_id · file_unique_id
+# Logs show the ACTUAL MongoDB database label from your env
+# (e.g. 'DATA-BASE-01'), not a random hard-coded name.
 #
-# Cache: the current write shard is cached for 30 seconds to
-# avoid running dbStats on every save. On write failure the
-# cache is invalidated and pick_shard() runs again.
+# Cache: current shard cached 30s. On write failure cache is
+# invalidated and shard is re-picked.
 #
 # Returns:
 #   saved      → {"status": "saved",     "record": {...}}
@@ -24,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -44,10 +43,15 @@ _SUPPORTED = (
     enums.MessageMediaType.DOCUMENT,
 )
 
-# Cache current write shard for this many seconds
 SHARD_CACHE_TTL = 30.0
 
-_cached_shard: Optional[Tuple[int, Any]] = None
+try:
+    DEFAULT_THRESHOLD_MB = int(os.getenv("INDEXING_THRESHOLD_MB", "400"))
+except (TypeError, ValueError):
+    DEFAULT_THRESHOLD_MB = 400
+DEFAULT_THRESHOLD_MB = max(50, DEFAULT_THRESHOLD_MB)
+
+_cached_shard: Optional[Tuple[Any, Any]] = None
 _cached_shard_at: float = 0.0
 
 
@@ -94,6 +98,57 @@ _LANGS = {
     "turkish": "Turkish",
     "thai": "Thai",
 }
+
+
+# ============================================================
+# SHARD PICKER (self-contained fill-first)
+# ============================================================
+
+async def _shard_used_mb(entry) -> Optional[float]:
+    """Return used storage MB for one shard, or None on error."""
+    try:
+        stats = await entry.db.command("dbStats")
+        used = (stats.get("storageSize", 0) or 0) + (
+            stats.get("indexSize", 0) or 0
+        )
+        return used / (1024 * 1024)
+    except Exception as e:
+        logger.debug(f"[PIPELINE] dbStats {entry.label}: {e}")
+        return None
+
+
+async def _pick_shard_fill_first() -> Tuple[Any, Any]:
+    """
+    Return (entry, db) for the FIRST shard whose used MB is
+    under INDEXING_THRESHOLD_MB. Never distributes / hashes.
+    """
+    from database import db_registry
+
+    entries = list(db_registry.media_entries())
+    if not entries:
+        raise RuntimeError("no media shards configured")
+
+    threshold = DEFAULT_THRESHOLD_MB
+
+    for entry in entries:
+        if not entry.online:
+            continue
+        used = await _shard_used_mb(entry)
+        if used is None:
+            continue
+        if used < threshold:
+            return (entry, entry.db)
+
+    # All full → use last online
+    for entry in reversed(entries):
+        if entry.online:
+            logger.warning(
+                f"[PIPELINE] all shards over {threshold} MB → "
+                f"using last online '{entry.label}'"
+            )
+            return (entry, entry.db)
+
+    raise RuntimeError("no online media shards")
 
 
 # ============================================================
@@ -203,27 +258,31 @@ async def save_file(
                         q, {"_id": 1}
                     )
                     if existing:
-                        return (True, 0)  # duplicate
+                        return (True, 0)
                 except Exception as e:
-                    logger.debug(f"[PIPELINE] dup check shard {entry.index}: {e}")
+                    logger.debug(
+                        f"[PIPELINE] dup check '{entry.label}': {e}"
+                    )
 
-        # ── 2. Pick target shard (fill-first, cached) ──
+        # ── 2. Pick target shard (fill-first, cached 30s) ──
         now = time.time()
         if _cached_shard is None or (now - _cached_shard_at) > SHARD_CACHE_TTL:
             try:
-                from database.media.routing import media_router
-                idx, db = await media_router.pick_shard()
-                _cached_shard = (idx, db)
+                entry, db = await _pick_shard_fill_first()
+                _cached_shard = (entry, db)
                 _cached_shard_at = now
             except Exception as e:
                 logger.error(f"[PIPELINE] no shard available: {e}")
                 return (False, 2)
 
-        shard_index, target_db = _cached_shard
+        entry, target_db = _cached_shard
+        shard_label = entry.label
+        shard_index = entry.index
 
         # ── 3. Build record + upsert ──
         record = _build_record(media, message, fingerprint, metadata_source)
         record["shard_index"] = shard_index
+        record["shard_label"] = shard_label
 
         try:
             await target_db["media_files"].update_one(
@@ -232,16 +291,20 @@ async def save_file(
                 upsert=True,
             )
         except Exception as e:
-            # Cache may be stale (shard just filled up) → force re-pick
+            # Cache stale → force re-pick and retry
             _cached_shard = None
             _cached_shard_at = 0.0
-            logger.warning(f"[PIPELINE] write failed, re-picking shard: {e}")
+            logger.warning(
+                f"[PIPELINE] write failed, re-picking shard: {e}"
+            )
             try:
-                from database.media.routing import media_router
-                shard_index, target_db = await media_router.pick_shard()
-                _cached_shard = (shard_index, target_db)
+                entry, target_db = await _pick_shard_fill_first()
+                _cached_shard = (entry, target_db)
                 _cached_shard_at = time.time()
+                shard_label = entry.label
+                shard_index = entry.index
                 record["shard_index"] = shard_index
+                record["shard_label"] = shard_label
                 await target_db["media_files"].update_one(
                     {"_id": fingerprint},
                     {"$set": record},
@@ -259,7 +322,7 @@ async def save_file(
             pass
 
         logger.info(
-            f"[PIPELINE] ✅ saved to DB{shard_index} "
+            f"[PIPELINE] ✅ saved to '{shard_label}' "
             f"file='{str(record.get('file_name', '?'))[:60]}'"
         )
         return (True, 1)
