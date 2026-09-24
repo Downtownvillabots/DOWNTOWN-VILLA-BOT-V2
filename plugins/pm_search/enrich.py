@@ -1,5 +1,6 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — PM SEARCH ENRICH (TMDB + DB fuzzy)
+# 🏨 DOWNTOWN VILLA — PM SEARCH ENRICH
+# (TMDB + OMDB + DB fuzzy + progressive shortening)
 # ============================================================
 
 from __future__ import annotations
@@ -51,8 +52,12 @@ def clean_filename(name: str) -> str:
     return t or str(name)
 
 
+def _tokenize(s: str) -> List[str]:
+    return [w for w in clean_filename(s).lower().split() if len(w) >= 2]
+
+
 # ============================================================
-# ENRICH
+# ENRICH (single title → metadata)
 # ============================================================
 
 async def enrich(
@@ -112,7 +117,69 @@ def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
 
 
 # ============================================================
-# DB TITLE CACHE (for fuzzy fallback)
+# TMDB / OMDB SEARCHERS
+# ============================================================
+
+async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
+    try:
+        from providers import tmdb_provider as TP
+        movies = await TP.search_movie(query)
+        tv = await TP.search_tv(query)
+        out: List[Dict[str, Any]] = []
+        for r in list(movies or []) + list(tv or []):
+            t = r.get("title")
+            if not t:
+                continue
+            out.append({
+                "title": t,
+                "year": str(r.get("year") or ""),
+                "rating": float(r.get("rating") or 0),
+                "kind": r.get("kind") or "movie",
+                "poster": r.get("poster"),
+                "tmdb_id": r.get("tmdb_id"),
+                "source": "tmdb",
+            })
+        return out
+    except Exception as e:
+        logger.debug(f"[SUGG] tmdb: {e}")
+        return []
+
+
+async def _omdb_search(query: str) -> List[Dict[str, Any]]:
+    try:
+        from providers import omdb_provider as OP  # type: ignore
+    except Exception:
+        return []
+
+    try:
+        results = await OP.search(query)  # type: ignore
+    except Exception as e:
+        logger.debug(f"[SUGG] omdb: {e}")
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for r in results or []:
+        t = r.get("title") or r.get("Title")
+        if not t:
+            continue
+        out.append({
+            "title": t,
+            "year": str(r.get("year") or r.get("Year") or ""),
+            "rating": float(
+                str(r.get("rating") or r.get("imdbRating") or 0)
+                .replace("N/A", "0") or 0
+            ),
+            "kind": "movie",
+            "poster": r.get("poster") or r.get("Poster"),
+            "tmdb_id": None,
+            "imdb_id": r.get("imdb_id") or r.get("imdbID"),
+            "source": "imdb",
+        })
+    return out
+
+
+# ============================================================
+# DB TITLE CACHE
 # ============================================================
 
 _db_titles_cache: List[Tuple[str, str]] = []
@@ -121,10 +188,6 @@ DB_TITLES_TTL = 300.0
 
 
 async def _load_db_titles() -> List[Tuple[str, str]]:
-    """
-    Return list of (title, year_str) from every media shard.
-    Cached 5 min.
-    """
     global _db_titles_cache, _db_titles_at
     now = time.time()
     if _db_titles_cache and (now - _db_titles_at) < DB_TITLES_TTL:
@@ -142,7 +205,7 @@ async def _load_db_titles() -> List[Tuple[str, str]]:
         try:
             cursor = e.db["media_files"].find(
                 {"title": {"$exists": True, "$ne": ""}},
-                {"title": 1, "year": 1, "type": 1, "_id": 0},
+                {"title": 1, "year": 1, "_id": 0},
             ).limit(3000)
             async for doc in cursor:
                 t = doc.get("title")
@@ -154,22 +217,17 @@ async def _load_db_titles() -> List[Tuple[str, str]]:
 
     _db_titles_cache = list(titles)
     _db_titles_at = now
-    logger.debug(f"[SUGG] loaded {len(_db_titles_cache)} unique titles")
+    logger.debug(f"[SUGG] loaded {len(_db_titles_cache)} DB titles")
     return _db_titles_cache
 
 
 async def _db_fuzzy_suggestions(
     query: str,
     limit: int = 6,
-    min_score: float = 60.0,
+    min_score: float = 55.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Fuzzy match the query against every title in the DB.
-    Used when TMDB search returns nothing.
-    """
     if not query:
         return []
-
     try:
         from rapidfuzz import process as rf, fuzz
     except Exception:
@@ -183,25 +241,15 @@ async def _db_fuzzy_suggestions(
     if not q_clean:
         return []
 
-    # Build lookup: cleaned_title → (original_title, year)
     lookup: Dict[str, Tuple[str, str]] = {}
     for t, y in titles:
         c = clean_filename(t).lower().strip()
         if c and c not in lookup:
             lookup[c] = (t, y)
 
-    if not lookup:
-        return []
-
     choices = list(lookup.keys())
-
     try:
-        results = rf.extract(
-            q_clean,
-            choices,
-            scorer=fuzz.WRatio,
-            limit=limit,
-        )
+        results = rf.extract(q_clean, choices, scorer=fuzz.WRatio, limit=limit)
     except Exception:
         return []
 
@@ -228,7 +276,39 @@ async def _db_fuzzy_suggestions(
 
 
 # ============================================================
-# SUGGESTIONS (TMDB first, DB fuzzy fallback)
+# FUZZY FILTER
+# ============================================================
+
+def _fuzzy_filter(
+    query: str,
+    items: List[Dict[str, Any]],
+    min_score: float = 45.0,
+    limit: int = 6,
+) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+    try:
+        from rapidfuzz import fuzz
+    except Exception:
+        return items[:limit]
+
+    q_clean = clean_filename(query).lower()
+    scored: List[Dict[str, Any]] = []
+    for it in items:
+        t = it.get("title") or ""
+        if not t:
+            continue
+        score = fuzz.WRatio(q_clean, clean_filename(t).lower())
+        it = dict(it)
+        it["score"] = max(it.get("score", 0), score)
+        scored.append(it)
+
+    scored.sort(key=lambda x: (x["score"], x.get("rating", 0)), reverse=True)
+    return [x for x in scored if x["score"] >= min_score][:limit]
+
+
+# ============================================================
+# SUGGESTIONS — main entry
 # ============================================================
 
 async def suggestions(
@@ -236,7 +316,7 @@ async def suggestions(
     year: Optional[int] = None,
     limit: int = 6,
 ) -> List[Dict[str, Any]]:
-    if not query:
+    if not query or len(query.strip()) < 2:
         return []
 
     key = f"s:{query.lower()}:{year or ''}:{limit}"
@@ -244,64 +324,62 @@ async def suggestions(
     if c and c[0] > time.time():
         return c[1]
 
-    # ── 1. TMDB ──
-    raw: List[Dict[str, Any]] = []
-    try:
-        from providers import tmdb_provider as TP
-        movies = await TP.search_movie(query)
-        tv = await TP.search_tv(query)
-        raw = list(movies or []) + list(tv or [])
-    except Exception as e:
-        logger.debug(f"[SUGG] TMDB: {e}")
-
-    try:
-        from rapidfuzz import fuzz
-        have_fuzz = True
-    except Exception:
-        have_fuzz = False
-
-    q_clean = clean_filename(query).lower()
+    seen_titles: Set[str] = set()
     out: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
 
-    for r in raw[:20]:
-        title = r.get("title") or ""
-        if not title:
-            continue
-        tkey = title.lower()
-        if tkey in seen:
-            continue
-        seen.add(tkey)
+    def _add(items: List[Dict[str, Any]]) -> None:
+        for it in items:
+            t = (it.get("title") or "").lower()
+            if t and t not in seen_titles:
+                seen_titles.add(t)
+                out.append(it)
 
-        if have_fuzz:
-            score = fuzz.WRatio(q_clean, clean_filename(title).lower())
-        else:
-            score = 100 if q_clean in clean_filename(title).lower() else 50
+    # ── 1. TMDB with FULL query ──
+    _add(_fuzzy_filter(query, await _tmdb_search(query), limit=limit))
 
-        out.append({
-            "title": title,
-            "year": str(r.get("year") or ""),
-            "rating": float(r.get("rating") or 0),
-            "kind": r.get("kind") or "movie",
-            "poster": r.get("poster"),
-            "tmdb_id": r.get("tmdb_id"),
-            "score": score,
-            "source": "tmdb",
-        })
-
-    out.sort(key=lambda x: (x["score"], x["rating"]), reverse=True)
-    out = [x for x in out if x["score"] >= 55][:limit]
-
-    # ── 2. Fallback: DB fuzzy ──
+    # ── 2. TMDB with progressively shorter queries ──
     if not out:
-        logger.info(f"[SUGG] TMDB empty for '{query}' → DB fuzzy fallback")
-        try:
-            out = await _db_fuzzy_suggestions(query, limit=limit)
-        except Exception as e:
-            logger.debug(f"[SUGG] db fallback: {e}")
+        words = query.split()
+        for n in range(len(words) - 1, 0, -1):
+            short = " ".join(words[:n])
+            if len(short) < 3:
+                break
+            candidates = await _tmdb_search(short)
+            filtered = _fuzzy_filter(query, candidates, limit=limit)
+            if filtered:
+                _add(filtered)
+                break
 
-    _cache[key] = (time.time() + CACHE_TTL, out)
-    return out
+    # ── 3. TMDB with each single word (last resort) ──
+    if not out:
+        for word in _tokenize(query):
+            if len(word) < 4:
+                continue
+            candidates = await _tmdb_search(word)
+            filtered = _fuzzy_filter(query, candidates, limit=limit)
+            if filtered:
+                _add(filtered[:limit])
+                break
+
+    # ── 4. OMDB (IMDb) with FULL query ──
+    if not out:
+        _add(_fuzzy_filter(query, await _omdb_search(query), limit=limit))
+
+    # ── 5. OMDB with first two words ──
+    if not out:
+        words = query.split()
+        if len(words) >= 2:
+            short = " ".join(words[:2])
+            _add(_fuzzy_filter(query, await _omdb_search(short), limit=limit))
+
+    # ── 6. DB fuzzy fallback ──
+    if not out:
+        logger.info(f"[SUGG] providers empty for '{query}' → DB fuzzy fallback")
+        _add(await _db_fuzzy_suggestions(query, limit=limit))
+
+    final = out[:limit]
+    _cache[key] = (time.time() + CACHE_TTL, final)
+    return final
 
 
 __all__ = [
