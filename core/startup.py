@@ -412,6 +412,27 @@ async def start_bot() -> None:
     except Exception as e:
         logger.warning(f"[BOOT] start_router: {e}")
 
+    # ── 0b. Register flow steps + default flows ──
+    #         MUST run before any search flow is invoked,
+    #         otherwise get_flow() / get_step() return None.
+    try:
+        from core import steps  # noqa: F401
+        from core.flow_engine import list_steps, list_flows
+        _s = len(list_steps())
+        _f = len(list_flows())
+        logger.info(
+            f"[BOOT] ✅ flow engine ready — "
+            f"{_s} steps · {_f} flows"
+        )
+        if _s == 0 or _f == 0:
+            logger.error(
+                "[BOOT] ⚠️ flow engine loaded but registry is EMPTY — "
+                "search flows will fail silently"
+            )
+    except Exception as e:
+        logger.exception(f"[BOOT] ❌ core.steps failed to load: {e}")
+        
+
     # ── 1. Validate config ──
     try:
         errors = config.validate()
