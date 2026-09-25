@@ -114,12 +114,13 @@ async def _handle_updated(client, q, req, token):
     )
 
     if not delivery_token:
-        # Fallback: use original token as delivery token
-        delivery_token = token
-        logger.warning("[REQ] delivery create failed — reusing request token")
+    # Fallback: keep request token alive so user can still retrieve
+    delivery_token = token
+    logger.warning("[REQ] delivery create failed — reusing request token")
 
-    # ── 2. Expire the request token IMMEDIATELY ──
-    await RS.delete_request(token)
+# Only expire the request token if we created a fresh delivery token
+    if delivery_token != token:
+       await RS.delete_request(token)
 
     # ── 3. Message to user ──
     text = "\n".join([
