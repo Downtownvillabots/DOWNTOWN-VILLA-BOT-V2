@@ -567,7 +567,6 @@ __all__ = [
 #
 # ============================================================
 
-from __future__ import annotations
 
 import copy
 import logging
@@ -1109,7 +1108,7 @@ __all__ = [
 #
 # ============================================================
 
-from __future__ import annotations
+
 
 import asyncio
 import logging
@@ -1746,7 +1745,6 @@ __all__ = [
 #
 # ============================================================
 
-from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
