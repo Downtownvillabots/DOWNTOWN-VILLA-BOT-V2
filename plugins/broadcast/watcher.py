@@ -203,7 +203,7 @@ if _FILTER is not None:
             original_caption = message.caption or ""
 
             _ss_new(
-                uid,
+                chat_id,
                 source_chat_id=chat_id,
                 source_msg_id=msg_id,
                 source_file_name=file_name,
@@ -362,7 +362,7 @@ async def _render_timer_for(
     title: str,
     target_count: int,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid) or {}
     selected = s.get("auto_delete_secs", 0)
 
@@ -419,7 +419,7 @@ async def _render_timer_for(
 # ============================================================
 
 async def _render_channel_picker(q: CallbackQuery) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -493,7 +493,7 @@ async def _render_channel_picker(q: CallbackQuery) -> None:
 # ============================================================
 
 async def _render_channel_editor(q: CallbackQuery, cid: int) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     from plugins.broadcast import channels as CH
     ch = await CH.get_channel(cid)
     if not ch:
@@ -753,7 +753,7 @@ async def _render_user_picker(q: CallbackQuery) -> None:
 # ============================================================
 
 async def _render_us_timer_picker(q: CallbackQuery) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid) or {}
     selected = s.get("auto_delete_secs", 0)
     flt = s.get("target_user_filter") or "all"
@@ -802,7 +802,7 @@ async def _render_us_timer_picker(q: CallbackQuery) -> None:
 # ============================================================
 
 async def _render_preview(q: CallbackQuery) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -911,7 +911,7 @@ async def _effective_buttons(uid: int) -> List[Dict[str, Any]]:
 # ============================================================
 
 async def _render_caption_menu(q: CallbackQuery) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -990,7 +990,7 @@ async def _render_channels_all_confirm(q: CallbackQuery) -> None:
     custom_cap = sum(1 for c in enabled if c.get("caption") is not None)
     custom_btn = sum(1 for c in enabled if c.get("buttons") is not None)
 
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid) or {}
     timer = s.get("auto_delete_secs", 0)
 
@@ -1044,7 +1044,7 @@ async def _render_groups_all_confirm(q: CallbackQuery) -> None:
     except Exception:
         pass
 
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid) or {}
     timer = s.get("auto_delete_secs", 0)
 
@@ -1087,7 +1087,7 @@ async def _render_groups_all_confirm(q: CallbackQuery) -> None:
 async def _render_groups_single_confirm(
     q: CallbackQuery, gid: int,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid) or {}
     timer = s.get("auto_delete_secs", 0)
 
@@ -1143,7 +1143,7 @@ async def _render_groups_single_confirm(
 
 
 async def _render_users_confirm(q: CallbackQuery) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -1301,7 +1301,7 @@ async def broadcast_center_router(client: Client, q: CallbackQuery):
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("❌ admin only", show_alert=True)
 
-    uid = q.from_user.id
+    uid = q.message.chat.id
     parts = str(q.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
 
@@ -1676,7 +1676,7 @@ async def _render_channel_buttons(q: CallbackQuery, cid: int) -> None:
 async def _run_channel_single(
     client: Client, q: CallbackQuery, cid: int,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -1710,7 +1710,7 @@ async def _run_channel_single(
 async def _run_groups_single(
     client: Client, q: CallbackQuery, gid: int,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -1739,7 +1739,7 @@ async def _run_groups_single(
 async def _run_groups_all(
     client: Client, q: CallbackQuery,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -1784,7 +1784,7 @@ async def _run_groups_all(
 async def _run_users(
     client: Client, q: CallbackQuery,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
@@ -1855,7 +1855,7 @@ async def _run_users(
 async def _run_channels_all(
     client: Client, q: CallbackQuery,
 ) -> None:
-    uid = q.from_user.id
+    uid = q.message.chat.id
     s = _ss_get(uid)
     if not s:
         return await q.answer("session expired", show_alert=True)
