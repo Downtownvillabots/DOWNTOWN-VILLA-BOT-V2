@@ -4,11 +4,10 @@
 #
 # Executes a broadcast run:
 #   • Copy source message to every target
-#   • Respect captions/buttons per channel
 #   • Handle FloodWait
 #   • Skip blocked/deleted users
 #   • Track counters live
-#   • Auto-delete timer per message (ALL KINDS)
+#   • Auto-delete for channels + groups + users
 #   • Cancel support
 #
 # ============================================================
@@ -103,7 +102,6 @@ async def run_broadcast(
 
     from plugins.broadcast import state as BS
 
-    # Create run
     job_id = await BS.create_run(
         owner=owner,
         target_kind=kind,
@@ -115,7 +113,6 @@ async def run_broadcast(
     STATE["job_id"] = job_id
 
     try:
-        # Fetch source message
         try:
             source_msg = await client.get_messages(
                 source_chat_id, source_msg_id
@@ -128,7 +125,6 @@ async def run_broadcast(
             STATE["last_error"] = "source message gone"
             return {"ok": False, "reason": "source gone"}
 
-        # Caption + buttons
         from plugins.broadcast import templates as T
         cap_tpl = caption_template or await T.get_caption()
         btns = buttons_list if buttons_list is not None else await T.get_buttons()
@@ -136,7 +132,6 @@ async def run_broadcast(
         caption = T.build_caption(source_msg, cap_tpl)
         kb = T.build_buttons_kb(btns)
 
-        # Broadcast
         start = time.time()
         sem = asyncio.Semaphore(5)
         lock = asyncio.Lock()
@@ -157,7 +152,7 @@ async def run_broadcast(
                         reply_markup=kb,
                     )
 
-                    # Auto-delete schedule — works for ALL kinds
+                    # Auto-delete — works for ALL kinds
                     if autodelete_seconds > 0 and sent:
                         try:
                             await BS.schedule_autodelete(
@@ -180,7 +175,6 @@ async def run_broadcast(
                             caption=caption,
                             reply_markup=kb,
                         )
-                        # Auto-delete schedule — works for ALL kinds
                         if autodelete_seconds > 0 and sent:
                             try:
                                 await BS.schedule_autodelete(
@@ -215,17 +209,12 @@ async def run_broadcast(
                 elif result == "failed":
                     STATE["failed"] += 1
 
-                # Auto-cleanup blocked users
                 if result == "blocked" and kind == "users":
                     asyncio.create_task(_remove_blocked_user(tid))
 
-                # Update DB
                 if job_id:
-                    await BS.increment_run(job_id, **{
-                        result: 1
-                    })
+                    await BS.increment_run(job_id, **{result: 1})
 
-                # Speed/ETA
                 done = STATE["sent"] + STATE["failed"] + STATE["blocked"]
                 elapsed = max(0.001, time.time() - start)
                 STATE["speed"] = done / elapsed
@@ -235,7 +224,6 @@ async def run_broadcast(
                     from utils import format as FM
                     STATE["eta_text"] = FM.duration_short(eta)
 
-        # Run in batches
         for i in range(0, len(targets), batch_size):
             if STATE["cancel_requested"]:
                 break
@@ -250,7 +238,6 @@ async def run_broadcast(
                 except Exception:
                     pass
 
-        # Done
         final_status = (
             "cancelled" if STATE["cancel_requested"] else "completed"
         )
