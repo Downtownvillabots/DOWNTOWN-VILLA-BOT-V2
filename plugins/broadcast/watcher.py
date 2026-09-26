@@ -1758,6 +1758,107 @@ async def bc_text_input(client: Client, message: Message):
 
 
 # ============================================================
+# ADMIN PANEL ENTRY — open flow in admin's PM
+# ============================================================
+
+async def bc_open_for_admin(client: Client, user_id: int) -> None:
+    """
+    Called from /admin → [📢 Broadcast].
+    Sends the source picker to the admin's PM.
+    """
+    key = int(user_id)
+
+    ch = getattr(config, "BROADCAST_CHANNEL_ID", None)
+    if not ch:
+        try:
+            await client.send_message(
+                chat_id=user_id,
+                text=(
+                    f"{F.EMO['warn']} <b>BROADCAST_CHANNEL_ID not set</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        msgs = []
+        async for m in client.get_chat_history(ch, limit=40):
+            if m.media and not m.service:
+                msgs.append(m)
+            if len(msgs) >= 10:
+                break
+    except Exception as e:
+        logger.exception(f"[BC-ADMIN] fetch: {e}")
+        try:
+            await client.send_message(
+                chat_id=user_id,
+                text=(
+                    f"{F.EMO['cross']} {F.sc('cannot read channel')}\n"
+                    f"<code>{type(e).__name__}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    if not msgs:
+        try:
+            await client.send_message(
+                chat_id=user_id,
+                text="\n".join([
+                    f"{F.EMO['warn']} <b>{F.fb('NO FILES')}</b>",
+                    F.DIV, "",
+                    f"📌 {F.sc('upload a file to the broadcast channel')}",
+                    f"📌 {F.sc('then try again')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    src_list = [(int(m.id), _extract_name(m)) for m in msgs]
+
+    _s_set(
+        key,
+        source_list=src_list,
+        broadcast_channel_id=int(ch),
+        awaiting=None,
+    )
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📢 <b>{F.fb('SELECT SOURCE')}</b>",
+        F.DIV, "",
+        f"📌 {F.sc('pick a file from the broadcast channel')}",
+    ])
+
+    rows = []
+    for i, (mid, name) in enumerate(src_list):
+        rows.append([InlineKeyboardButton(
+            f"📦 {name[:42]}",
+            callback_data=_cb(f"src:{i}"),
+        )])
+    rows.append([InlineKeyboardButton(
+        f"❌ {F.sc('cancel')}",
+        callback_data=_cb("cancel"),
+    )])
+
+    try:
+        await client.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.exception(f"[BC-ADMIN] send: {e}")
+
+# ============================================================
 # PUBLIC
 # ============================================================
 
