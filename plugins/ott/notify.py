@@ -278,6 +278,8 @@ async def _send_hype(client: Client) -> None:
                     f"🔔 {F.sc('be ready — we will notify you')}",
                 ])
                 poster = T.poster_url(movie.get("poster_path"))
+
+                sent = False
                 if poster:
                     try:
                         await client.send_photo(
@@ -285,18 +287,30 @@ async def _send_hype(client: Client) -> None:
                             caption=text,
                             parse_mode=ParseMode.HTML,
                         )
-                        continue
+                        sent = True
+                    except FloodWait as e:
+                        wait = int(getattr(e, "value", 30) or 30)
+                        logger.warning(f"[OTT] hype flood {wait}s")
+                        await asyncio.sleep(wait + 2)
                     except Exception:
                         pass
-                await client.send_message(
-                    chat_id=uid, text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
+
+                if not sent:
+                    await client.send_message(
+                        chat_id=uid, text=text,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+
                 await asyncio.sleep(0.05)
+            except FloodWait as e:
+                wait = int(getattr(e, "value", 30) or 30)
+                logger.warning(f"[OTT] hype text flood {wait}s")
+                await asyncio.sleep(wait + 2)
+            except UserIsBlocked:
+                continue
             except Exception:
                 continue
-
 
 # ============================================================
 # PENDING AUTO-DELETE LOOP
