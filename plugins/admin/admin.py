@@ -915,12 +915,12 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             return
 
         if module == "premium":
-            from plugins.premium import premium_watch as PW
-            fn = getattr(PW, "open_panel_for_admin", None)
+            from plugins.admin import premium as PA
+            fn = getattr(PA, "open_panel_for_admin", None)
             if fn is not None:
                 await fn(client, q.message)
             else:
-                await q.answer("Use /premium", show_alert=True)
+                await q.answer("Premium panel unavailable", show_alert=True)
             return
 
         if module == "ott":
