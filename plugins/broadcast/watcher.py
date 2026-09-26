@@ -793,6 +793,10 @@ async def _render_us_timer_picker(q: CallbackQuery) -> None:
         callback_data=_cb("users"),
     )])
 
+    await _edit(q, text, InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
 # ============================================================
 # PREVIEW
 # ============================================================
@@ -2242,5 +2246,3 @@ def snapshot() -> Dict[str, Any]:
 
 
 __all__ = ["snapshot"]
-    await _edit(q, text, InlineKeyboardMarkup(rows))
-    await q.answer()
