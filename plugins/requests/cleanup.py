@@ -39,24 +39,23 @@ async def _purge_loop() -> None:
 
 
 def start_cleanup() -> None:
-    """Idempotent — safe to call multiple times."""
+    """
+    Idempotent — safe to call multiple times.
+    Must be called from inside a running asyncio loop (see startup.py).
+    """
     global _task, _STARTED
     if _STARTED:
         return
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()          # ← modern API
         _task = loop.create_task(_purge_loop())
         _STARTED = True
         logger.info("[REQ-CLEANUP] ✅ scheduler started (24h interval)")
+    except RuntimeError:
+        # Not in a running loop — startup.py will call us later
+        logger.debug("[REQ-CLEANUP] not in running loop — deferring start")
     except Exception as e:
         logger.warning(f"[REQ-CLEANUP] start failed: {e}")
-
-
-# ── Auto-start on module import ──
-try:
-    start_cleanup()
-except Exception:
-    pass
 
 
 __all__ = ["start_cleanup"]
