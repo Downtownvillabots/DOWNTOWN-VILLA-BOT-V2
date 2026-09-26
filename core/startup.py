@@ -241,6 +241,14 @@ async def _start_all_loops(bot) -> None:
     except Exception as e:
         logger.debug(f"[BOOT] sessions cleanup: {e}")
 
+    # ── Requests delivery-token cleanup ──
+    try:
+        from plugins.requests import cleanup as _req_cleanup
+        _req_cleanup.start_cleanup()
+        started.append("requests_tokens")
+    except Exception as e:
+        logger.debug(f"[BOOT] requests tokens cleanup: {e}")
+
     # ── Backup watcher + autodelete ──
     try:
         from plugins.backup import watcher as W
