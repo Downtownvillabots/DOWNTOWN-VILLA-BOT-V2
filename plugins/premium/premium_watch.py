@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# AUTH
+# AUTH + HELPERS
 # ============================================================
 
 def _is_admin(uid) -> bool:
@@ -51,6 +51,7 @@ def _is_admin(uid) -> bool:
         return int(uid) in [int(a) for a in config.ADMINS]
     except Exception:
         return False
+
 
 async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
     """
@@ -371,15 +372,11 @@ async def _show_seasons(
         ),
     ])
 
-    try:
-        await q.message.edit_text(
-            "\n".join(lines)[:4000],
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _safe_edit(
+        q,
+        "\n".join(lines)[:4000],
+        InlineKeyboardMarkup(rows),
+    )
     await q.answer()
 
 
@@ -450,15 +447,11 @@ async def _show_episodes(
         ),
     ])
 
-    try:
-        await q.message.edit_text(
-            "\n".join(lines)[:4000],
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _safe_edit(
+        q,
+        "\n".join(lines)[:4000],
+        InlineKeyboardMarkup(rows),
+    )
     await q.answer()
 
 
@@ -865,15 +858,7 @@ async def _show_rating_menu(client, q, slug: str) -> None:
         )],
     ]
 
-    try:
-        await q.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _safe_edit(q, text, InlineKeyboardMarkup(rows))
     await q.answer()
 
 
@@ -936,15 +921,11 @@ async def _show_missing(client, q, slug: str) -> None:
         ),
     ])
 
-    try:
-        await q.message.edit_text(
-            "\n".join(lines)[:4000],
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _safe_edit(
+        q,
+        "\n".join(lines)[:4000],
+        InlineKeyboardMarkup(rows),
+    )
     await q.answer()
 
 
@@ -973,24 +954,20 @@ async def _show_watch_order(client, q, slug: str) -> None:
         f"<i>{F.sc('coming soon — franchises supported in v2')}</i>",
     ])
 
-    try:
-        await q.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"{F.EMO['back']} {F.sc('back')}",
-                    callback_data=f"pw:open:{slug}",
-                ),
-                InlineKeyboardButton(
-                    f"{F.EMO['cross']} {F.sc('close')}",
-                    callback_data="pw:close_session",
-                ),
-            ]]),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _safe_edit(
+        q,
+        text,
+        InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"pw:open:{slug}",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data="pw:close_session",
+            ),
+        ]]),
+    )
     await q.answer()
 
 
@@ -1021,24 +998,20 @@ async def _show_admin(client, q) -> None:
         f"<b>{sessions}</b>",
     ])
 
-    try:
-        await q.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"{F.EMO['back']} {F.sc('back')}",
-                    callback_data="pw:menu",
-                ),
-                InlineKeyboardButton(
-                    f"{F.EMO['cross']} {F.sc('close')}",
-                    callback_data="pw:menu_close",
-                ),
-            ]]),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _safe_edit(
+        q,
+        text,
+        InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data="pw:menu",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data="pw:menu_close",
+            ),
+        ]]),
+    )
     await q.answer()
 
 
