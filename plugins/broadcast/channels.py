@@ -1,14 +1,14 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — BROADCAST CHANNELS (WITH PER-CHANNEL CONFIG)
+# 🏨 DOWNTOWN VILLA — BROADCAST CHANNELS
 # ============================================================
 #
-# Channel CRUD + per-channel caption/buttons overrides.
+# Channel CRUD + per-channel caption/buttons storage.
 #
 # Each channel doc:
 #   {
 #     chat_id, title, username, enabled, primary,
-#     caption: str | None,       # None = use global default
-#     buttons: list | None,      # None = use global default
+#     caption: str | None,   # None = use global default
+#     buttons: list | None,  # None = use global default
 #   }
 #
 # ============================================================
@@ -164,15 +164,10 @@ async def set_buttons(chat_id: int, buttons: Optional[List[Dict]]) -> bool:
 
 
 async def reset_overrides(chat_id: int) -> bool:
-    """Revert a channel to global defaults for both caption + buttons."""
     return await update_channel(chat_id, caption=None, buttons=None)
 
 
 async def effective_caption(chat_id: int) -> str:
-    """
-    Return the caption template for this channel:
-    per-channel if set, else global default.
-    """
     ch = await get_channel(chat_id)
     if ch and ch.get("caption") is not None:
         return ch["caption"]
@@ -184,10 +179,6 @@ async def effective_caption(chat_id: int) -> str:
 
 
 async def effective_buttons(chat_id: int) -> List[Dict[str, Any]]:
-    """
-    Return the button list for this channel:
-    per-channel if set, else global default.
-    """
     ch = await get_channel(chat_id)
     if ch and ch.get("buttons") is not None:
         return list(ch["buttons"])
