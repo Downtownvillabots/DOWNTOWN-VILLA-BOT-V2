@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
@@ -450,6 +451,23 @@ async def _send_results(
                 disable_web_page_preview=True,
             )
             await asyncio.sleep(0.4)
+        except FloodWait as e:
+            wait = int(getattr(e, "value", 30) or 30)
+            logger.warning(
+                f"[MISS] flood wait {wait}s — retrying part {p+1}"
+            )
+            await asyncio.sleep(wait + 2)
+            try:
+                await client.send_message(
+                    chat_id=chat_id,
+                    text="\n".join(lines)[:4000],
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                await asyncio.sleep(0.4)
+            except Exception as e2:
+                logger.warning(f"[MISS] retry failed part {p+1}: {e2}")
         except Exception as e:
             logger.debug(f"[MISS] part {p}: {e}")
 
