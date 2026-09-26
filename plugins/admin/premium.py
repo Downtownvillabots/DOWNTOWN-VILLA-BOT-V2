@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
@@ -40,7 +40,6 @@ SESSION_TTL = 600.0
 # ============================================================
 
 def cb(action: str) -> str:
-    """Build a callback: cb('home') → 'adm:pma:home'"""
     return PREFIX + str(action)
 
 
@@ -114,6 +113,52 @@ async def _gather_sessions() -> int:
         return 0
 
 
+async def _gather_analytics() -> Dict[str, Any]:
+    """Detailed analytics from real data."""
+    out: Dict[str, Any] = {
+        "new_week": 0,
+        "new_month": 0,
+        "new_total": 0,
+        "by_plan": {},   # {months: count}
+        "avg_days_remaining": 0,
+    }
+
+    try:
+        from plugins.premium import state as S
+        users = await S.list_users(limit=2000)
+    except Exception:
+        return out
+
+    now = time.time()
+    week_ago = now - 7 * 86400
+    month_ago = now - 30 * 86400
+
+    total_days = 0
+    active_count = 0
+
+    for u in users:
+        added = float(u.get("added_at", 0) or 0)
+        exp = float(u.get("expires_at", 0) or 0)
+        plan = int(u.get("plan_months", 1) or 1)
+
+        if added >= week_ago:
+            out["new_week"] += 1
+        if added >= month_ago:
+            out["new_month"] += 1
+        out["new_total"] += 1
+
+        out["by_plan"][plan] = out["by_plan"].get(plan, 0) + 1
+
+        if exp > now:
+            total_days += int((exp - now) / 86400)
+            active_count += 1
+
+    if active_count > 0:
+        out["avg_days_remaining"] = total_days // active_count
+
+    return out
+
+
 # ============================================================
 # MAIN DASHBOARD
 # ============================================================
@@ -144,6 +189,20 @@ def _kb_main() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 f"🔴 {F.sc('expired')}",
                 callback_data=cb("list:expired:0"),
+            ),
+            InlineKeyboardButton(
+                f"➕ {F.sc('add premium')}",
+                callback_data=cb("add_prem"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"📊 {F.sc('statistics')}",
+                callback_data=cb("stats"),
+            ),
+            InlineKeyboardButton(
+                f"📜 {F.sc('history')}",
+                callback_data=cb("history"),
             ),
         ],
         [
@@ -542,6 +601,256 @@ async def _render_confirm_remove(user_id: int) -> tuple:
 
 
 # ============================================================
+# ADD PREMIUM
+# ============================================================
+
+async def _render_add_prem_prompt() -> tuple:
+    lines = [
+        f"➕ <b>{F.fb('ADD PREMIUM')}</b>",
+        F.DIV, "",
+        f"📌 {F.sc('send the user id')}",
+        f"📌 {F.sc('example')} · <code>123456789</code>",
+        "",
+        f"💡 {F.sc('tips')}",
+        f"• {F.sc('user must have started the bot first')}",
+        f"• {F.sc('send')} <code>-</code> {F.sc('to cancel')}",
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"❌ {F.sc('cancel')}",
+            callback_data=cb("home"),
+        ),
+    ]])
+
+
+async def _render_add_prem_months(user_id: int) -> tuple:
+    try:
+        from plugins.premium import state as S
+        existing = await S.get_user(user_id)
+    except Exception:
+        existing = None
+
+    lines = [
+        f"➕ <b>{F.fb('ADD PREMIUM')}</b>",
+        F.DIV, "",
+        f"🆔 {F.sc('user id')} · <code>{user_id}</code>",
+    ]
+
+    if existing:
+        exp = float(existing.get("expires_at", 0) or 0)
+        days = int((exp - time.time()) / 86400)
+        uname = existing.get("username") or "—"
+        lines += [
+            f"👤 {F.sc('username')} · "
+            f"<code>@{F.sc(str(uname))}</code>",
+            "",
+            f"⚠️ {F.sc('this user already has premium')}",
+            f"⏳ {F.sc('currently')} · <b>{days} days</b>",
+            f"📌 {F.sc('adding will stack on top')}",
+        ]
+    else:
+        lines += [
+            "",
+            f"🆕 {F.sc('new premium user')}",
+        ]
+
+    lines += [
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('pick the duration')}",
+    ]
+
+    rows = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ 1 month",
+                callback_data=cb(f"add_prem_do:{user_id}:1")),
+            InlineKeyboardButton("➕ 3 months",
+                callback_data=cb(f"add_prem_do:{user_id}:3")),
+        ],
+        [
+            InlineKeyboardButton("➕ 6 months",
+                callback_data=cb(f"add_prem_do:{user_id}:6")),
+            InlineKeyboardButton("➕ 12 months",
+                callback_data=cb(f"add_prem_do:{user_id}:12")),
+        ],
+        [InlineKeyboardButton(
+            f"❌ {F.sc('cancel')}",
+            callback_data=cb("home"),
+        )],
+    ])
+
+    return "\n".join(lines), rows
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+async def _render_stats() -> tuple:
+    s = await _gather_stats()
+    a = await _gather_analytics()
+    sessions = await _gather_sessions()
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📊 <b>{F.fb('PREMIUM STATISTICS')}</b>",
+        F.DIV, "",
+        f"👥 <b>{F.fb('USER COUNTS')}</b>",
+        "",
+        f"👥 {F.sc('total')} · <b>{FM.num(s['total'])}</b>",
+        f"🟢 {F.sc('active')} · <b>{FM.num(s['active'])}</b>",
+        f"🟡 {F.sc('expiring 7d')} · <b>{FM.num(s['expiring_7d'])}</b>",
+        f"🔴 {F.sc('expired')} · <b>{FM.num(s['expired'])}</b>",
+        "",
+        F.DIV_S,
+        f"📈 <b>{F.fb('GROWTH')}</b>",
+        "",
+        f"📅 {F.sc('new this week')} · <b>{FM.num(a['new_week'])}</b>",
+        f"📆 {F.sc('new this month')} · <b>{FM.num(a['new_month'])}</b>",
+        f"📊 {F.sc('total records')} · <b>{FM.num(a['new_total'])}</b>",
+        "",
+        F.DIV_S,
+        f"💎 <b>{F.fb('BY PLAN')}</b>",
+        "",
+    ]
+
+    plan_counts = a.get("by_plan") or {}
+    if plan_counts:
+        for months in sorted(plan_counts.keys()):
+            cnt = plan_counts[months]
+            lines.append(
+                f"📦 {months} {F.sc('months')} · <b>{FM.num(cnt)}</b>"
+            )
+    else:
+        lines.append(f"⚪ {F.sc('no data')}")
+
+    lines += [
+        "",
+        F.DIV_S,
+        f"⏳ <b>{F.fb('ENGAGEMENT')}</b>",
+        "",
+        f"📺 {F.sc('watch sessions')} · <b>{FM.num(sessions)}</b>",
+        f"⏰ {F.sc('avg days remaining')} · "
+        f"<b>{a.get('avg_days_remaining', 0)}</b>",
+        "",
+        F.DIV,
+        f"🕒 <code>{FM.datetime_()}</code>",
+    ]
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"🔄 {F.sc('refresh')}",
+                callback_data=cb("stats"),
+            ),
+            InlineKeyboardButton(
+                f"🏠 {F.sc('home')}",
+                callback_data=cb("home"),
+            ),
+        ],
+        [InlineKeyboardButton(
+            f"❌ {F.sc('close')}",
+            callback_data=cb("close"),
+        )],
+    ])
+
+    return "\n".join(lines)[:4000], kb
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+async def _render_history(page: int = 0) -> tuple:
+    try:
+        from plugins.premium import state as S
+        users = await S.list_users(limit=200)
+    except Exception:
+        users = []
+
+    # Sort by added_at desc (most recent first)
+    users.sort(key=lambda u: u.get("added_at", 0), reverse=True)
+
+    total = len(users)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = users[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📜 <b>{F.fb('PREMIUM HISTORY')}</b>",
+        F.DIV, "",
+        f"📊 {F.sc('total records')} · <b>{FM.num(total)}</b>",
+        f"📄 {F.sc('page')} · <b>{page + 1}/{total_pages}</b>",
+        "",
+        F.DIV_S,
+        "",
+    ]
+
+    if not chunk:
+        lines.append(f"⚪ {F.sc('no premium records yet')}")
+    else:
+        for i, u in enumerate(chunk):
+            added = float(u.get("added_at", 0) or 0)
+            exp = float(u.get("expires_at", 0) or 0)
+            uid = u.get("user_id", 0)
+            uname = u.get("username") or "—"
+            plan = int(u.get("plan_months", 1) or 1)
+            added_by = u.get("added_by", 0)
+
+            added_str = "—"
+            try:
+                if added:
+                    added_str = FM.datetime_(
+                        datetime.fromtimestamp(added)
+                    )
+            except Exception:
+                pass
+
+            is_active = exp > time.time()
+            icon = "🟢" if is_active else "🔴"
+
+            lines.append(
+                f"<b>{page * PAGE_SIZE + i + 1:02d}.</b> {icon} "
+                f"<b>@{F.sc(str(uname)[:24])}</b>"
+            )
+            lines.append(f"   🆔 <code>{uid}</code>")
+            lines.append(f"   💎 {plan}mo · 📅 {added_str}")
+            if added_by:
+                lines.append(f"   👤 by <code>{added_by}</code>")
+            lines.append("")
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"⬅️ {F.sc('prev')}",
+                callback_data=cb(f"history:{max(0, page - 1)}"),
+            ),
+            InlineKeyboardButton(
+                f"{F.sc('next')} ➡️",
+                callback_data=cb(f"history:{min(total_pages - 1, page + 1)}"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🔄 {F.sc('refresh')}",
+                callback_data=cb(f"history:{page}"),
+            ),
+            InlineKeyboardButton(
+                f"🏠 {F.sc('home')}",
+                callback_data=cb("home"),
+            ),
+        ],
+        [InlineKeyboardButton(
+            f"❌ {F.sc('close')}",
+            callback_data=cb("close"),
+        )],
+    ])
+
+    return "\n".join(lines)[:4000], kb
+
+
+# ============================================================
 # SEARCH
 # ============================================================
 
@@ -636,10 +945,10 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
     if not data.startswith(PREFIX):
         return await q.answer("❌ invalid")
 
-    rest = data[len(PREFIX):]           # e.g. "list:all:0"
+    rest = data[len(PREFIX):]
     parts = rest.split(":")
     action = parts[0] if parts else ""
-    args = parts[1:]                    # e.g. ["all", "0"]
+    args = parts[1:]
 
     try:
         # ── CLOSE ──
@@ -786,7 +1095,80 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return await q.answer()
 
-        return await q.answer(f"❓ Unknown action: {action}")
+        # ── ADD PREMIUM (prompt for user ID) ──
+        if action == "add_prem":
+            _pending_set(q.from_user.id, kind="add_prem")
+            text, kb = await _render_add_prem_prompt()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── ADD PREMIUM (months picker after user ID given) ──
+        if action == "add_prem_months":
+            try:
+                uid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌", show_alert=True)
+            text, kb = await _render_add_prem_months(uid)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── ADD PREMIUM (execute) ──
+        if action == "add_prem_do":
+            try:
+                uid = int(args[0])
+                months = int(args[1])
+            except (ValueError, IndexError):
+                return await q.answer("❌", show_alert=True)
+
+            try:
+                from plugins.premium import state as S
+                # Try to fetch username from bot (if user started it)
+                username = ""
+                try:
+                    chat = await client.get_chat(uid)
+                    username = chat.username or ""
+                except Exception:
+                    pass
+
+                ok = await S.add_premium_user(
+                    user_id=uid,
+                    username=username,
+                    months=months,
+                    added_by=q.from_user.id,
+                    notes="added via admin panel",
+                )
+                await q.answer(
+                    f"✅ Added {months} months" if ok
+                    else "❌ Failed"
+                )
+            except Exception as e:
+                logger.exception(f"[PMA] add_prem_do: {e}")
+                return await q.answer(
+                    f"❌ {type(e).__name__}", show_alert=True
+                )
+
+            # Show user detail
+            text, kb = await _render_user(uid)
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── STATS ──
+        if action == "stats":
+            text, kb = await _render_stats()
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── HISTORY ──
+        if action == "history":
+            try:
+                page = int(args[0]) if args else 0
+            except ValueError:
+                page = 0
+            text, kb = await _render_history(page)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        return await q.answer(f"❓ Unknown: {action}")
 
     except Exception as e:
         logger.exception(f"[PMA] router: {e}")
@@ -797,7 +1179,7 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
 
 
 # ============================================================
-# TEXT INPUT (search)
+# TEXT INPUT (search + add premium)
 # ============================================================
 
 @Client.on_message(
@@ -815,6 +1197,7 @@ async def premium_admin_text_input(client: Client, message: Message):
     kind = pending.get("kind")
     text = (message.text or "").strip()
 
+    # ── SEARCH ──
     if kind == "search":
         _pending_drop(message.from_user.id)
 
@@ -828,7 +1211,43 @@ async def premium_admin_text_input(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        try:
+            message.stop_propagation()
+        except Exception:
+            pass
+        return
 
+    # ── ADD PREMIUM (user ID input) ──
+    if kind == "add_prem":
+        if text == "-" or not text:
+            _pending_drop(message.from_user.id)
+            t, k = await _render_main()
+            await message.reply_text(
+                t, reply_markup=k,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            try:
+                message.stop_propagation()
+            except Exception:
+                pass
+            return
+
+        if not text.isdigit():
+            return await message.reply_text(
+                f"{F.EMO['cross']} {F.sc('send a numeric user id')}",
+                parse_mode=ParseMode.HTML,
+            )
+
+        _pending_drop(message.from_user.id)
+        user_id = int(text)
+
+        t, k = await _render_add_prem_months(user_id)
+        await message.reply_text(
+            t, reply_markup=k,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         try:
             message.stop_propagation()
         except Exception:
@@ -841,13 +1260,7 @@ async def premium_admin_text_input(client: Client, message: Message):
 # ============================================================
 
 async def open_panel_for_admin(client: Client, message: Message) -> None:
-    """
-    Called from /admin → [💎 Premium].
-    
-    NOTE: auth is already verified by admin_router — we do NOT check
-    message.from_user here (which would be the bot, since the admin
-    panel message was sent by the bot).
-    """
+    """Called from /admin → [💎 Premium]."""
     text, kb = await _render_main()
 
     try:
