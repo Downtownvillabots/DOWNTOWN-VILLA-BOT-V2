@@ -1,22 +1,21 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — BROADCAST TARGETS
+# 🏨 DOWNTOWN VILLA — BROADCAST CHANNELS (WITH PER-CHANNEL CONFIG)
 # ============================================================
 #
-# Manage broadcast targets from Telegram:
-#   • Channels (broadcast-only destinations)
-#   • Per-channel caption override
-#   • Per-channel button override
-#   • Enable/disable
-#   • Primary flag (used as default destination)
+# Channel CRUD + per-channel caption/buttons overrides.
 #
-# Stored in SYSTEM DB → broadcast_channels
+# Each channel doc:
+#   {
+#     chat_id, title, username, enabled, primary,
+#     caption: str | None,       # None = use global default
+#     buttons: list | None,      # None = use global default
+#   }
 #
 # ============================================================
 
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -33,9 +32,7 @@ def _coll():
     try:
         from database import db_registry
         db = db_registry.get_system_db()
-        if db is None:
-            return None
-        return db[COLL]
+        return db[COLL] if db is not None else None
     except Exception:
         return None
 
@@ -153,13 +150,61 @@ async def set_primary(chat_id: int) -> bool:
 
 
 # ============================================================
+# PER-CHANNEL CAPTION / BUTTONS
+# ============================================================
+
+async def set_caption(chat_id: int, caption: Optional[str]) -> bool:
+    """Set (or clear with None) a channel's custom caption."""
+    return await update_channel(chat_id, caption=caption)
+
+
+async def set_buttons(chat_id: int, buttons: Optional[List[Dict]]) -> bool:
+    """Set (or clear with None) a channel's custom buttons."""
+    return await update_channel(chat_id, buttons=buttons)
+
+
+async def reset_overrides(chat_id: int) -> bool:
+    """Revert a channel to global defaults for both caption + buttons."""
+    return await update_channel(chat_id, caption=None, buttons=None)
+
+
+async def effective_caption(chat_id: int) -> str:
+    """
+    Return the caption template for this channel:
+    per-channel if set, else global default.
+    """
+    ch = await get_channel(chat_id)
+    if ch and ch.get("caption") is not None:
+        return ch["caption"]
+    try:
+        from plugins.broadcast import templates as T
+        return await T.get_caption()
+    except Exception:
+        return ""
+
+
+async def effective_buttons(chat_id: int) -> List[Dict[str, Any]]:
+    """
+    Return the button list for this channel:
+    per-channel if set, else global default.
+    """
+    ch = await get_channel(chat_id)
+    if ch and ch.get("buttons") is not None:
+        return list(ch["buttons"])
+    try:
+        from plugins.broadcast import templates as T
+        return await T.get_buttons()
+    except Exception:
+        return []
+
+
+# ============================================================
 # RESOLVE
 # ============================================================
 
 async def resolve_target(client, text: str) -> Dict[str, Any]:
-    """Resolve a channel from text."""
-    out = {"ok": False, "chat_id": None, "title": "", "username": "",
-           "error": ""}
+    out = {"ok": False, "chat_id": None, "title": "",
+           "username": "", "error": ""}
     text = (text or "").strip()
     try:
         if text.startswith("@"):
@@ -194,10 +239,6 @@ async def resolve_target(client, text: str) -> Dict[str, Any]:
     return out
 
 
-# ============================================================
-# TEST SEND
-# ============================================================
-
 async def test_channel(client, chat_id: int) -> bool:
     try:
         from utils import fonts as F
@@ -219,5 +260,7 @@ async def test_channel(client, chat_id: int) -> bool:
 __all__ = [
     "add_channel", "list_channels", "get_channel",
     "update_channel", "remove_channel", "set_primary",
+    "set_caption", "set_buttons", "reset_overrides",
+    "effective_caption", "effective_buttons",
     "resolve_target", "test_channel",
 ]
