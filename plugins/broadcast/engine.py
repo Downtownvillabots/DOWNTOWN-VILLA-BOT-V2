@@ -8,7 +8,7 @@
 #   • Handle FloodWait
 #   • Skip blocked/deleted users
 #   • Track counters live
-#   • Auto-delete timer per message
+#   • Auto-delete timer per message (ALL KINDS)
 #   • Cancel support
 #
 # ============================================================
@@ -157,9 +157,8 @@ async def run_broadcast(
                         reply_markup=kb,
                     )
 
-                    # Auto-delete schedule
-                    if (autodelete_seconds > 0 and sent
-                        
+                    # Auto-delete schedule — works for ALL kinds
+                    if autodelete_seconds > 0 and sent:
                         try:
                             await BS.schedule_autodelete(
                                 tid, sent.id,
@@ -181,8 +180,8 @@ async def run_broadcast(
                             caption=caption,
                             reply_markup=kb,
                         )
-                        if (autodelete_seconds > 0 and sent
-                                and kind == "users"):
+                        # Auto-delete schedule — works for ALL kinds
+                        if autodelete_seconds > 0 and sent:
                             try:
                                 await BS.schedule_autodelete(
                                     tid, sent.id,
