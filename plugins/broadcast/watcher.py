@@ -220,8 +220,7 @@ if _FILTER is not None:
                 awaiting=None,
             )
 
-            await _render_main(client, uid, reply_to=message)
-
+            await _render_main(client, chat_id, reply_to=message)
         except Exception as e:
             logger.exception(f"[BC-C] watcher: {e}")
 
