@@ -159,7 +159,7 @@ async def run_broadcast(
 
                     # Auto-delete schedule
                     if (autodelete_seconds > 0 and sent
-                            and kind == "users"):
+                        
                         try:
                             await BS.schedule_autodelete(
                                 tid, sent.id,
