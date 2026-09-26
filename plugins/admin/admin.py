@@ -909,7 +909,7 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             from plugins.admin import broadcast_panel as BP
             fn = getattr(BP, "open_panel_for_admin", None)
             if fn is not None:
-                await fn(client, q.message)
+                await fn(client, q)
             else:
                 await q.answer("Broadcast panel unavailable", show_alert=True)
             return
