@@ -104,8 +104,9 @@ async def add_premium_user(
                     "expires_at": expires_at,
                     "notes": notes or "",
                     "status": "active",
+                    "reminders_sent": [],
                 },
-                "$setOnInsert": {"reminders_sent": []},
+                
             },
             upsert=True,
         )
