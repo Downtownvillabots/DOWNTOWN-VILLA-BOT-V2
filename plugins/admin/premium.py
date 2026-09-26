@@ -5,13 +5,8 @@
 # Admin-only management panel for premium users.
 # Opened from /admin → [💎 Premium] button.
 #
-# Follows the same conventions as databases.py:
-#   • Lives in plugins/admin/
-#   • Callback prefix: adm:pma_*
-#   • Handler group: -9520 (runs before main admin router)
-#   • Auto-discovered by admin/__init__.py
-#
-# Uses ONLY real DB fields from premium_users, watch_sessions.
+# Callback format: adm:pma:<action>[:args...]
+# Handler group: -9520 (runs before main admin router)
 #
 # ============================================================
 
@@ -31,13 +26,22 @@ from pyrogram.types import (
 from core import config
 from utils import fonts as F
 from utils import format as FM
-from utils import progress as P
 
 logger = logging.getLogger(__name__)
 
-PFX = "adm:pma"
+PREFIX = "adm:pma:"
+FILTER_REGEX = r"^adm:pma:"
 PAGE_SIZE = 8
 SESSION_TTL = 600.0
+
+
+# ============================================================
+# CALLBACK BUILDER
+# ============================================================
+
+def cb(action: str) -> str:
+    """Build a callback: cb('home') → 'adm:pma:home'"""
+    return PREFIX + str(action)
 
 
 # ============================================================
@@ -49,11 +53,6 @@ def _is_admin(uid) -> bool:
         return int(uid) in [int(a) for a in config.ADMINS]
     except Exception:
         return False
-
-
-def cb(*parts) -> str:
-    """Build an adm:pma_* callback string."""
-    return ":".join([PFX] + [str(p) for p in parts])
 
 
 # ============================================================
@@ -91,13 +90,9 @@ def _pending_drop(uid: int) -> None:
 
 async def _gather_stats() -> Dict[str, int]:
     out = {
-        "total": 0,
-        "active": 0,
-        "expiring_7d": 0,
-        "expiring_3d": 0,
-        "expired": 0,
+        "total": 0, "active": 0,
+        "expiring_7d": 0, "expiring_3d": 0, "expired": 0,
     }
-
     try:
         from plugins.premium import state as S
         counts = await S.count_users()
@@ -108,7 +103,6 @@ async def _gather_stats() -> Dict[str, int]:
         out["total"] = out["active"] + out["expired"]
     except Exception as e:
         logger.debug(f"[PMA] stats: {e}")
-
     return out
 
 
@@ -230,7 +224,6 @@ async def _render_user_list(filter_type: str, page: int) -> tuple:
     total = len(filtered)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
-
     chunk = filtered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     lines = [
@@ -274,7 +267,6 @@ async def _render_user_list(filter_type: str, page: int) -> tuple:
     lines.append(f"📄 {F.sc('page')} · <b>{page + 1}/{total_pages}</b>")
 
     rows: List[List[InlineKeyboardButton]] = []
-
     btn_row: List[InlineKeyboardButton] = []
     for u in chunk:
         uid = u.get("user_id", 0)
@@ -578,12 +570,10 @@ async def _do_search(query: str) -> tuple:
         q = q[1:]
 
     found = []
-
     try:
         from plugins.premium import state as S
         if q.isdigit():
-            uid = int(q)
-            user = await S.get_user(uid)
+            user = await S.get_user(int(q))
             if user:
                 found.append(user)
         else:
@@ -612,30 +602,7 @@ async def _do_search(query: str) -> tuple:
             ]]),
         )
 
-    if len(found) == 1:
-        return await _render_user(found[0].get("user_id"))
-
-    rows = []
-    for u in found[:10]:
-        uid = u.get("user_id", 0)
-        uname = u.get("username") or str(uid)
-        rows.append([InlineKeyboardButton(
-            f"👤 @{uname}",
-            callback_data=cb(f"user:{uid}"),
-        )])
-    rows.append([InlineKeyboardButton(
-        f"🏠 {F.sc('home')}",
-        callback_data=cb("home"),
-    )])
-
-    return (
-        "\n".join([
-            f"🔍 <b>{F.fb('RESULTS')}</b>",
-            F.DIV, "",
-            f"📊 <b>{len(found)}</b> matches",
-        ]),
-        InlineKeyboardMarkup(rows),
-    )
+    return await _render_user(found[0].get("user_id"))
 
 
 # ============================================================
@@ -655,21 +622,24 @@ async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
 
 
 # ============================================================
-# ROUTER (group -9520 — before main admin router)
+# ROUTER
 # ============================================================
 
 @Client.on_callback_query(
-    filters.regex(rf"^{PFX}"), group=-9520,
+    filters.regex(FILTER_REGEX), group=-9520,
 )
 async def premium_admin_router(client: Client, q: CallbackQuery):
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("⛔ Admins only", show_alert=True)
 
-    parts = str(q.data).split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    # strip the "pma_" prefix to get the raw action
-    if action.startswith("pma_"):
-        action = action[4:]
+    data = str(q.data or "")
+    if not data.startswith(PREFIX):
+        return await q.answer("❌ invalid")
+
+    rest = data[len(PREFIX):]           # e.g. "list:all:0"
+    parts = rest.split(":")
+    action = parts[0] if parts else ""
+    args = parts[1:]                    # e.g. ["all", "0"]
 
     try:
         # ── CLOSE ──
@@ -692,9 +662,9 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
 
         # ── LIST ──
         if action == "list":
-            filter_type = parts[2] if len(parts) > 2 else "all"
+            filter_type = args[0] if args else "all"
             try:
-                page = int(parts[3]) if len(parts) > 3 else 0
+                page = int(args[1]) if len(args) > 1 else 0
             except ValueError:
                 page = 0
             text, kb = await _render_user_list(filter_type, page)
@@ -704,7 +674,7 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
         # ── USER DETAIL ──
         if action == "user":
             try:
-                uid = int(parts[2])
+                uid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌ invalid id", show_alert=True)
             text, kb = await _render_user(uid)
@@ -714,7 +684,7 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
         # ── EXTEND MENU ──
         if action == "extend":
             try:
-                uid = int(parts[2])
+                uid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌", show_alert=True)
             text, kb = await _render_extend(uid)
@@ -724,8 +694,8 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
         # ── EXTEND DO ──
         if action == "extend_do":
             try:
-                uid = int(parts[2])
-                months = int(parts[3])
+                uid = int(args[0])
+                months = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌", show_alert=True)
 
@@ -740,10 +710,10 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
                     added_by=q.from_user.id,
                     notes="extended via admin panel",
                 )
-                if ok:
-                    await q.answer(f"✅ Extended by {months} months")
-                else:
-                    await q.answer("❌ Extend failed", show_alert=True)
+                await q.answer(
+                    f"✅ Extended by {months} months" if ok
+                    else "❌ Extend failed"
+                )
             except Exception as e:
                 logger.exception(f"[PMA] extend: {e}")
                 return await q.answer(
@@ -757,7 +727,7 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
         # ── RESET REMINDERS ──
         if action == "reset_rem":
             try:
-                uid = int(parts[2])
+                uid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌", show_alert=True)
 
@@ -780,10 +750,10 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
-        # ── REMOVE (confirm) ──
+        # ── REMOVE (confirm screen) ──
         if action == "remove":
             try:
-                uid = int(parts[2])
+                uid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌", show_alert=True)
             text, kb = await _render_confirm_remove(uid)
@@ -793,17 +763,14 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
         # ── REMOVE DO ──
         if action == "remove_do":
             try:
-                uid = int(parts[2])
+                uid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌", show_alert=True)
 
             try:
                 from plugins.premium import state as S
                 ok = await S.remove_user(uid)
-                if ok:
-                    await q.answer("🗑️ Removed")
-                else:
-                    await q.answer("⚠️ Not found")
+                await q.answer("🗑️ Removed" if ok else "⚠️ Not found")
             except Exception as e:
                 logger.exception(f"[PMA] remove: {e}")
                 return await q.answer("❌ failed", show_alert=True)
@@ -812,14 +779,14 @@ async def premium_admin_router(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
-        # ── SEARCH PROMPT ──
+        # ── SEARCH ──
         if action == "search":
             _pending_set(q.from_user.id, kind="search")
             text, kb = await _render_search_prompt()
             await _safe_edit(q, text, kb)
             return await q.answer()
 
-        return await q.answer("❓ Unknown")
+        return await q.answer(f"❓ Unknown action: {action}")
 
     except Exception as e:
         logger.exception(f"[PMA] router: {e}")
@@ -853,18 +820,14 @@ async def premium_admin_text_input(client: Client, message: Message):
 
         if text == "-" or not text:
             t, k = await _render_main()
-            await message.reply_text(
-                t, reply_markup=k,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
         else:
             t, k = await _do_search(text)
-            await message.reply_text(
-                t, reply_markup=k,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+
+        await message.reply_text(
+            t, reply_markup=k,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
         try:
             message.stop_propagation()
@@ -878,10 +841,13 @@ async def premium_admin_text_input(client: Client, message: Message):
 # ============================================================
 
 async def open_panel_for_admin(client: Client, message: Message) -> None:
-    """Called from /admin → [💎 Premium]."""
-    if not message.from_user or not _is_admin(message.from_user.id):
-        return
-
+    """
+    Called from /admin → [💎 Premium].
+    
+    NOTE: auth is already verified by admin_router — we do NOT check
+    message.from_user here (which would be the bot, since the admin
+    panel message was sent by the bot).
+    """
     text, kb = await _render_main()
 
     try:
