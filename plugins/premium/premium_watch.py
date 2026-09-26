@@ -52,6 +52,38 @@ def _is_admin(uid) -> bool:
     except Exception:
         return False
 
+async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
+    """
+    Edit either a text or a photo message safely.
+    Photo messages require edit_caption; text uses edit_text.
+    """
+    msg = q.message
+    is_media = bool(
+        getattr(msg, "photo", None)
+        or getattr(msg, "video", None)
+        or getattr(msg, "document", None)
+        or getattr(msg, "animation", None)
+    )
+
+    try:
+        if is_media:
+            await msg.edit_caption(
+                caption=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await msg.edit_text(
+                text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+    except Exception as e:
+        err = str(e).lower()
+        if "not modified" not in err:
+            logger.debug(f"[PREM] safe_edit: {e}")
+
 
 # ============================================================
 # COMMAND
