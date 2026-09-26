@@ -233,6 +233,14 @@ async def _start_all_loops(bot) -> None:
     except Exception as e:
         logger.debug(f"[BOOT] flow cleanup: {e}")
 
+    # ── Media search sessions cleanup ──
+    try:
+        from media_search import sessions as _sess_mod
+        _sess_mod.ensure_cleanup(interval=120)
+        started.append("sessions")
+    except Exception as e:
+        logger.debug(f"[BOOT] sessions cleanup: {e}")
+
     # ── Backup watcher + autodelete ──
     try:
         from plugins.backup import watcher as W
