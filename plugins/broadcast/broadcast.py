@@ -672,6 +672,23 @@ async def _build_channel_view(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
             f"🧪 {F.sc('test')}",
             callback_data=f"{PFX}:ch_test:{chat_id}",
         )],
+                # ── NEW: per-channel caption + buttons editors ──
+        [
+            InlineKeyboardButton(
+                f"📝 {F.sc('caption')} · "
+                f"{'custom' if ch.get('caption') is not None else 'default'}",
+                callback_data=f"{PFX}:ch_cap:{chat_id}",
+            ),
+            InlineKeyboardButton(
+                f"🔘 {F.sc('buttons')} · "
+                f"{'custom' if ch.get('buttons') is not None else 'default'}",
+                callback_data=f"{PFX}:ch_btn:{chat_id}",
+            ),
+        ],
+        [InlineKeyboardButton(
+            f"♻️ {F.sc('reset overrides')}",
+            callback_data=f"{PFX}:ch_reset:{chat_id}",
+        )],
         [InlineKeyboardButton(
             f"🗑️ {F.sc('remove')}",
             callback_data=f"{PFX}:ch_confirm_rm:{chat_id}",
@@ -1007,6 +1024,322 @@ async def broadcast_router(client: Client, q: CallbackQuery):
             await q.answer(f"❌ {type(e).__name__}", show_alert=True)
         except Exception:
             pass
+
+
+# ============================================================
+# PER-CHANNEL CAPTION EDITOR
+# ============================================================
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_cap:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_cap(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+
+    from plugins.broadcast import channels as CH
+    cid = int(q.matches[0].group(1))
+    ch = await CH.get_channel(cid)
+    if not ch:
+        return await q.answer("⚠️ channel not found", show_alert=True)
+
+    cap = ch.get("caption")
+    cap_disp = "(using global default)" if cap is None else (cap or "(empty)")
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📝 <b>{F.fb('CHANNEL CAPTION')}</b>",
+        F.DIV, "",
+        f"📢 {F.sc('channel')} · <b>{F.sc(str(ch.get('title'))[:50])}</b>",
+        "",
+        F.DIV_S,
+        f"<b>{F.sc('current')}:</b>",
+        f"<code>{cap_disp}</code>",
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('placeholders')}:",
+        f"<code>{{file_name}}</code> <code>{{file_size}}</code>",
+        f"<code>{{year}}</code> <code>{{rating}}</code>",
+    ])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"✏️ {F.sc('set custom caption')}",
+            callback_data=f"{PFX}:ch_cap_set:{cid}",
+        )],
+        [InlineKeyboardButton(
+            f"📚 {F.sc('load template')}",
+            callback_data=f"{PFX}:ch_cap_tpl:{cid}",
+        )],
+        [InlineKeyboardButton(
+            f"♻️ {F.sc('reset to default')}",
+            callback_data=f"{PFX}:ch_cap_rst:{cid}",
+        )],
+        [
+            InlineKeyboardButton(
+                f"⬅️ {F.sc('back')}",
+                callback_data=f"{PFX}:ch_view:{cid}",
+            ),
+            InlineKeyboardButton(
+                f"❌ {F.sc('close')}",
+                callback_data=f"{PFX}:close",
+            ),
+        ],
+    ])
+
+    await _safe_edit(q, text, kb)
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_cap_set:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_cap_set(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    cid = int(q.matches[0].group(1))
+    _new_setup(q.from_user.id, "ch_cap_edit", chat_id=cid)
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"✏️ <b>{F.fb('SET CHANNEL CAPTION')}</b>",
+        F.DIV, "",
+        f"📌 {F.sc('send the new caption as next message')}",
+        f"📌 {F.sc('send')} <code>-</code> {F.sc('for empty')}",
+    ])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"❌ {F.sc('cancel')}",
+            callback_data=f"{PFX}:ch_cap:{cid}",
+        ),
+    ]])
+    await _safe_edit(q, text, kb)
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_cap_rst:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_cap_rst(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    cid = int(q.matches[0].group(1))
+    await CH.set_caption(cid, None)
+    await q.answer("♻️ reset")
+    # Re-render
+    text, kb = await _build_channel_view(cid)
+    await _safe_edit(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_cap_tpl:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_cap_tpl(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import templates as T
+    cid = int(q.matches[0].group(1))
+    rows = []
+    for name in T.CAPTION_TEMPLATES.keys():
+        rows.append([InlineKeyboardButton(
+            f"📝 {name.upper()}",
+            callback_data=f"{PFX}:ch_cap_use:{cid}:{name}",
+        )])
+    rows.append([InlineKeyboardButton(
+        f"⬅️ {F.sc('back')}",
+        callback_data=f"{PFX}:ch_cap:{cid}",
+    )])
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📚 <b>{F.fb('LOAD TEMPLATE')}</b>",
+        F.DIV, "",
+        f"📌 {F.sc('pick a template for this channel')}",
+    ])
+    await _safe_edit(q, text, InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_cap_use:(-?\d+):(\w+)$"), group=-8300,
+)
+async def cb_ch_cap_use(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    from plugins.broadcast import templates as T
+    cid = int(q.matches[0].group(1))
+    name = q.matches[0].group(2)
+    tpl = T.CAPTION_TEMPLATES.get(name)
+    if not tpl:
+        return await q.answer("⚠️ not found", show_alert=True)
+    await CH.set_caption(cid, tpl)
+    await q.answer(f"✅ loaded {name}")
+    text, kb = await _build_channel_view(cid)
+    await _safe_edit(q, text, kb)
+
+
+# ============================================================
+# PER-CHANNEL BUTTONS EDITOR
+# ============================================================
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_btn:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_btn(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    from plugins.broadcast import templates as T
+    cid = int(q.matches[0].group(1))
+    ch = await CH.get_channel(cid)
+    if not ch:
+        return await q.answer("⚠️ not found", show_alert=True)
+
+    custom = ch.get("buttons")
+    using_default = custom is None
+    btns = (await T.get_buttons()) if using_default else custom
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔘 <b>{F.fb('CHANNEL BUTTONS')}</b>",
+        F.DIV, "",
+        f"📢 {F.sc('channel')} · <b>{F.sc(str(ch.get('title'))[:50])}</b>",
+        "",
+        f"📌 {F.sc('source')} · "
+        + ("🌐 global default" if using_default else "🔘 custom"),
+        "",
+        F.DIV_S,
+    ]
+
+    if not btns:
+        lines.append(f"⚪ {F.sc('no buttons')}")
+    else:
+        for i, b in enumerate(btns, 1):
+            lines.append(f"{i}. <b>{F.sc(str(b.get('name'))[:40])}</b>")
+            lines.append(f"   <code>{str(b.get('url'))[:60]}</code>")
+
+    rows = []
+    if using_default:
+        rows.append([InlineKeyboardButton(
+            f"✏️ {F.sc('create custom')}",
+            callback_data=f"{PFX}:ch_btn_custom:{cid}",
+        )])
+    else:
+        for i, b in enumerate(btns, 1):
+            rows.append([InlineKeyboardButton(
+                f"🗑️ {i}. {str(b.get('name'))[:30]}",
+                callback_data=f"{PFX}:ch_btn_rm:{cid}:{i-1}",
+            )])
+        rows.append([InlineKeyboardButton(
+            f"➕ {F.sc('add button')}",
+            callback_data=f"{PFX}:ch_btn_add:{cid}",
+        )])
+        rows.append([InlineKeyboardButton(
+            f"♻️ {F.sc('reset to default')}",
+            callback_data=f"{PFX}:ch_btn_rst:{cid}",
+        )])
+
+    rows.append([
+        InlineKeyboardButton(
+            f"⬅️ {F.sc('back')}",
+            callback_data=f"{PFX}:ch_view:{cid}",
+        ),
+        InlineKeyboardButton(
+            f"❌ {F.sc('close')}",
+            callback_data=f"{PFX}:close",
+        ),
+    ])
+
+    await _safe_edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_btn_custom:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_btn_custom(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    cid = int(q.matches[0].group(1))
+    await CH.set_buttons(cid, [])
+    await q.answer("✏️ empty custom list created")
+    text, kb = await _build_channel_view(cid)
+    await _safe_edit(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_btn_rst:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_btn_rst(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    cid = int(q.matches[0].group(1))
+    await CH.set_buttons(cid, None)
+    await q.answer("♻️ reset")
+    text, kb = await _build_channel_view(cid)
+    await _safe_edit(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_btn_add:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_btn_add(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    cid = int(q.matches[0].group(1))
+    _new_setup(q.from_user.id, "ch_btn_add", chat_id=cid)
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"➕ <b>{F.fb('ADD CHANNEL BUTTON')}</b>",
+        F.DIV, "",
+        f"📌 {F.sc('send')} <code>Name | URL</code>",
+    ])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"❌ {F.sc('cancel')}",
+            callback_data=f"{PFX}:ch_btn:{cid}",
+        ),
+    ]])
+    await _safe_edit(q, text, kb)
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_btn_rm:(-?\d+):(\d+)$"), group=-8300,
+)
+async def cb_ch_btn_rm(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    cid = int(q.matches[0].group(1))
+    idx = int(q.matches[0].group(2))
+    ch = await CH.get_channel(cid)
+    if not ch or ch.get("buttons") is None:
+        return await q.answer("⚠️ not found", show_alert=True)
+    btns = list(ch["buttons"])
+    if idx < 0 or idx >= len(btns):
+        return await q.answer("⚠️ invalid index", show_alert=True)
+    btns.pop(idx)
+    await CH.set_buttons(cid, btns)
+    await q.answer("🗑️ removed")
+    text, kb = await _build_channel_view(cid)
+    await _safe_edit(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ch_reset:(-?\d+)$"), group=-8300,
+)
+async def cb_ch_reset(client, q):
+    if not q.from_user or not _is_admin(q.from_user.id):
+        return await q.answer("❌", show_alert=True)
+    from plugins.broadcast import channels as CH
+    cid = int(q.matches[0].group(1))
+    await CH.reset_overrides(cid)
+    await q.answer("♻️ overrides cleared")
+    text, kb = await _build_channel_view(cid)
+    await _safe_edit(q, text, kb)
 
 
 # ============================================================
