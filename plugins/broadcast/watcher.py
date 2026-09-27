@@ -1279,13 +1279,13 @@ async def _run_single_channel(
 
     mode = s.get("caption_mode", "auto")
     if mode == "custom" and s.get("custom_caption") is not None:
-        cap = s["custom_caption"]
+        cap = _clean_caption(s["custom_caption"])
     elif mode == "keep":
         cap = s.get("original_caption") or ""
     elif mode == "none":
         cap = ""
     elif ch_cap is not None:
-        cap = ch_cap
+        cap = _clean_caption(ch_cap)
     else:
         from plugins.broadcast import templates as T
         cap = await T.get_caption()
