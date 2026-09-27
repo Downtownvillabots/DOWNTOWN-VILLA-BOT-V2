@@ -1,21 +1,11 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — BROADCAST CENTER (FINAL — FULL)
+# 🏨 DOWNTOWN VILLA — BROADCAST CENTER (FIXED)
 # ============================================================
 #
 # Two entry points:
-#   1. Upload file to BROADCAST_CHANNEL_ID
-#   2. /broadcast in PM → pick recent file from channel
-#
-# Full customization:
-#   • Per-channel caption (edit/keep/global/none)
-#   • Per-channel buttons (custom/global/add/remove)
-#   • Timer for channels/groups/users (never/1d/3d/7d/30d)
-#   • Send to all channels (each with own caption)
-#   • Send to all groups / selected
-#   • Send to all users / premium only
-#   • Preview, live progress, final report
-#   • Session TTL = 24 hours
-#   • Session keyed by chat_id (channel + PM both work)
+#   1. Upload file to BROADCAST_CHANNEL_ID → watcher saves to DB
+#   2. /broadcast in PM  OR  /admin → 📢 Broadcast
+#      → reads recent files from DB (bots CANNOT use get_chat_history)
 #
 # ============================================================
 
@@ -42,11 +32,13 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# SESSION STATE — keyed by chat_id, 24h TTL
+# SESSION STATE
 # ============================================================
 
 _sessions: Dict[int, Dict[str, Any]] = {}
 SESSION_TTL = 86400.0
+
+SOURCES_COLL = "broadcast_sources"
 
 
 def _s_set(key: int, **data) -> None:
@@ -79,7 +71,58 @@ def _s_drop(key: int) -> None:
 
 
 # ============================================================
-# TIMER PRESETS
+# SOURCES DB (bot-safe replacement for get_chat_history)
+# ============================================================
+
+def _src_coll():
+    try:
+        from database import db_registry
+        db = db_registry.get_system_db()
+        if db is None:
+            return None
+        return db[SOURCES_COLL]
+    except Exception:
+        return None
+
+
+async def _save_source(
+    message_id: int, chat_id: int, name: str,
+) -> None:
+    c = _src_coll()
+    if c is None:
+        return
+    try:
+        await c.update_one(
+            {"message_id": int(message_id), "chat_id": int(chat_id)},
+            {"$set": {
+                "message_id": int(message_id),
+                "chat_id": int(chat_id),
+                "name": (name or "file")[:80],
+                "created_at": time.time(),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        logger.debug(f"[BC] save source: {e}")
+
+
+async def _list_sources(limit: int = 10) -> List[Dict[str, Any]]:
+    c = _src_coll()
+    if c is None:
+        return []
+    try:
+        cursor = c.find({}).sort("created_at", -1).limit(int(limit))
+        docs = await cursor.to_list(length=int(limit))
+        for d in docs:
+            d.pop("_id", None)
+        return docs
+    except Exception as e:
+        logger.warning(f"[BC] list sources: {e}")
+        return []
+
+
+# ============================================================
+# TIMERS
 # ============================================================
 
 TIMERS = [
@@ -175,7 +218,7 @@ async def _count_users() -> int:
 
 
 # ============================================================
-# WATCHER — fires on upload to BROADCAST_CHANNEL_ID
+# WATCHER — upload to BROADCAST_CHANNEL_ID
 # ============================================================
 
 def _channel_filter():
@@ -194,12 +237,18 @@ if _FILTER is not None:
     async def bc_channel_watcher(client: Client, message: Message):
         try:
             key = int(message.chat.id)
+            name = _extract_name(message)
+
+            # Save to DB so /broadcast and /admin can find it later
+            await _save_source(
+                int(message.id), int(message.chat.id), name,
+            )
 
             _s_set(
                 key,
                 source_chat_id=key,
                 source_msg_id=int(message.id),
-                source_name=_extract_name(message),
+                source_name=name,
                 original_caption=message.caption or "",
                 caption_mode="auto",
                 custom_caption=None,
@@ -216,7 +265,7 @@ if _FILTER is not None:
 
 
 # ============================================================
-# /broadcast COMMAND (PM)
+# /broadcast COMMAND (PM) — reads sources from DB
 # ============================================================
 
 @Client.on_message(
@@ -236,22 +285,9 @@ async def bc_cmd(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
         )
 
-    try:
-        msgs = []
-        async for m in client.get_chat_history(ch, limit=40):
-            if m.media and not m.service:
-                msgs.append(m)
-            if len(msgs) >= 10:
-                break
-    except Exception as e:
-        logger.exception(f"[BC-PM] fetch: {e}")
-        return await message.reply_text(
-            f"{F.EMO['cross']} {F.sc('cannot read channel')}\n"
-            f"<code>{type(e).__name__}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-
-    if not msgs:
+    # ✅ DB read (bots cannot use get_chat_history)
+    docs = await _list_sources(limit=10)
+    if not docs:
         return await message.reply_text(
             "\n".join([
                 f"{F.EMO['warn']} <b>{F.fb('NO FILES')}</b>",
@@ -262,7 +298,8 @@ async def bc_cmd(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
         )
 
-    src_list = [(int(m.id), _extract_name(m)) for m in msgs]
+    src_list = [(int(d["message_id"]), d.get("name") or "file")
+                for d in docs]
 
     _s_set(
         key,
@@ -400,7 +437,6 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
     ])
 
     return text, kb
-
 
 
 # ============================================================
@@ -861,7 +897,6 @@ async def bc_router(client: Client, q: CallbackQuery):
     parts = str(q.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
 
-    # ── CANCEL works without session ──
     if action == "cancel":
         _s_drop(key)
         try:
@@ -877,7 +912,6 @@ async def bc_router(client: Client, q: CallbackQuery):
         )
 
     try:
-        # ── HOME ──
         if action == "home":
             s["_ch_count"] = await _count_channels()
             s["_group_count"] = await _count_groups()
@@ -886,7 +920,6 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer()
 
-        # ── SOURCE PICK ──
         if action == "src":
             idx = int(parts[2]) if len(parts) > 2 else 0
             srcs = s.get("source_list") or []
@@ -915,7 +948,6 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer("✅ source loaded")
 
-        # ── CHANNELS ──
         if action == "channels":
             return await _show_channels(q, key)
 
@@ -989,7 +1021,6 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer()
 
-        # ── GROUPS ──
         if action == "groups":
             return await _show_groups(q, key)
 
@@ -1009,7 +1040,6 @@ async def bc_router(client: Client, q: CallbackQuery):
             gid = int(parts[2]) if len(parts) > 2 else 0
             return await _run_single_group(client, q, key, gid)
 
-        # ── USERS ──
         if action == "users":
             return await _show_users(q, key)
 
@@ -1021,12 +1051,10 @@ async def bc_router(client: Client, q: CallbackQuery):
         if action == "us_go":
             return await _run_users(client, q, key)
 
-        # ── MAIN TIMER ──
         if action == "main_timer":
             _s_upd(key, timer_context="main")
             return await _show_timer(q, key, "general")
 
-        # ── TIMER SET ──
         if action == "timer_set":
             secs = int(parts[2]) if len(parts) > 2 else 0
             ctx = ":".join(parts[3:]) if len(parts) > 3 else ""
@@ -1059,7 +1087,6 @@ async def bc_router(client: Client, q: CallbackQuery):
 
             return await _show_timer(q, key, ctx or "general")
 
-        # ── CAPTION ──
         if action == "cap":
             return await _show_caption(q, key)
 
@@ -1120,11 +1147,9 @@ async def bc_router(client: Client, q: CallbackQuery):
             _s_upd(key, caption_mode="none", custom_caption=None)
             return await _show_channel_editor(q, key, cid)
 
-        # ── PREVIEW ──
         if action == "preview":
             return await _show_preview(q, key)
 
-        # ── STOP ──
         if action == "stop":
             from plugins.broadcast import engine as E
             ok = E.cancel()
@@ -1674,7 +1699,7 @@ async def _render_done(
 
 
 # ============================================================
-# TEXT INPUT (caption entry + channel button add)
+# TEXT INPUT
 # ============================================================
 
 @Client.on_message(
@@ -1758,14 +1783,11 @@ async def bc_text_input(client: Client, message: Message):
 
 
 # ============================================================
-# ADMIN PANEL ENTRY — open flow in admin's PM
+# ADMIN PANEL ENTRY — reads sources from DB
 # ============================================================
 
 async def bc_open_for_admin(client: Client, user_id: int) -> None:
-    """
-    Called from /admin → [📢 Broadcast].
-    Sends the source picker to the admin's PM.
-    """
+    """Called from /admin → [📢 Broadcast]. Sends picker to PM."""
     key = int(user_id)
 
     ch = getattr(config, "BROADCAST_CHANNEL_ID", None)
@@ -1782,29 +1804,10 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
             pass
         return
 
-    try:
-        msgs = []
-        async for m in client.get_chat_history(ch, limit=40):
-            if m.media and not m.service:
-                msgs.append(m)
-            if len(msgs) >= 10:
-                break
-    except Exception as e:
-        logger.exception(f"[BC-ADMIN] fetch: {e}")
-        try:
-            await client.send_message(
-                chat_id=user_id,
-                text=(
-                    f"{F.EMO['cross']} {F.sc('cannot read channel')}\n"
-                    f"<code>{type(e).__name__}</code>"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        return
+    # ✅ DB read — bots CANNOT use get_chat_history
+    docs = await _list_sources(limit=10)
 
-    if not msgs:
+    if not docs:
         try:
             await client.send_message(
                 chat_id=user_id,
@@ -1820,7 +1823,8 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
             pass
         return
 
-    src_list = [(int(m.id), _extract_name(m)) for m in msgs]
+    src_list = [(int(d["message_id"]), d.get("name") or "file")
+                for d in docs]
 
     _s_set(
         key,
@@ -1858,6 +1862,7 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
     except Exception as e:
         logger.exception(f"[BC-ADMIN] send: {e}")
 
+
 # ============================================================
 # PUBLIC
 # ============================================================
@@ -1869,4 +1874,4 @@ def snapshot() -> Dict[str, Any]:
     }
 
 
-__all__ = ["snapshot"]
+__all__ = ["snapshot", "bc_open_for_admin"]
