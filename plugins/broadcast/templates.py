@@ -3,6 +3,7 @@
 # ============================================================
 #
 # Caption + button templates (global + per-channel).
+# Cleans links, @mentions, t.me URLs before sending.
 #
 # Global default stored in SYSTEM DB → broadcast_settings
 #
@@ -11,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -128,11 +130,58 @@ async def set_buttons(buttons: List[Dict[str, Any]]) -> bool:
 
 
 # ============================================================
+# CAPTION CLEANER
+# ============================================================
+
+def clean_caption(text: str) -> str:
+    """
+    Remove all links, @mentions, t.me URLs from text.
+    Keeps plain text keywords + emojis.
+    """
+    if not text:
+        return ""
+
+    # 1. Remove http/https URLs
+    text = re.sub(r"https?://\S+", "", text)
+
+    # 2. Remove bare t.me links
+    text = re.sub(r"\bt\.me/\S+", "", text)
+
+    # 3. Remove telegram invite links
+    text = re.sub(r"\bjoinchat/\S+", "", text)
+    text = re.sub(r"\btelegram\.me/\S+", "", text)
+    text = re.sub(r"\btelegram\.dog/\S+", "", text)
+
+    # 4. Remove @username mentions
+    text = re.sub(r"@[A-Za-z0-9_]{3,}", "", text)
+
+    # 5. Remove join keyword spam lines like "JOIN: ..." or "JOIN CHANNEL"
+    text = re.sub(
+        r"(?im)^\s*(join|subscribe|click here|join now|join us)\s*[:.\-]?\s*.*$",
+        "",
+        text,
+    )
+
+    # 6. Remove empty brackets / leftover artifacts
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"\[\s*\]", "", text)
+    text = re.sub(r"<\s*>", "", text)
+
+    # 7. Collapse excess whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = text.strip()
+
+    return text
+
+
+# ============================================================
 # BUILD CAPTION
 # ============================================================
 
 def build_caption(message, template: str) -> str:
-    """Render a caption for a message using template."""
+    """Render a caption for a message using template + clean it."""
     try:
         file_name = "file"
         file_size_str = "0 B"
@@ -151,19 +200,26 @@ def build_caption(message, template: str) -> str:
                 break
 
         year = ""
-        import re
         mm = re.search(r"\b(19[3-9]\d|20[0-4]\d)\b", file_name)
         if mm:
             year = mm.group(1)
 
-        return template.format(
+        rendered = template.format(
             file_name=file_name[:100],
             file_size=file_size_str,
             rating="—",
             year=year or "—",
-            file_caption=file_caption[:200] if file_caption else "—",
+            file_caption=clean_caption(file_caption)[:200]
+            if file_caption else "—",
         )
-    except Exception:
+
+        # Final cleaning pass on the rendered caption
+        rendered = clean_caption(rendered)
+
+        return rendered
+
+    except Exception as e:
+        logger.warning(f"[BC-TPL] build_caption: {e}")
         return template
 
 
@@ -209,5 +265,5 @@ def build_buttons_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMa
 __all__ = [
     "DEFAULT_CAPTION", "CAPTION_TEMPLATES",
     "get_caption", "set_caption", "get_buttons", "set_buttons",
-    "build_caption", "build_buttons_kb",
+    "build_caption", "build_buttons_kb", "clean_caption",
 ]
