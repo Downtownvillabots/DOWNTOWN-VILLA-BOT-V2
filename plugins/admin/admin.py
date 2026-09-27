@@ -906,13 +906,14 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             return
 
         if module == "broadcast":
-            from plugins.admin import broadcast_panel as BP
-            fn = getattr(BP, "open_panel_for_admin", None)
-            if fn is not None:
-                await fn(client, q)
-            else:
-                await q.answer("Broadcast unavailable", show_alert=True)
+            from plugins.broadcast import watcher as W
+            if q.from_user:
+                await W.bc_open_for_admin(client, q.from_user.id)
+                await q.answer("📢 Opening in PM…")
             return
+
+        
+            
 
         if module == "premium":
             from plugins.admin import premium as PA
