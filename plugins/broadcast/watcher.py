@@ -210,6 +210,38 @@ def _clean_caption(text: str) -> str:
 
 
 # ============================================================
+# DEBOUNCE — batch multiple rapid uploads into one panel
+# ============================================================
+
+_debounce: Dict[int, int] = {}
+
+
+async def _debounced_show(message: Message, key: int, msg_id: int) -> None:
+    """Wait 2.5s. If no newer file came, show the panel."""
+    await asyncio.sleep(2.5)
+    if _debounce.get(key) != msg_id:
+        return
+
+    name = _extract_name(message)
+
+    _s_set(
+        key,
+        source_chat_id=int(message.chat.id),
+        source_msg_id=int(message.id),
+        source_name=name,
+        original_caption=_clean_caption(message.caption or ""),
+        caption_mode="auto",
+        custom_caption=None,
+        timer_secs=0,
+        user_filter="all",
+        timer_context=None,
+        awaiting=None,
+    )
+
+    await _show_main(message, key)
+
+
+# ============================================================
 # COUNTS
 # ============================================================
 
@@ -270,26 +302,15 @@ if _FILTER is not None:
             key = int(message.chat.id)
             name = _extract_name(message)
 
-            # Save to DB so /broadcast and /admin can find it later
             await _save_source(
                 int(message.id), int(message.chat.id), name,
             )
 
-            _s_set(
-                key,
-                source_chat_id=key,
-                source_msg_id=int(message.id),
-                source_name=name,
-                original_caption=_clean_caption(message.caption or ""),
-                caption_mode="auto",
-                custom_caption=None,
-                timer_secs=0,
-                user_filter="all",
-                timer_context=None,
-                awaiting=None,
+            # Debounce: only last file in a batch shows the panel
+            _debounce[key] = int(message.id)
+            asyncio.create_task(
+                _debounced_show(message, key, int(message.id))
             )
-
-            await _show_main(message, key)
 
         except Exception as e:
             logger.exception(f"[BC] watcher: {e}")
@@ -397,7 +418,10 @@ async def _show_main(reply_to: Message, key: int) -> None:
 
 
 def _main_text_kb(s: Dict[str, Any]) -> tuple:
-    name = (s.get("source_name") or "file")[:40]
+    if s.get("use_all") and s.get("source_list"):
+        name = f"{len(s['source_list'])} FILES"
+    else:
+        name = (s.get("source_name") or "file")[:40]
     cap_mode = s.get("caption_mode", "auto")
     cap_icon = {
         "auto": "🌐 global",
@@ -461,6 +485,16 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
         ],
         [
             InlineKeyboardButton(
+                f"📦 {F.sc('sources')}",
+                callback_data=_cb("sources"),
+            ),
+            InlineKeyboardButton(
+                f"🚀 {F.sc('send all')}",
+                callback_data=_cb("multi_all"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 f"❌ {F.sc('cancel')}",
                 callback_data=_cb("cancel"),
             ),
@@ -468,6 +502,47 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
     ])
 
     return text, kb
+
+   
+
+async def _show_multi_source(key: int) -> Optional[tuple]:
+    """Show all recent files as a picker."""
+    docs = await _list_sources(limit=10)
+    if not docs:
+        return None
+
+    if len(docs) == 1:
+        return None
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📦 <b>{F.fb('SELECT SOURCE')}</b>",
+        F.DIV, "",
+        f"📊 {F.sc('files ready')} · <b>{len(docs)}</b>",
+        "",
+        f"📌 {F.sc('pick one file OR use all')}",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"📦 {F.sc('USE ALL')} ({len(docs)} {F.sc('files')})",
+            callback_data=_cb("multi_all"),
+        )],
+    ]
+
+    for i, d in enumerate(docs, 1):
+        name = (d.get("name") or "file")[:32]
+        rows.append([InlineKeyboardButton(
+            f"{i}. {name}",
+            callback_data=_cb(f"multi_one:{i-1}"),
+        )])
+
+    rows.append([InlineKeyboardButton(
+        f"❌ {F.sc('cancel')}",
+        callback_data=_cb("cancel"),
+    )])
+
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ============================================================
@@ -951,6 +1026,62 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer()
 
+        if action == "multi_all":
+            docs = await _list_sources(limit=10)
+            if not docs:
+                return await q.answer("no files", show_alert=True)
+            srcs = [
+                (int(d["message_id"]), d.get("name") or "file")
+                for d in docs
+            ]
+            _s_upd(key, source_list=srcs, use_all=True)
+
+            s2 = _s_get(key) or {}
+            s2["_ch_count"] = await _count_channels()
+            s2["_group_count"] = await _count_groups()
+            s2["_user_count"] = await _count_users()
+            text, kb = _main_text_kb(s2)
+            await _edit(q, text, kb)
+            return await q.answer(f"✅ {len(srcs)} files loaded")
+
+        if action == "multi_one":
+            idx = int(parts[2]) if len(parts) > 2 else 0
+            docs = await _list_sources(limit=10)
+            if idx < 0 or idx >= len(docs):
+                return await q.answer("invalid", show_alert=True)
+            d = docs[idx]
+            ch_id = int(getattr(config, "BROADCAST_CHANNEL_ID", 0))
+
+            _s_upd(
+                key,
+                source_chat_id=ch_id,
+                source_msg_id=int(d["message_id"]),
+                source_name=d.get("name") or "file",
+                original_caption="",
+                caption_mode="auto",
+                custom_caption=None,
+                timer_secs=0,
+                user_filter="all",
+                source_list=None,
+                use_all=False,
+            )
+
+            s2 = _s_get(key) or {}
+            s2["_ch_count"] = await _count_channels()
+            s2["_group_count"] = await _count_groups()
+            s2["_user_count"] = await _count_users()
+            text, kb = _main_text_kb(s2)
+            await _edit(q, text, kb)
+            return await q.answer("✅ file loaded")
+
+        if action == "sources":
+            res = await _show_multi_source(key)
+            if not res:
+                return await q.answer("only 1 file", show_alert=True)
+            text, kb = res
+            await _edit(q, text, kb)
+            return await q.answer()
+
         if action == "src":
             idx = int(parts[2]) if len(parts) > 2 else 0
             srcs = s.get("source_list") or []
@@ -1297,15 +1428,22 @@ async def _run_single_channel(
 
     timer = s.get("timer_secs", 0)
 
+    sources = s.get("source_list") if s.get("use_all") else None
     _s_drop(key)
     await q.answer("🚀 starting...")
 
-    asyncio.create_task(_do_send(
-        client, q.message.chat.id, q.message.id,
-        s["source_chat_id"], s["source_msg_id"],
-        [cid], "channel", timer, cap, btns,
-    ))
-
+    if sources:
+        asyncio.create_task(_do_send_multi(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], sources,
+            [cid], "channel", timer, cap, btns,
+        ))
+    else:
+        asyncio.create_task(_do_send(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], s["source_msg_id"],
+            [cid], "channel", timer, cap, btns,
+        ))
 
 async def _run_single_group(
     client: Client, q: CallbackQuery, key: int, gid: int,
@@ -1318,14 +1456,22 @@ async def _run_single_group(
     btns = await _effective_buttons(key)
     timer = s.get("timer_secs", 0)
 
+    sources = s.get("source_list") if s.get("use_all") else None
     _s_drop(key)
     await q.answer("🚀 starting...")
 
-    asyncio.create_task(_do_send(
-        client, q.message.chat.id, q.message.id,
-        s["source_chat_id"], s["source_msg_id"],
-        [gid], "group", timer, cap, btns,
-    ))
+    if sources:
+        asyncio.create_task(_do_send_multi(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], sources,
+            [cid], "channel", timer, cap, btns,
+        ))
+    else:
+        asyncio.create_task(_do_send(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], s["source_msg_id"],
+            [cid], "channel", timer, cap, btns,
+        ))
 
 
 async def _run_groups_all(
@@ -1355,14 +1501,22 @@ async def _run_groups_all(
     btns = await _effective_buttons(key)
     timer = s.get("timer_secs", 0)
 
+    sources = s.get("source_list") if s.get("use_all") else None
     _s_drop(key)
-    await q.answer(f"🚀 starting · {len(targets)} groups")
+    await q.answer("🚀 starting...")
 
-    asyncio.create_task(_do_send(
-        client, q.message.chat.id, q.message.id,
-        s["source_chat_id"], s["source_msg_id"],
-        targets, "groups", timer, cap, btns,
-    ))
+    if sources:
+        asyncio.create_task(_do_send_multi(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], sources,
+            [cid], "channel", timer, cap, btns,
+        ))
+    else:
+        asyncio.create_task(_do_send(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], s["source_msg_id"],
+            [cid], "channel", timer, cap, btns,
+        ))
 
 
 async def _run_users(
@@ -1416,14 +1570,22 @@ async def _run_users(
     cap = await _effective_caption(key)
     btns = await _effective_buttons(key)
 
+    sources = s.get("source_list") if s.get("use_all") else None
     _s_drop(key)
-    await q.answer(f"🚀 starting · {len(targets)} users")
+    await q.answer("🚀 starting...")
 
-    asyncio.create_task(_do_send(
-        client, q.message.chat.id, q.message.id,
-        s["source_chat_id"], s["source_msg_id"],
-        targets, "users", timer, cap, btns,
-    ))
+    if sources:
+        asyncio.create_task(_do_send_multi(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], sources,
+            [cid], "channel", timer, cap, btns,
+        ))
+    else:
+        asyncio.create_task(_do_send(
+            client, q.message.chat.id, q.message.id,
+            s["source_chat_id"], s["source_msg_id"],
+            [cid], "channel", timer, cap, btns,
+        ))
 
 
 async def _run_channels_all(
@@ -1811,6 +1973,72 @@ async def bc_text_input(client: Client, message: Message):
                     parse_mode=ParseMode.HTML,
                 )
         return
+
+async def _do_send_multi(
+    client: Client,
+    panel_chat: int, panel_msg: int,
+    source_chat: int,
+    sources: List[Tuple[int, str]],
+    targets: List[int],
+    kind: str,
+    timer: int,
+    cap_tpl: Optional[str] = None,
+    btns: Optional[List[Dict]] = None,
+) -> None:
+    """Send MULTIPLE files to MULTIPLE targets."""
+    from plugins.broadcast import engine as E
+    from plugins.broadcast import templates as T
+
+    total_sources = len(sources)
+    total_targets = len(targets)
+    grand_total = total_sources * total_targets
+
+    started = time.time()
+    grand_sent = 0
+    grand_failed = 0
+
+    for idx, (src_msg_id, src_name) in enumerate(sources, 1):
+        try:
+            await client.edit_message_text(
+                chat_id=panel_chat, message_id=panel_msg,
+                text="\n".join([
+                    f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                    f"🚀 <b>{F.fb('MULTI-FILE BROADCAST')}</b>",
+                    F.DIV, "",
+                    f"📦 {F.sc('file')} · <b>{idx}/{total_sources}</b>",
+                    f"📛 <code>{src_name[:40]}</code>",
+                    f"🎯 {F.sc('targets')} · <b>{total_targets}</b>",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        try:
+            result = await E.run_broadcast(
+                client=client,
+                source_chat_id=source_chat,
+                source_msg_id=src_msg_id,
+                targets=targets,
+                kind=kind,
+                caption_template=cap_tpl,
+                buttons_list=btns,
+                autodelete_seconds=timer,
+                owner=0,
+            )
+            grand_sent += result.get("sent", 0)
+            grand_failed += result.get("failed", 0)
+        except Exception as e:
+            logger.exception(f"[BC-MULTI] {src_name}: {e}")
+            grand_failed += total_targets
+
+    elapsed = time.time() - started
+    await _render_done(
+        client, panel_chat, panel_msg,
+        f"{kind} · {total_sources} files", grand_total,
+        {"sent": grand_sent, "failed": grand_failed, "blocked": 0},
+        elapsed, timer,
+    )
 
 
 # ============================================================
