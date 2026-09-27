@@ -177,6 +177,37 @@ def _extract_name(message: Message) -> str:
         pass
     return "file"
 
+import re as _re
+
+
+def _clean_caption(text: str) -> str:
+    """
+    Remove links + @mentions from caption.
+    Keeps plain text keywords.
+    """
+    if not text:
+        return ""
+
+    # Remove URLs (http/https)
+    text = _re.sub(r"https?://\S+", "", text)
+
+    # Remove t.me links (bare or with http)
+    text = _re.sub(r"\bt\.me/\S+", "", text)
+
+    # Remove @username mentions
+    text = _re.sub(r"@\w+", "", text)
+
+    # Remove telegram invite links like joinchat/+
+    text = _re.sub(r"\bjoinchat/\S+", "", text)
+
+    # Cleanup extra whitespace
+    text = _re.sub(r"[ \t]+", " ", text)
+    text = _re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = text.strip()
+
+    return text
+
 
 # ============================================================
 # COUNTS
@@ -249,7 +280,7 @@ if _FILTER is not None:
                 source_chat_id=key,
                 source_msg_id=int(message.id),
                 source_name=name,
-                original_caption=message.caption or "",
+                original_caption=_clean_caption(message.caption or ""),
                 caption_mode="auto",
                 custom_caption=None,
                 timer_secs=0,
