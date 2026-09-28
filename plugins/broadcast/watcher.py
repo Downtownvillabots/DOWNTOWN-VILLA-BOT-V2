@@ -21,7 +21,7 @@ from pyrogram.types import (
 from plugins.broadcast.config import (
     BROADCAST_CHANNEL_ID, ADMINS, DEBOUNCE_SECONDS,
     BROADCAST_BATCH_SIZE, BROADCAST_CONCURRENCY, DEFAULT_DELAY,
-    DIV, DIV2, fb, sc, _is_admin, _fmt_int, _progress_colored,
+    DIV, DIV2, fb, sc, _esc, _is_admin, _fmt_int, _progress_colored,
 )
 from plugins.broadcast import database as DB
 from plugins.broadcast import keyboards as KB
@@ -253,6 +253,9 @@ def _build_batch_view(
     elif stage == "final":
         kb = KB.kb_conf_confirm(sid)
 
+    elif stage == "preview":
+        kb = KB.kb_conf_preview(sid)
+        
     else:
         kb = KB.kb_conf_destination(sid)
 
@@ -574,9 +577,11 @@ async def cb_conf_timer(client, q):
     batch = ST.find_batch_by_sid(sid)
     conf["timer_days"] = days
 
+    # Build caption preview
+    preview_text = await _render_preview(client, batch, conf)
     text, kb = _build_batch_view(
-        batch, stage="final", conf=conf,
-        extra=f"✅ {sc('ready to send')}",
+        batch, stage="preview", conf=conf,
+        extra=preview_text,
     )
     await _edit_or_answer(q, text, kb)
 
@@ -1003,6 +1008,66 @@ if BROADCAST_CHANNEL_ID:
             await message.delete()
         except Exception:
             pass
+
+
+async def _render_preview(client, batch, conf) -> str:
+    """Render preview of the caption using the first selected file."""
+    files = conf["files"]
+    if not files:
+        return "(no files)"
+
+    first = files[0]
+    try:
+        src_msg = await client.get_messages(
+            int(first["chat_id"]), int(first["msg_id"])
+        )
+    except Exception:
+        src_msg = None
+
+    cap_mode = conf.get("caption_mode")
+    caption_display = ""
+
+    if cap_mode == "own":
+        cleaned = TPL.clean_caption(first.get("original_caption") or "")
+        if not cleaned:
+            caption_display = "<i>(no caption on this file)</i>"
+        else:
+            caption_display = _esc(cleaned)
+
+    elif cap_mode == "channel":
+        ch_id = conf.get("channel_id")
+        ch = None
+        if isinstance(ch_id, int):
+            ch = await DB.get_channel(int(ch_id))
+        if ch and ch.get("caption"):
+            cap_tpl = ch["caption"]
+        else:
+            cap_tpl = await DB.get_global_caption()
+        if src_msg:
+            caption_display = TPL.build_caption(src_msg, cap_tpl)
+        else:
+            caption_display = _esc(cap_tpl)
+
+    else:  # global
+        cap_tpl = await DB.get_global_caption()
+        if src_msg:
+            caption_display = TPL.build_caption(src_msg, cap_tpl)
+        else:
+            caption_display = _esc(cap_tpl)
+
+    lines = [
+        f"👁️ <b>{fb('PREVIEW')}</b>",
+        "",
+        f"📛 <code>{(first.get('name') or 'file')[:44]}</code>",
+        "",
+        f"<b>{sc('caption')}:</b>",
+        "",
+        caption_display,
+    ]
+    if len(files) > 1:
+        lines += ["", f"📦 <i>+ {len(files) - 1} more file(s)</i>"]
+
+    return "\n".join(lines)
 
 
 # ═════════════════════════════════════════════════════════════
