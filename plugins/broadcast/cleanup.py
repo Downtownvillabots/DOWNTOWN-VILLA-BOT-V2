@@ -22,6 +22,7 @@ async def _loop():
             ST.cleanup_sessions()
             ST.cleanup_jobs()
             ST.cleanup_sources()
+            ST.cleanup_batches()
         except asyncio.CancelledError:
             break
         except Exception as e:
