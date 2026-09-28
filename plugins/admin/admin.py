@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -79,20 +79,56 @@ def cb(*parts) -> str:
 
 
 # ============================================================
+# SECTION 2b — LIVE REFRESH OPTIONS (NEW)
+# ============================================================
+
+REFRESH_OPTIONS = [
+    (3,    "3s"),
+    (5,    "5s"),
+    (10,   "10s"),
+    (15,   "15s"),
+    (30,   "30s"),
+    (60,   "1m"),
+    (300,  "5m"),
+    (1800, "30m"),
+    (0,    "OFF"),
+]
+DEFAULT_REFRESH = 5
+
+# chat_id → seconds between refreshes (0 = off)
+_live_intervals: Dict[int, int] = {}
+
+
+def _get_interval(chat_id: int) -> int:
+    return _live_intervals.get(int(chat_id), DEFAULT_REFRESH)
+
+
+def _set_interval(chat_id: int, seconds: int) -> None:
+    _live_intervals[int(chat_id)] = max(0, int(seconds))
+
+
+# ============================================================
 # SECTION 3 — LIVE PANEL REGISTRY
 # ============================================================
 
-# panel_id → {chat_id, message_id, page, last_text, created}
+# panel_id → {chat_id, message_id, page, last_text, created, builder}
 _panels: Dict[int, Dict[str, Any]] = {}
 
 
-def register_panel(message_id: int, chat_id: int, page: str, text: str) -> None:
+def register_panel(
+    message_id: int,
+    chat_id: int,
+    page: str,
+    text: str,
+    builder: Optional[Callable] = None,
+) -> None:
     _panels[message_id] = {
         "chat_id": chat_id,
         "message_id": message_id,
         "page": page,
         "last_text": text,
         "created": time.time(),
+        "builder": builder,
     }
 
 
@@ -102,6 +138,120 @@ def unregister_panel(message_id: int) -> None:
 
 def active_panel_count() -> int:
     return len(_panels)
+
+
+# ============================================================
+# SECTION 3b — PAGE BUILDERS (NEW)
+# ============================================================
+
+def _build_page_builder(page: str, chat_id: int = 0) -> Optional[Callable]:
+    """Return an async builder for a page. None = static."""
+    if page == "main":
+        async def _main():
+            return _render_main(chat_id)
+        return _main
+    if page == "dashboard":
+        from plugins.admin import dashboard as D
+        return D.build
+    if page == "databases":
+        from plugins.admin import databases as DB_
+        return DB_.build_index
+    if page == "server":
+        from plugins.admin import server as SV
+        return SV.build
+    if page == "tasks":
+        from plugins.admin import tasks as T
+        return T.build
+    if page == "logs":
+        from plugins.admin import logs as L
+        return L.build
+    if page == "stats":
+        from plugins.admin import stats as S
+        return S.build
+    if page == "health":
+        from plugins.admin import health as H
+        return H.build
+    if page == "sparkline":
+        from plugins.admin import sparkline as SP
+        return SP.build
+    return None
+
+
+# ============================================================
+# SECTION 3c — REFRESH PICKER (NEW)
+# ============================================================
+
+def _render_refresh_page(chat_id: int) -> tuple:
+    secs = _get_interval(chat_id)
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔄 <b>{F.fb('LIVE REFRESH')}</b>",
+        F.DIV, "",
+        f"⚙️ {F.sc('current')} · "
+        f"<b>{'🔴 OFF' if secs == 0 else f'🟢 {secs}s'}</b>",
+        "",
+        f"📌 {F.sc('how often every open panel refreshes')}",
+        f"📌 {F.sc('applies to all live pages below')}",
+        f"   • dashboard · databases · server · tasks",
+        f"   • logs · stats · health · sparkline",
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('tap a value below')}",
+    ])
+    return text, _refresh_kb(chat_id)
+
+
+def _refresh_kb(chat_id: int) -> InlineKeyboardMarkup:
+    current = _get_interval(chat_id)
+    rows = []
+    row = []
+    for secs, label in REFRESH_OPTIONS:
+        mark = "✅ " if secs == current else ""
+        row.append(InlineKeyboardButton(
+            f"{mark}{label}",
+            callback_data=f"adm:refresh:{secs}",
+        ))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=cb("home"),
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data=cb("close"),
+        ),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+@Client.on_callback_query(
+    filters.regex(r"^adm:refresh:\d+$"),
+    group=-9510,
+)
+async def set_refresh_interval(client: Client, q: CallbackQuery):
+    if not q.from_user or not is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    try:
+        secs = int(str(q.data).split(":")[2])
+    except (ValueError, IndexError):
+        return await q.answer("❌")
+
+    chat_id = q.message.chat.id
+    _set_interval(chat_id, secs)
+
+    label = "OFF" if secs == 0 else f"{secs}s"
+    await q.answer(f"🔄 {label}")
+
+    text, kb = _render_refresh_page(chat_id)
+    await _safe_edit(q, text, kb)
+    register_panel(q.message.id, chat_id, "refresh", text, builder=None)
+    ensure_live()
 
 
 # ============================================================
@@ -141,9 +291,11 @@ def _quick_stats() -> Dict[str, Any]:
     return out
 
 
-def _render_main() -> tuple:
+def _render_main(chat_id: int = 0) -> tuple:
     """Build main admin panel text + keyboard."""
     s = _quick_stats()
+    secs = _get_interval(chat_id)
+    interval_label = "🔴 OFF" if secs == 0 else f"🟢 {secs}s"
 
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -155,6 +307,8 @@ def _render_main() -> tuple:
         f"{F.EMO['bar']} {F.sc('panels')} · <b>{s['panels']}</b>",
         f"{F.EMO['package']} {F.sc('cache')} · <b>{FM.num(s['cache'])}</b>",
         f"{F.EMO['spark']} {F.sc('flows')} · <b>{s.get('flows', 0)}</b>",
+        "",
+        f"🔄 {F.sc('live')} · <b>{interval_label}</b>",
         "",
         F.DIV_S,
         "",
@@ -264,10 +418,14 @@ def _render_main() -> tuple:
                 f"⚙️ {F.sc('settings')}",
                 callback_data=cb("page", "settings"),
             ),
+            InlineKeyboardButton(
+                f"🔄 {F.sc('refresh')} · {interval_label}",
+                callback_data=cb("page", "refresh"),
+            ),
         ],
         [
             InlineKeyboardButton(
-                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                f"{F.EMO['refresh']} {F.sc('refresh now')}",
                 callback_data=cb("home"),
             ),
             InlineKeyboardButton(
@@ -297,8 +455,9 @@ async def cmd_admin(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
         )
 
+    chat_id = message.chat.id
     with rocket.timer("admin.open", log=False):
-        text, kb = _render_main()
+        text, kb = _render_main(chat_id)
 
     sent = await message.reply_text(
         text,
@@ -307,7 +466,11 @@ async def cmd_admin(client: Client, message: Message):
         disable_web_page_preview=True,
     )
 
-    register_panel(sent.id, sent.chat.id, "main", text)
+    register_panel(
+        sent.id, sent.chat.id, "main", text,
+        builder=_build_page_builder("main", chat_id),
+    )
+    ensure_live()
 
 
 # ============================================================
@@ -475,6 +638,12 @@ async def admin_sv_router(client: Client, q: CallbackQuery):
 
         text, kb = await SV.route(page, arg)
         await _safe_edit(q, text, kb)
+
+        async def _b(_p=page, _a=arg):
+            return await SV.route(_p, _a)
+        register_panel(q.message.id, q.message.chat.id,
+                       f"server:{page}", text, builder=_b)
+        ensure_live()
         await q.answer()
     except Exception as e:
         logger.exception(f"[ADMIN] sv router: {e}")
@@ -507,6 +676,9 @@ async def admin_lg_router(client: Client, q: CallbackQuery):
             LG._set_filter("page", 0)
             text, kb = await LG.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "logs", text, builder=LG.build)
+            ensure_live()
             return await q.answer(f"✅ {key}={val}")
 
         # ── PAGE ──
@@ -518,12 +690,16 @@ async def admin_lg_router(client: Client, q: CallbackQuery):
             LG._set_filter("page", page)
             text, kb = await LG.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "logs", text, builder=LG.build)
             return await q.answer()
 
         # ── REFRESH ──
         if action == "refresh":
             text, kb = await LG.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "logs", text, builder=LG.build)
             return await q.answer()
 
         # ── RESET FILTERS ──
@@ -531,6 +707,8 @@ async def admin_lg_router(client: Client, q: CallbackQuery):
             LG._reset_filters()
             text, kb = await LG.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "logs", text, builder=LG.build)
             return await q.answer("♻️ Reset")
 
         # ── SEARCH ──
@@ -550,6 +728,7 @@ async def admin_lg_router(client: Client, q: CallbackQuery):
                 ),
             ]])
             await _safe_edit(q, text, kb)
+            unregister_panel(q.message.id)
             return await q.answer()
 
         # ── EXPORT ──
@@ -573,6 +752,7 @@ async def admin_lg_router(client: Client, q: CallbackQuery):
         if action == "confirm_clear":
             text, kb = await LG.build_clear_confirm()
             await _safe_edit(q, text, kb)
+            unregister_panel(q.message.id)
             return await q.answer("⚠️")
 
         # ── DO CLEAR ──
@@ -585,6 +765,8 @@ async def admin_lg_router(client: Client, q: CallbackQuery):
                 await q.answer("❌")
             text, kb = await LG.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "logs", text, builder=LG.build)
             return
 
     except Exception as e:
@@ -615,15 +797,21 @@ async def admin_st_router(client: Client, q: CallbackQuery):
             sub = parts[3] if len(parts) > 3 else ""
             if sub == "users":
                 text, kb = await ST.build_top_users()
+                async def _b(): return await ST.build_top_users()
             else:
                 text, kb = await ST.build()
+                async def _b(): return await ST.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "stats", text, builder=_b)
+            ensure_live()
             return await q.answer()
 
         # ── CONFIRM RESET ──
         if action == "confirm_reset":
             text, kb = await ST.build_reset_confirm()
             await _safe_edit(q, text, kb)
+            unregister_panel(q.message.id)
             return await q.answer("⚠️")
 
         # ── DO RESET ──
@@ -635,6 +823,8 @@ async def admin_st_router(client: Client, q: CallbackQuery):
                 await q.answer("❌")
             text, kb = await ST.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "stats", text, builder=ST.build)
             return
 
     except Exception as e:
@@ -667,12 +857,17 @@ async def admin_tk_router(client: Client, q: CallbackQuery):
             TK._set_filter(key, val)
             text, kb = await TK.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "tasks", text, builder=TK.build)
+            ensure_live()
             return await q.answer(f"✅ {key}={val}")
 
         # ── REFRESH ──
         if action == "refresh":
             text, kb = await TK.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "tasks", text, builder=TK.build)
             return await q.answer()
 
         # ── CLEAR DONE ──
@@ -681,6 +876,8 @@ async def admin_tk_router(client: Client, q: CallbackQuery):
             await q.answer(f"🗑️ Cleared {n}")
             text, kb = await TK.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "tasks", text, builder=TK.build)
             return
 
         # ── DETAIL ──
@@ -688,6 +885,7 @@ async def admin_tk_router(client: Client, q: CallbackQuery):
             tid = parts[3] if len(parts) > 3 else ""
             text, kb = await TK.build_task_detail(tid)
             await _safe_edit(q, text, kb)
+            unregister_panel(q.message.id)
             return await q.answer()
 
         # ── CONFIRM CANCEL ──
@@ -695,6 +893,7 @@ async def admin_tk_router(client: Client, q: CallbackQuery):
             tid = parts[3] if len(parts) > 3 else ""
             text, kb = await TK.build_cancel_confirm(tid)
             await _safe_edit(q, text, kb)
+            unregister_panel(q.message.id)
             return await q.answer("⚠️")
 
         # ── DO CANCEL ──
@@ -704,6 +903,8 @@ async def admin_tk_router(client: Client, q: CallbackQuery):
             await q.answer("🛑 Cancelled" if ok else "⚠️ Failed")
             text, kb = await TK.build()
             await _safe_edit(q, text, kb)
+            register_panel(q.message.id, q.message.chat.id,
+                           "tasks", text, builder=TK.build)
             return
 
     except Exception as e:
@@ -731,9 +932,12 @@ async def admin_router(client: Client, q: CallbackQuery):
 
     # ────────── HOME ──────────
     if action == "home":
-        text, kb = _render_main()
+        chat_id = q.message.chat.id
+        text, kb = _render_main(chat_id)
         await _safe_edit(q, text, kb)
-        register_panel(q.message.id, q.message.chat.id, "main", text)
+        register_panel(q.message.id, chat_id, "main", text,
+                       builder=_build_page_builder("main", chat_id))
+        ensure_live()
         return await q.answer()
 
     # ────────── CLOSE ──────────
@@ -774,31 +978,29 @@ async def admin_router(client: Client, q: CallbackQuery):
 async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
     """Dispatch to the right page builder."""
     try:
-        if page == "dashboard":
-            from plugins.admin import dashboard as D
-            text, kb = await D.build()
-        elif page == "databases":
-            from plugins.admin import databases as DB_
-            text, kb = await DB_.build_index()
-        elif page == "server":
-            from plugins.admin import server as SV
-            text, kb = await SV.build()
-        elif page == "tasks":
-            from plugins.admin import tasks as T
-            text, kb = await T.build()
-        elif page == "logs":
-            from plugins.admin import logs as L
-            text, kb = await L.build()
-        elif page == "stats":
-            from plugins.admin import stats as S
-            text, kb = await S.build()
-        elif page == "health":
-            from plugins.admin import health as H
-            text, kb = await H.build()
-        elif page == "sparkline":
-            from plugins.admin import sparkline as SP
-            text, kb = await SP.build()
-        elif page == "flow":
+        chat_id = q.message.chat.id
+
+        # Refresh picker
+        if page == "refresh":
+            text, kb = _render_refresh_page(chat_id)
+            await _safe_edit(q, text, kb)
+            register_panel(q.message.id, chat_id, "refresh",
+                           text, builder=None)
+            ensure_live()
+            return await q.answer()
+
+        # Try live builder
+        builder = _build_page_builder(page, chat_id)
+        if builder is not None:
+            text, kb = await builder()
+            await _safe_edit(q, text, kb)
+            register_panel(q.message.id, chat_id, page, text,
+                           builder=builder)
+            ensure_live()
+            return await q.answer()
+
+        # Static pages
+        if page == "flow":
             text = "\n".join([
                 f"{F.EMO['spark']} <b>{F.fb('FLOW EDITOR')}</b>",
                 F.DIV, "",
@@ -866,7 +1068,7 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
             kb = _back_kb()
 
         await _safe_edit(q, text, kb)
-        register_panel(q.message.id, q.message.chat.id, page, text)
+        register_panel(q.message.id, chat_id, page, text, builder=None)
 
     except Exception as e:
         logger.exception(f"[ADMIN] page {page} failed: {e}")
@@ -914,8 +1116,6 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             else:
                 await q.answer("Broadcast unavailable", show_alert=True)
             return
-        
-            
 
         if module == "premium":
             from plugins.admin import premium as PA
@@ -956,7 +1156,7 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
                 logger.exception(f"[ADMIN] pmsearch: {e}")
                 await q.answer("❌ Failed", show_alert=True)
             return
-            
+
         await q.answer(f"❓ Unknown module", show_alert=True)
     except ImportError:
         await q.answer(f"Use /{module} command", show_alert=True)
@@ -1024,43 +1224,77 @@ async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
 
 
 # ============================================================
-# SECTION 12 — LIVE UPDATER
+# SECTION 12 — LIVE UPDATER (NOW REFRESHES ALL PAGES)
 # ============================================================
 
-async def _live_loop(interval: float = 5.0) -> None:
-    """Refresh every open dashboard panel every N seconds."""
+_live_task: Optional[asyncio.Task] = None
+_last_refresh: Dict[int, float] = {}
+
+
+async def _live_loop() -> None:
+    """
+    Refresh every registered panel (any page with a builder)
+    at its chat's chosen interval.
+    """
     while True:
         try:
-            await asyncio.sleep(interval)
-            for panel_id, panel in list(_panels.items()):
-                if panel.get("page") != "dashboard":
+            await asyncio.sleep(1.0)
+
+            if not _panels:
+                continue
+
+            from core.client import client as _c
+            if _c is None:
+                continue
+
+            now = time.time()
+
+            for msg_id, panel in list(_panels.items()):
+                builder = panel.get("builder")
+                if builder is None:
                     continue
+
+                chat_id = panel["chat_id"]
+                interval = _get_interval(chat_id)
+                if interval <= 0:
+                    continue
+
+                last = _last_refresh.get(msg_id, 0)
+                if now - last < interval:
+                    continue
+                _last_refresh[msg_id] = now
+
                 try:
-                    from core.client import client as _c
-                    if _c is None:
+                    result = await builder()
+                    if not result:
                         continue
-                    from plugins.admin import dashboard as D
-                    text, kb = await D.build()
+                    text, kb = result
                     if text == panel.get("last_text"):
                         continue
+
                     await _c.edit_message_text(
-                        chat_id=panel["chat_id"],
-                        message_id=panel["message_id"],
+                        chat_id=chat_id,
+                        message_id=msg_id,
                         text=text,
                         reply_markup=kb,
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
                     )
                     panel["last_text"] = text
-                except Exception:
-                    pass
+                except Exception as e:
+                    err = str(e).lower()
+                    if "not modified" in err:
+                        continue
+                    if "message to edit not found" in err:
+                        _panels.pop(msg_id, None)
+                        _last_refresh.pop(msg_id, None)
+                        continue
+                    logger.debug(f"[ADMIN-LIVE] {msg_id}: {e}")
+
         except asyncio.CancelledError:
             return
-        except Exception:
-            pass
-
-
-_live_task: Optional[asyncio.Task] = None
+        except Exception as e:
+            logger.debug(f"[ADMIN-LIVE] loop: {e}")
 
 
 def ensure_live() -> None:
@@ -1070,6 +1304,7 @@ def ensure_live() -> None:
     try:
         loop = asyncio.get_running_loop()
         _live_task = loop.create_task(_live_loop())
+        logger.info("[ADMIN-LIVE] started")
     except RuntimeError:
         pass
 
@@ -1082,6 +1317,10 @@ def snapshot() -> Dict[str, Any]:
     return {
         "panels": active_panel_count(),
         "admins": len(config.ADMINS),
+        "live_intervals": dict(_live_intervals),
+        "live_task_running": bool(
+            _live_task and not _live_task.done()
+        ),
     }
 
 
