@@ -166,6 +166,44 @@ async def clear_sources() -> int:
     except Exception:
         return 0
 
+# ─── BATCHES (channel uploads → one message with toggles) ───
+_BATCHES: Dict[int, Dict[str, Any]] = {}
+_BATCH_TTL = 3600
+
+
+def new_batch(key: int, sid: str) -> Dict[str, Any]:
+    b = {
+        "sid": sid,
+        "started_at": time.time(),
+        "files": [],
+        "reply_msg_id": None,
+        "chat_id": int(key),
+    }
+    _BATCHES[int(key)] = b
+    return b
+
+
+def get_batch(key: int) -> Optional[Dict[str, Any]]:
+    return _BATCHES.get(int(key))
+
+
+def find_batch_by_sid(sid: str) -> Optional[Dict[str, Any]]:
+    for b in _BATCHES.values():
+        if b.get("sid") == sid:
+            return b
+    return None
+
+
+def clear_batch(key: int) -> None:
+    _BATCHES.pop(int(key), None)
+
+
+def cleanup_batches() -> None:
+    now = time.time()
+    for k in list(_BATCHES.keys()):
+        if now - _BATCHES[k].get("started_at", 0) > _BATCH_TTL:
+            _BATCHES.pop(k, None)
+
 
 # ─── DEBOUNCE ───
 _DEBOUNCE: Dict[int, int] = {}
@@ -186,4 +224,6 @@ def snapshot() -> Dict[str, Any]:
         "jobs": len(_ACTIVE_JOBS),
         "sources": len(_SOURCES),
         "debounce": len(_DEBOUNCE),
+        "batches": len(_BATCHES),
     }
+    
