@@ -12,11 +12,11 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 logger = logging.getLogger(__name__)
 
 
-# ─── CAPTION CLEANER ───
+# ─── CAPTION CLEANER (only for file's own caption) ───
 def clean_caption(text: str) -> str:
     """
     Remove links, @mentions, t.me URLs, JOIN lines.
-    Keeps plain text + emojis.
+    ONLY used for file's OWN caption (untrusted uploads).
     """
     if not text:
         return ""
@@ -53,8 +53,14 @@ def _human_size(size) -> str:
     return f"{s:.2f} {units[i]}"
 
 
-def build_caption(message, template: str) -> str:
-    """Render a caption and clean it."""
+def build_caption(
+    message, template: str, clean: bool = False
+) -> str:
+    """
+    Render a caption.
+    - clean=False (DEFAULT): keep template AS-IS — JOIN links stay
+    - clean=True: strip links/@mentions (only for OWN caption mode)
+    """
     try:
         file_name = "file"
         file_size_str = "0 B"
@@ -77,15 +83,26 @@ def build_caption(message, template: str) -> str:
         if mm:
             year = mm.group(1)
 
+        # file_caption always cleaned (untrusted source)
+        fc_clean = ""
+        if file_caption:
+            fc_clean = clean_caption(file_caption)[:200]
+        if not fc_clean:
+            fc_clean = "—"
+
         rendered = template.format(
             file_name=file_name[:100],
             file_size=file_size_str,
             rating="—",
             year=year or "—",
-            file_caption=clean_caption(file_caption)[:200]
-            if file_caption else "—",
+            file_caption=fc_clean,
         )
-        return clean_caption(rendered)
+
+        # ONLY clean when explicitly asked (own mode)
+        if clean:
+            rendered = clean_caption(rendered)
+
+        return rendered
 
     except Exception as e:
         logger.warning(f"[BC-TPL] build_caption: {e}")
@@ -116,7 +133,6 @@ def build_buttons_kb(
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-# ─── EFFECTIVE (per-channel fallback to global) ───
 async def effective_caption(channel: Optional[Dict[str, Any]]) -> str:
     from plugins.broadcast.database import get_global_caption
     if channel is None or channel.get("caption") is None:
