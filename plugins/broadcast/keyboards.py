@@ -476,6 +476,31 @@ def kb_conf_confirm(sid: str) -> InlineKeyboardMarkup:
     ])
 
 
+def kb_conf_preview(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🚀 SEND NOW",
+            callback_data=f"bcconf:{sid}:send",
+        )],
+        [InlineKeyboardButton(
+            "📝 CHANGE CAPTION",
+            callback_data=f"bcconf:{sid}:chcap",
+        )],
+        [InlineKeyboardButton(
+            "⏱️ CHANGE TIMER",
+            callback_data=f"bcconf:{sid}:chtimer",
+        )],
+        [InlineKeyboardButton(
+            "◀️ BACK",
+            callback_data=f"bcconf:{sid}:back",
+        )],
+        [InlineKeyboardButton(
+            "❌ CANCEL",
+            callback_data=f"bcconf:{sid}:cancel",
+        )],
+    ])
+
+
 __all__ = [
     "cb", "kb_main", "kb_channels", "kb_channel_view",
     "kb_caption", "kb_buttons", "kb_button_view",
@@ -486,4 +511,5 @@ __all__ = [
     "kb_confirm_batch", "kb_cancel_session", "kb_back",
     "kb_batch", "kb_conf_destination", "kb_conf_channels",
     "kb_conf_caption", "kb_conf_timer", "kb_conf_confirm",
+    "kb_conf_preview",
 ]
