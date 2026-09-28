@@ -373,3 +373,24 @@ async def get_all_groups_full() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"[BC] groups full: {e}")
     return out
+
+
+async def save_group_manual(chat_id: int, title: str) -> bool:
+    """Insert a group doc manually (if bot is already in it)."""
+    c = _groups_coll()
+    if c is None:
+        return False
+    try:
+        await c.update_one(
+            {"chat_id": int(chat_id)},
+            {"$set": {
+                "chat_id": int(chat_id),
+                "title": (title or str(chat_id))[:120],
+                "manual": True,
+            }},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"[BC] save group: {e}")
+        return False
