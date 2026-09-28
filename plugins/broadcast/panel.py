@@ -316,6 +316,28 @@ async def cb_gr_view(client, q):
     await V.safe_edit(q, r[0], r[1])
     await q.answer()
 
+@Client.on_callback_query(
+    filters.regex(r"^bc:gr_add$"), group=-500
+)
+async def cb_gr_add(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    ST.new_session(q.from_user.id, "add_group")
+    text = "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"➕ <b>{fb('ADD GROUP')}</b>",
+        DIV, "",
+        f"📝 {sc('send the group id or @username')}",
+        "", DIV2, "",
+        f"📌 {sc('examples')}:",
+        f"• <code>-1001234567890</code>",
+        f"• <code>@mygroup</code>",
+        "", f"⚠️ {sc('bot must be in the group')}",
+    ])
+    await V.safe_edit(q, text, KB.kb_cancel_session())
+    await q.answer()
+
+
 
 @Client.on_callback_query(
     filters.regex(r"^bc:gr_cap:(-?\d+)$"), group=-500
