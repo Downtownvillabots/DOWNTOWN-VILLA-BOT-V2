@@ -348,3 +348,28 @@ async def remove_autodelete(doc_id) -> None:
         await c.delete_one({"_id": doc_id})
     except Exception:
         pass
+
+
+async def get_all_groups_full() -> List[Dict[str, Any]]:
+    """Return full group docs with id + title."""
+    c = _groups_coll()
+    if c is None:
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        async for doc in c.find(
+            {}, {"chat_id": 1, "id": 1, "title": 1, "chat_status": 1}
+        ):
+            cs = doc.get("chat_status") or {}
+            if cs.get("is_disabled"):
+                continue
+            cid = doc.get("chat_id") or doc.get("id")
+            if not cid:
+                continue
+            out.append({
+                "chat_id": int(cid),
+                "title": doc.get("title") or str(cid),
+            })
+    except Exception as e:
+        logger.warning(f"[BC] groups full: {e}")
+    return out
