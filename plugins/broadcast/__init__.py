@@ -3,18 +3,22 @@
 # ============================================================
 
 from __future__ import annotations
-import importlib, logging, pkgutil
+import importlib
+import logging
+import pkgutil
 from pathlib import Path
 from typing import List
 
 logger = logging.getLogger(__name__)
+
 _loaded: List[str] = []
 _failed: List[str] = []
 
 
 def discover() -> None:
     global _loaded, _failed
-    _loaded.clear(); _failed.clear()
+    _loaded.clear()
+    _failed.clear()
     pkg_dir = Path(__file__).parent
     for mod in pkgutil.iter_modules([str(pkg_dir)]):
         name = mod.name
@@ -27,7 +31,10 @@ def discover() -> None:
         except Exception as e:
             logger.exception(f"[BROADCAST] failed: {full}: {e}")
             _failed.append(name)
-    logger.info(f"[BROADCAST] loaded {len(_loaded)} modules ({len(_failed)} failed)")
+    logger.info(
+        f"[BROADCAST] loaded {len(_loaded)} modules "
+        f"({len(_failed)} failed)"
+    )
 
 
 def loaded() -> List[str]:
