@@ -100,6 +100,62 @@ async def bc_input(client: Client, message):
             await message.reply_text("❌ ꜰᴀɪʟᴇᴅ.")
         return
 
+
+        # ─── ADD GROUP ───
+    if action == "add_group":
+        target_id = target_title = None
+        if text.startswith("@"):
+            try:
+                chat = await client.get_chat(text)
+                target_id = chat.id
+                target_title = chat.title or text
+            except Exception as e:
+                return await message.reply_text(
+                    f"❌ ᴄᴀɴɴᴏᴛ ʀᴇꜱᴏʟᴠᴇ <code>{_esc(text)}</code>\n"
+                    f"<code>{_esc(e)}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
+        else:
+            try:
+                target_id = int(text)
+                try:
+                    chat = await client.get_chat(target_id)
+                    target_title = chat.title or str(target_id)
+                except Exception:
+                    target_title = str(target_id)
+            except ValueError:
+                return await message.reply_text(
+                    "❌ ꜱᴇɴᴅ ᴀ ɢʀᴏᴜᴘ ɪᴅ ᴏʀ @ᴜꜱᴇʀɴᴀᴍᴇ."
+                )
+        # verify bot is in group
+        try:
+            me = await client.get_me()
+            m = await client.get_chat_member(target_id, me.id)
+            st = getattr(m, "status", None)
+            st = st.name.lower() if hasattr(st, "name") else str(st).lower()
+            if st not in ("administrator", "creator", "owner", "member"):
+                return await message.reply_text(
+                    f"⚠️ ʙᴏᴛ ɪꜱ ɴᴏᴛ ɪɴ <b>{_esc(target_title)}</b>.",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            return await message.reply_text(
+                f"❌ ᴄʜᴇᴄᴋ ꜰᴀɪʟᴇᴅ:\n<code>{_esc(e)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        ok = await DB.save_group_manual(target_id, target_title)
+        ST.clear_session(message.from_user.id)
+        if ok:
+            await message.reply_text(
+                f"✅ <b>ɢʀᴏᴜᴘ ᴀᴅᴅᴇᴅ</b>\n\n"
+                f"📛 <b>{_esc(target_title)}</b>\n"
+                f"🆔 <code>{target_id}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.reply_text("❌ ꜰᴀɪʟᴇᴅ.")
+        return
+
     # ─── EDIT GLOBAL CAPTION ───
     if action == "edit_caption":
         if len(text) < 3:
