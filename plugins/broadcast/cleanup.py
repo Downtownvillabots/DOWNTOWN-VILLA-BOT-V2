@@ -9,7 +9,6 @@ import logging
 from pyrogram import Client
 
 from plugins.broadcast import state as ST
-from plugins.broadcast import watcher as W
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +23,7 @@ async def _loop():
             ST.cleanup_jobs()
             ST.cleanup_sources()
             ST.cleanup_batches()
-            _cleanup_conf()
+        
         except asyncio.CancelledError:
             break
         except Exception as e:
