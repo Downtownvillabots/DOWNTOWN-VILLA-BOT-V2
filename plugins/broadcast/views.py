@@ -140,18 +140,90 @@ async def view_channel_detail(
 
 
 async def view_groups() -> Tuple[str, InlineKeyboardMarkup]:
-    count = await DB.count_groups()
+    groups = await DB.get_all_groups_full()
+    count = len(groups)
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"👥 <b>{fb('BROADCAST TO GROUPS')}</b>",
         DIV, "",
         f"📊 {sc('total groups')} · <code>{_fmt_int(count)}</code>",
-        "", DIV2,
-        f"📌 {sc('groups use the global default caption & buttons')}",
-        f"📌 {sc('auto-delete timer will be applied if chosen')}",
-        "", DIV2,
+        "", DIV2, "",
+        f"📌 {sc('tap a group to customize')}",
+        f"📌 {sc('or send to all at once')}",
     ]
-    return "\n".join(lines), KB.kb_groups_menu(count)
+    return "\n".join(lines), KB.kb_groups_list(groups)
+
+
+async def view_group_detail(gid: int) -> Optional[Tuple[str, InlineKeyboardMarkup]]:
+    groups = await DB.get_all_groups_full()
+    group = None
+    for g in groups:
+        if g["chat_id"] == int(gid):
+            group = g
+            break
+    if not group:
+        return None
+
+    # Group caption/buttons stored in broadcast_config under key groups_overrides
+    overrides = await _get_group_override(gid)
+    cap_state = (
+        "✅ custom" if overrides.get("caption") else "🌐 global default"
+    )
+    btn_count = (
+        len(overrides.get("buttons") or [])
+        if overrides.get("buttons") is not None
+        else None
+    )
+    btn_state = (
+        "🌐 global default"
+        if btn_count is None
+        else f"🔘 {btn_count} custom"
+    )
+
+    lines = [
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"👥 <b>{fb('GROUP')}</b>",
+        DIV, "",
+        f"📛 {sc('title')} · <b>{_esc(group.get('title'))}</b>",
+        f"🆔 {sc('chat id')} · <code>{group.get('chat_id')}</code>",
+        "",
+        DIV2, "",
+        f"📝 {sc('caption')} · <b>{cap_state}</b>",
+        f"🔘 {sc('buttons')} · <b>{btn_state}</b>",
+        "", DIV2, "",
+        f"📌 {sc('custom caption/buttons apply only here')}",
+    ]
+    return "\n".join(lines), KB.kb_group_view(group)
+
+
+async def _get_group_override(gid: int) -> Dict[str, Any]:
+    c = DB._cfg_coll()
+    if c is None:
+        return {}
+    try:
+        doc = await c.find_one({"_id": "group_overrides"}) or {}
+        return (doc.get("map") or {}).get(str(int(gid))) or {}
+    except Exception:
+        return {}
+
+
+async def _set_group_override(gid: int, **fields) -> bool:
+    c = DB._cfg_coll()
+    if c is None:
+        return False
+    try:
+        doc = await c.find_one({"_id": "group_overrides"}) or {}
+        mp = dict(doc.get("map") or {})
+        key = str(int(gid))
+        mp[key] = {**(mp.get(key) or {}), **fields}
+        await c.update_one(
+            {"_id": "group_overrides"},
+            {"$set": {"map": mp, "updated_at": __import__("time").time()}},
+            upsert=True,
+        )
+        return True
+    except Exception:
+        return False
 
 
 async def view_users_menu() -> Tuple[str, InlineKeyboardMarkup]:
@@ -336,4 +408,5 @@ __all__ = [
     "view_groups", "view_users_menu",
     "view_caption", "view_buttons", "view_button_detail",
     "view_history", "view_stats", "view_autodelete",
+    "view_group_detail", "_get_group_override", "_set_group_override",
 ]
