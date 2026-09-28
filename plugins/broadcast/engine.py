@@ -8,7 +8,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.errors import (
     FloodWait, RPCError, UserIsBlocked, InputUserDeactivated,
@@ -727,4 +727,4 @@ def _is_admin_check(q):
         return False
 
 
-from pyrogram import filters  # ensure filters imported
+
