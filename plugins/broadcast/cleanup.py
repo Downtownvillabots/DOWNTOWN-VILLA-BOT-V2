@@ -9,6 +9,7 @@ import logging
 from pyrogram import Client
 
 from plugins.broadcast import state as ST
+from plugins.broadcast import watcher as W
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ async def _loop():
             ST.cleanup_jobs()
             ST.cleanup_sources()
             ST.cleanup_batches()
+            _cleanup_conf()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -38,6 +40,15 @@ def start() -> None:
         _TASK = loop.create_task(_loop())
     except Exception:
         pass
+
+def _cleanup_conf():
+    """Remove stale confirmation entries."""
+    import time
+    now = time.time()
+    for sid in list(W._CONF.keys()):
+        c = W._CONF[sid]
+        if now - c.get("created", 0) > 3600:
+            W._CONF.pop(sid, None)
 
 
 __all__ = ["start"]
