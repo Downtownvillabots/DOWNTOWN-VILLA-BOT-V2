@@ -198,6 +198,59 @@ async def bc_input(client: Client, message):
             await message.reply_text("❌ ꜰᴀɪʟᴇᴅ.")
         return
 
+
+        # ─── GROUP CAPTION ───
+    if action == "gr_edit_caption":
+        gid = session["data"].get("chat_id")
+        if gid is None:
+            ST.clear_session(message.from_user.id)
+            return await message.reply_text("❌ Invalid session.")
+        from plugins.broadcast import views as V
+        new_cap = "" if text == "-" else text
+        await V._set_group_override(gid, caption=new_cap or None)
+        ST.clear_session(message.from_user.id)
+        await message.reply_text(
+            f"✅ <b>Group caption saved</b>\n\n"
+            f"<code>{_esc(new_cap) if new_cap else '(cleared)'}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ─── GROUP BUTTON ───
+    if action == "gr_add_button":
+        gid = session["data"].get("chat_id")
+        if gid is None:
+            ST.clear_session(message.from_user.id)
+            return await message.reply_text("❌ Invalid.")
+        if "|" not in text:
+            return await message.reply_text(
+                "❌ Format: <code>Name | URL</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        name, url = [p.strip() for p in text.split("|", 1)]
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif not (url.startswith("http://")
+                  or url.startswith("https://")
+                  or url.startswith("tg://")):
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                return await message.reply_text("❌ Invalid URL.")
+        from plugins.broadcast import views as V
+        ov = await V._get_group_override(gid)
+        btns = list(ov.get("buttons") or [])
+        btns.append({"name": name[:60], "url": url})
+        await V._set_group_override(gid, buttons=btns)
+        ST.clear_session(message.from_user.id)
+        await message.reply_text(
+            f"✅ <b>Button added</b>\n<code>{_esc(name)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    
+
     # ─── CHANNEL BUTTON ───
     if action == "ch_add_button":
         cid = session["data"].get("chat_id")
