@@ -500,6 +500,53 @@ def kb_conf_preview(sid: str) -> InlineKeyboardMarkup:
         )],
     ])
 
+def kb_groups_list(groups: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"🎯 SEND TO ALL ({len(groups)})",
+            callback_data="bc:do_groups",
+        )],
+    ]
+    for g in groups[:20]:
+        gid = g.get("chat_id")
+        title = str(g.get("title") or gid)[:32]
+        rows.append([InlineKeyboardButton(
+            f"👥 {title}",
+            callback_data=f"bc:gr_view:{gid}",
+        )])
+    rows.append([
+        InlineKeyboardButton("🔄 REFRESH", callback_data="bc:groups"),
+        InlineKeyboardButton("◀️ BACK", callback_data="bc:main"),
+    ])
+    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="bc:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_group_view(group: Dict[str, Any]) -> InlineKeyboardMarkup:
+    gid = group.get("chat_id")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "✏️ EDIT CAPTION",
+            callback_data=f"bc:gr_cap:{gid}",
+        )],
+        [InlineKeyboardButton(
+            "🔘 EDIT BUTTONS",
+            callback_data=f"bc:gr_btn:{gid}",
+        )],
+        [InlineKeyboardButton(
+            "⏱️ SET TIMER",
+            callback_data=f"bc:gr_timer:{gid}",
+        )],
+        [InlineKeyboardButton(
+            "🚀 SEND NOW",
+            callback_data=f"bc:gr_send:{gid}",
+        )],
+        [InlineKeyboardButton(
+            "◀️ BACK", callback_data="bc:groups",
+        ),
+         InlineKeyboardButton("❌ CLOSE", callback_data="bc:close")],
+    ])
+
 
 __all__ = [
     "cb", "kb_main", "kb_channels", "kb_channel_view",
@@ -512,4 +559,5 @@ __all__ = [
     "kb_batch", "kb_conf_destination", "kb_conf_channels",
     "kb_conf_caption", "kb_conf_timer", "kb_conf_confirm",
     "kb_conf_preview",
+    "kb_groups_list", "kb_group_view",
 ]
