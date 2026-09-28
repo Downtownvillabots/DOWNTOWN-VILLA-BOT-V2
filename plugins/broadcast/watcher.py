@@ -1,12 +1,22 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — BROADCAST CENTER (FIXED)
+# 🏨 DOWNTOWN VILLA — BROADCAST CENTER (FULL REWRITE)
 # ============================================================
 #
-# Two entry points:
-#   1. Upload file to BROADCAST_CHANNEL_ID → watcher saves to DB
-#   2. /broadcast in PM  OR  /admin → 📢 Broadcast
-#      → reads recent files from DB (bots CANNOT use get_chat_history)
+# Entry points:
+#   1. Upload file(s) to BROADCAST_CHANNEL_ID
+#   2. /broadcast in PM
+#   3. /admin → [📢 Broadcast]
 #
+# Features:
+#   • Multi-file debounce (upload N files → ONE panel)
+#   • "USE ALL" or pick individual file
+#   • Send to Channels / Groups / Users / All
+#   • Per-channel caption/buttons/timer
+#   • Global caption/buttons/timer
+#   • Preview before send
+#   • Order preserved (first uploaded = first sent)
+#
+# Callbacks: bca:<action>[:args...]
 # ============================================================
 
 from __future__ import annotations
@@ -14,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -36,6 +46,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 _sessions: Dict[int, Dict[str, Any]] = {}
+_debounce: Dict[int, int] = {}
 SESSION_TTL = 86400.0
 
 SOURCES_COLL = "broadcast_sources"
@@ -71,7 +82,7 @@ def _s_drop(key: int) -> None:
 
 
 # ============================================================
-# SOURCES DB (bot-safe replacement for get_chat_history)
+# SOURCES DB
 # ============================================================
 
 def _src_coll():
@@ -107,6 +118,10 @@ async def _save_source(
 
 
 async def _list_sources(limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Return recent sources.
+    Order: OLDEST first (so send order = upload order).
+    """
     c = _src_coll()
     if c is None:
         return []
@@ -115,10 +130,23 @@ async def _list_sources(limit: int = 10) -> List[Dict[str, Any]]:
         docs = await cursor.to_list(length=int(limit))
         for d in docs:
             d.pop("_id", None)
+        # reverse so oldest is first (upload order)
+        docs.reverse()
         return docs
     except Exception as e:
         logger.warning(f"[BC] list sources: {e}")
         return []
+
+
+async def _clear_sources() -> int:
+    c = _src_coll()
+    if c is None:
+        return 0
+    try:
+        r = await c.delete_many({})
+        return r.deleted_count
+    except Exception:
+        return 0
 
 
 # ============================================================
@@ -139,6 +167,10 @@ def _fmt_timer(secs: int) -> str:
         return "♾ never"
     return f"⏱ {FM.duration_short(secs)}"
 
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def _is_admin(uid) -> bool:
     try:
@@ -176,69 +208,6 @@ def _extract_name(message: Message) -> str:
     except Exception:
         pass
     return "file"
-
-import re as _re
-
-
-def _clean_caption(text: str) -> str:
-    """
-    Remove links + @mentions from caption.
-    Keeps plain text keywords.
-    """
-    if not text:
-        return ""
-
-    # Remove URLs (http/https)
-    text = _re.sub(r"https?://\S+", "", text)
-
-    # Remove t.me links (bare or with http)
-    text = _re.sub(r"\bt\.me/\S+", "", text)
-
-    # Remove @username mentions
-    text = _re.sub(r"@\w+", "", text)
-
-    # Remove telegram invite links like joinchat/+
-    text = _re.sub(r"\bjoinchat/\S+", "", text)
-
-    # Cleanup extra whitespace
-    text = _re.sub(r"[ \t]+", " ", text)
-    text = _re.sub(r"\n{3,}", "\n\n", text)
-    text = "\n".join(line.strip() for line in text.splitlines())
-    text = text.strip()
-
-    return text
-
-
-# ============================================================
-# DEBOUNCE — batch multiple rapid uploads into one panel
-# ============================================================
-
-_debounce: Dict[int, int] = {}
-
-
-async def _debounced_show(message: Message, key: int, msg_id: int) -> None:
-    """Wait 2.5s. If no newer file came, show the panel."""
-    await asyncio.sleep(2.5)
-    if _debounce.get(key) != msg_id:
-        return
-
-    name = _extract_name(message)
-
-    _s_set(
-        key,
-        source_chat_id=int(message.chat.id),
-        source_msg_id=int(message.id),
-        source_name=name,
-        original_caption=_clean_caption(message.caption or ""),
-        caption_mode="auto",
-        custom_caption=None,
-        timer_secs=0,
-        user_filter="all",
-        timer_context=None,
-        awaiting=None,
-    )
-
-    await _show_main(message, key)
 
 
 # ============================================================
@@ -294,6 +263,47 @@ def _channel_filter():
 _FILTER = _channel_filter()
 
 
+async def _debounced_show(message: Message, key: int, msg_id: int) -> None:
+    """Wait 2.5s. If no newer file came, show panel."""
+    await asyncio.sleep(2.5)
+    if _debounce.get(key) != msg_id:
+        return
+
+    docs = await _list_sources(limit=10)
+    if not docs:
+        return
+
+    # If only 1 file, go straight to main panel with that file selected
+    if len(docs) == 1:
+        d = docs[0]
+        _s_set(
+            key,
+            source_chat_id=int(d["chat_id"]),
+            source_msg_id=int(d["message_id"]),
+            source_name=d.get("name") or "file",
+            original_caption=_clean_caption(message.caption or ""),
+            caption_mode="auto",
+            custom_caption=None,
+            timer_secs=0,
+            user_filter="all",
+            timer_context=None,
+            awaiting=None,
+            use_all=False,
+            source_list=None,
+            broadcast_channel_id=int(message.chat.id),
+        )
+        await _show_main(message, key)
+        return
+
+    # Multiple files → show source picker
+    _s_set(
+        key,
+        broadcast_channel_id=int(message.chat.id),
+        awaiting=None,
+    )
+    await _show_source_picker(message, key, docs)
+
+
 if _FILTER is not None:
 
     @Client.on_message(_FILTER, group=-8306)
@@ -306,7 +316,6 @@ if _FILTER is not None:
                 int(message.id), int(message.chat.id), name,
             )
 
-            # Debounce: only last file in a batch shows the panel
             _debounce[key] = int(message.id)
             asyncio.create_task(
                 _debounced_show(message, key, int(message.id))
@@ -317,7 +326,7 @@ if _FILTER is not None:
 
 
 # ============================================================
-# /broadcast COMMAND (PM) — reads sources from DB
+# /broadcast COMMAND
 # ============================================================
 
 @Client.on_message(
@@ -329,7 +338,6 @@ async def bc_cmd(client: Client, message: Message):
         return
 
     key = int(message.chat.id)
-
     ch = getattr(config, "BROADCAST_CHANNEL_ID", None)
     if not ch:
         return await message.reply_text(
@@ -337,7 +345,6 @@ async def bc_cmd(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
         )
 
-    # ✅ DB read (bots cannot use get_chat_history)
     docs = await _list_sources(limit=10)
     if not docs:
         return await message.reply_text(
@@ -350,44 +357,77 @@ async def bc_cmd(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
         )
 
-    src_list = [(int(d["message_id"]), d.get("name") or "file")
-                for d in docs]
-
-    _s_set(
-        key,
-        source_list=src_list,
-        broadcast_channel_id=int(ch),
-        awaiting=None,
-    )
-
-    text = "\n".join([
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"📢 <b>{F.fb('SELECT SOURCE')}</b>",
-        F.DIV, "",
-        f"📌 {F.sc('pick a file from the broadcast channel')}",
-    ])
-
-    rows = []
-    for i, (mid, name) in enumerate(src_list):
-        rows.append([InlineKeyboardButton(
-            f"📦 {name[:42]}",
-            callback_data=_cb(f"src:{i}"),
-        )])
-    rows.append([InlineKeyboardButton(
-        f"❌ {F.sc('cancel')}",
-        callback_data=_cb("cancel"),
-    )])
-
     try:
         message.stop_propagation()
     except Exception:
         pass
 
-    await message.reply_text(
-        text,
+    _s_set(key, broadcast_channel_id=int(ch), awaiting=None)
+
+    if len(docs) == 1:
+        d = docs[0]
+        _s_upd(
+            key,
+            source_chat_id=int(d["chat_id"]),
+            source_msg_id=int(d["message_id"]),
+            source_name=d.get("name") or "file",
+            original_caption="",
+            caption_mode="auto",
+            custom_caption=None,
+            timer_secs=0,
+            user_filter="all",
+            use_all=False,
+            source_list=None,
+        )
+        await _show_main(message, key)
+    else:
+        await _show_source_picker(message, key, docs)
+
+
+# ============================================================
+# SOURCE PICKER (multi-file)
+# ============================================================
+
+async def _show_source_picker(
+    reply_to: Message, key: int, docs: List[Dict[str, Any]],
+) -> None:
+    n = len(docs)
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📦 <b>{F.fb('SELECT SOURCE')}</b>",
+        F.DIV, "",
+        f"📊 {F.sc('ready')} · <b>{n} {F.sc('files')}</b>",
+        "",
+        f"📌 {F.sc('send order')} · <i>{F.sc('oldest first')}</i>",
+        "",
+        F.DIV_S,
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    rows.append([InlineKeyboardButton(
+        f"🎯 {F.sc('USE ALL')} ({n} {F.sc('files')})",
+        callback_data=_cb("multi_all"),
+    )])
+
+    for i, d in enumerate(docs, 1):
+        name = (d.get("name") or "file")[:36]
+        rows.append([InlineKeyboardButton(
+            f"{i}. 📦 {name}",
+            callback_data=_cb(f"multi_one:{i-1}"),
+        )])
+
+    rows.append([InlineKeyboardButton(
+        f"❌ {F.sc('cancel')}",
+        callback_data=_cb("cancel"),
+    )])
+
+    await reply_to.reply_text(
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        quote=True,
     )
 
 
@@ -417,11 +457,13 @@ async def _show_main(reply_to: Message, key: int) -> None:
         logger.debug(f"[BC] main reply: {e}")
 
 
-def _main_text_kb(s: Dict[str, Any]) -> tuple:
+def _main_text_kb(s: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    # Source label
     if s.get("use_all") and s.get("source_list"):
         name = f"{len(s['source_list'])} FILES"
     else:
         name = (s.get("source_name") or "file")[:40]
+
     cap_mode = s.get("caption_mode", "auto")
     cap_icon = {
         "auto": "🌐 global",
@@ -429,8 +471,8 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
         "custom": "✏ custom",
         "none": "🚫 none",
     }.get(cap_mode, "?")
-    timer = s.get("timer_secs", 0)
 
+    timer = s.get("timer_secs", 0)
     ch_count = s.get("_ch_count", 0)
     group_count = s.get("_group_count", 0)
     user_count = s.get("_user_count", 0)
@@ -469,8 +511,8 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
                 callback_data=_cb("users"),
             ),
             InlineKeyboardButton(
-                f"📝 {F.sc('caption')}",
-                callback_data=_cb("cap"),
+                f"⚙️ {F.sc('settings')}",
+                callback_data=_cb("settings"),
             ),
         ],
         [
@@ -489,7 +531,7 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
                 callback_data=_cb("sources"),
             ),
             InlineKeyboardButton(
-                f"🚀 {F.sc('send all')}",
+                f"🎯 {F.sc('send all')}",
                 callback_data=_cb("multi_all"),
             ),
         ],
@@ -503,46 +545,34 @@ def _main_text_kb(s: Dict[str, Any]) -> tuple:
 
     return text, kb
 
-   
 
-async def _show_multi_source(key: int) -> Optional[tuple]:
-    """Show all recent files as a picker."""
-    docs = await _list_sources(limit=10)
-    if not docs:
-        return None
+# ============================================================
+# CAPTION CLEANER (used by watcher + runners)
+# ============================================================
 
-    if len(docs) == 1:
-        return None
+import re as _re
 
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"📦 <b>{F.fb('SELECT SOURCE')}</b>",
-        F.DIV, "",
-        f"📊 {F.sc('files ready')} · <b>{len(docs)}</b>",
+
+def _clean_caption(text: str) -> str:
+    if not text:
+        return ""
+    text = _re.sub(r"https?://\S+", "", text)
+    text = _re.sub(r"\bt\.me/\S+", "", text)
+    text = _re.sub(r"\bjoinchat/\S+", "", text)
+    text = _re.sub(r"\btelegram\.me/\S+", "", text)
+    text = _re.sub(r"\btelegram\.dog/\S+", "", text)
+    text = _re.sub(r"@[A-Za-z0-9_]{3,}", "", text)
+    text = _re.sub(
+        r"(?im)^\s*(join|subscribe|click here|join now|join us)\s*[:.\-]?\s*.*$",
         "",
-        f"📌 {F.sc('pick one file OR use all')}",
-    ]
-
-    rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(
-            f"📦 {F.sc('USE ALL')} ({len(docs)} {F.sc('files')})",
-            callback_data=_cb("multi_all"),
-        )],
-    ]
-
-    for i, d in enumerate(docs, 1):
-        name = (d.get("name") or "file")[:32]
-        rows.append([InlineKeyboardButton(
-            f"{i}. {name}",
-            callback_data=_cb(f"multi_one:{i-1}"),
-        )])
-
-    rows.append([InlineKeyboardButton(
-        f"❌ {F.sc('cancel')}",
-        callback_data=_cb("cancel"),
-    )])
-
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+        text,
+    )
+    text = _re.sub(r"\(\s*\)", "", text)
+    text = _re.sub(r"\[\s*\]", "", text)
+    text = _re.sub(r"[ \t]+", " ", text)
+    text = _re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    return text.strip()
 
 
 # ============================================================
@@ -559,6 +589,8 @@ async def _show_channels(q: CallbackQuery, key: int) -> None:
         f"📢 <b>{F.fb('SELECT CHANNELS')}</b>",
         F.DIV, "",
         f"📊 {F.sc('total')} · <b>{len(enabled)}</b>",
+        "",
+        F.DIV_S,
     ]
 
     rows: List[List[InlineKeyboardButton]] = []
@@ -570,11 +602,11 @@ async def _show_channels(q: CallbackQuery, key: int) -> None:
     else:
         rows.append([InlineKeyboardButton(
             f"🎯 {F.sc('SEND TO ALL')} ({len(enabled)})",
-            callback_data=_cb("ch_all_timer"),
+            callback_data=_cb("ch_all_go"),
         )])
         for c in enabled:
             cid = c.get("chat_id")
-            t = str(c.get("title") or cid)[:26]
+            t = str(c.get("title") or cid)[:28]
             marks = ""
             if c.get("caption") is not None:
                 marks += "📝"
@@ -605,6 +637,8 @@ async def _show_channel_editor(
     q: CallbackQuery, key: int, cid: int,
 ) -> None:
     from plugins.broadcast import channels as CH
+    from plugins.broadcast import templates as T
+
     ch = await CH.get_channel(cid)
     if not ch:
         return await q.answer("channel not found", show_alert=True)
@@ -616,18 +650,22 @@ async def _show_channel_editor(
 
     if ch_cap is not None:
         cap_src = "📝 channel custom"
-        preview = ch_cap[:150]
+        preview = _clean_caption(ch_cap)[:150]
     else:
-        from plugins.broadcast import templates as T
-        preview = (await T.get_caption())[:150]
+        preview = _clean_caption(await T.get_caption())[:150]
         cap_src = "🌐 global default"
 
     ch_btns = ch.get("buttons")
-    btn_src = (
-        f"🔘 custom ({len(ch_btns)})"
-        if ch_btns is not None
-        else "🌐 global"
-    )
+    if ch_btns is not None:
+        btn_src = f"🔘 custom ({len(ch_btns)})"
+    else:
+        btn_src = "🌐 global"
+
+    # source label
+    if s.get("use_all") and s.get("source_list"):
+        src_label = f"{len(s['source_list'])} FILES"
+    else:
+        src_label = (s.get("source_name") or "file")[:40]
 
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -635,6 +673,7 @@ async def _show_channel_editor(
         F.DIV, "",
         f"📛 <b>{F.sc(title)}</b>",
         f"🆔 <code>{cid}</code>",
+        f"📦 {F.sc('source')} · <code>{src_label}</code>",
         "",
         F.DIV_S,
         f"📝 {F.sc('caption')} · <b>{cap_src}</b>",
@@ -651,7 +690,7 @@ async def _show_channel_editor(
                 callback_data=_cb(f"cap_edit_ch:{cid}"),
             ),
             InlineKeyboardButton(
-                f"📄 {F.sc('use original')}",
+                f"📄 {F.sc('original')}",
                 callback_data=_cb(f"cap_keep_ch:{cid}"),
             ),
         ],
@@ -706,6 +745,7 @@ async def _show_channel_editor(
 async def _show_channel_buttons(q: CallbackQuery, cid: int) -> None:
     from plugins.broadcast import channels as CH
     from plugins.broadcast import templates as T
+
     ch = await CH.get_channel(cid)
     if not ch:
         return await q.answer("not found", show_alert=True)
@@ -726,9 +766,14 @@ async def _show_channel_buttons(q: CallbackQuery, cid: int) -> None:
         "",
         F.DIV_S,
     ]
+
     for i, b in enumerate(btns, 1):
         lines.append(f"{i}. <b>{F.sc(str(b.get('name'))[:40])}</b>")
         lines.append(f"   <code>{str(b.get('url'))[:60]}</code>")
+
+    if not btns:
+        lines.append("")
+        lines.append(f"⚪ {F.sc('no buttons configured')}")
 
     rows = []
     if using_default:
@@ -761,51 +806,6 @@ async def _show_channel_buttons(q: CallbackQuery, cid: int) -> None:
 
 
 # ============================================================
-# TIMER PICKER
-# ============================================================
-
-async def _show_timer(
-    q: CallbackQuery, key: int, context: str,
-) -> None:
-    s = _s_get(key) or {}
-    timer = s.get("timer_secs", 0)
-
-    text = "\n".join([
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"⏱ <b>{F.fb('AUTO-DELETE TIMER')}</b>",
-        F.DIV, "",
-        f"🎯 {F.sc('context')} · <b>{F.sc(context)}</b>",
-        "",
-        f"📌 {F.sc('never = stays forever')}",
-        f"📌 {F.sc('others = auto-delete after')}",
-        "",
-        f"⏱ {F.sc('current')} · <b>{_fmt_timer(timer)}</b>",
-    ])
-
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
-    for secs, label in TIMERS:
-        mark = "✅ " if secs == timer else ""
-        row.append(InlineKeyboardButton(
-            f"{mark}{label}",
-            callback_data=_cb(f"timer_set:{secs}:{context}"),
-        ))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-
-    rows.append([InlineKeyboardButton(
-        f"⬅ {F.sc('back')}",
-        callback_data=_cb("home"),
-    )])
-
-    await _edit(q, text, InlineKeyboardMarkup(rows))
-    await q.answer()
-
-
-# ============================================================
 # GROUP PICKER
 # ============================================================
 
@@ -827,6 +827,8 @@ async def _show_groups(q: CallbackQuery, key: int) -> None:
         f"👥 <b>{F.fb('SELECT GROUPS')}</b>",
         F.DIV, "",
         f"📊 {F.sc('total')} · <b>{len(groups)}</b>",
+        "",
+        F.DIV_S,
     ]
 
     rows: List[List[InlineKeyboardButton]] = []
@@ -834,15 +836,18 @@ async def _show_groups(q: CallbackQuery, key: int) -> None:
     if groups:
         rows.append([InlineKeyboardButton(
             f"🎯 {F.sc('SEND TO ALL')} ({len(groups)})",
-            callback_data=_cb("gr_all_timer"),
+            callback_data=_cb("gr_all_go"),
         )])
-        for g in groups[:10]:
+        for g in groups[:12]:
             gid = g.get("chat_id")
             t = str(g.get("title") or gid)[:30]
             rows.append([InlineKeyboardButton(
                 f"👥 {t}",
                 callback_data=_cb(f"gr:{gid}"),
             )])
+    else:
+        lines.append("")
+        lines.append(f"⚪ {F.sc('no groups registered')}")
 
     rows.append([InlineKeyboardButton(
         f"⬅ {F.sc('back')}",
@@ -903,7 +908,107 @@ async def _show_users(q: CallbackQuery, key: int) -> None:
 
 
 # ============================================================
-# CAPTION MENU
+# SETTINGS MENU (global caption + buttons)
+# ============================================================
+
+async def _show_settings(q: CallbackQuery, key: int) -> None:
+    from plugins.broadcast import templates as T
+
+    g_cap = _clean_caption(await T.get_caption())[:120]
+    g_btns = await T.get_buttons()
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"⚙️ <b>{F.fb('SETTINGS')}</b>",
+        F.DIV, "",
+        f"🌐 <b>{F.fb('GLOBAL CAPTION')}</b>",
+        f"<code>{F.sc(g_cap) if g_cap else '(empty)'}</code>",
+        "",
+        F.DIV_S,
+        f"🔘 {F.sc('global buttons')} · <b>{len(g_btns)}</b>",
+    ])
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"📝 {F.sc('edit caption')}",
+                callback_data=_cb("cap_edit_global"),
+            ),
+            InlineKeyboardButton(
+                f"📄 {F.sc('show template')}",
+                callback_data=_cb("cap_show_global"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🎛 {F.sc('manage buttons')}",
+                callback_data=_cb("g_btns"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🗑 {F.sc('clear sources')}",
+                callback_data=_cb("clear_sources"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"⬅ {F.sc('back')}",
+                callback_data=_cb("home"),
+            ),
+        ],
+    ]
+
+    await _edit(q, text, InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+# ============================================================
+# GLOBAL BUTTONS EDITOR
+# ============================================================
+
+async def _show_global_buttons(q: CallbackQuery) -> None:
+    from plugins.broadcast import templates as T
+    btns = await T.get_buttons()
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔘 <b>{F.fb('GLOBAL BUTTONS')}</b>",
+        F.DIV, "",
+    ]
+
+    for i, b in enumerate(btns, 1):
+        lines.append(f"{i}. <b>{F.sc(str(b.get('name'))[:40])}</b>")
+        lines.append(f"   <code>{str(b.get('url'))[:60]}</code>")
+
+    if not btns:
+        lines.append(f"⚪ {F.sc('no buttons configured')}")
+
+    rows = []
+    for i, b in enumerate(btns, 1):
+        rows.append([InlineKeyboardButton(
+            f"🗑 {i}. {str(b.get('name'))[:30]}",
+            callback_data=_cb(f"g_btns_rm:{i-1}"),
+        )])
+    rows.append([InlineKeyboardButton(
+        f"➕ {F.sc('add button')}",
+        callback_data=_cb("g_btns_add"),
+    )])
+    rows.append([InlineKeyboardButton(
+        f"🗑 {F.sc('clear all')}",
+        callback_data=_cb("g_btns_clear"),
+    )])
+    rows.append([InlineKeyboardButton(
+        f"⬅ {F.sc('back')}",
+        callback_data=_cb("settings"),
+    )])
+
+    await _edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+# ============================================================
+# CAPTION MENU (global editor for current source)
 # ============================================================
 
 async def _show_caption(q: CallbackQuery, key: int) -> None:
@@ -911,16 +1016,17 @@ async def _show_caption(q: CallbackQuery, key: int) -> None:
     mode = s.get("caption_mode", "auto")
 
     from plugins.broadcast import templates as T
+
     if mode == "custom" and s.get("custom_caption") is not None:
-        cap = s["custom_caption"]
+        cap = _clean_caption(s["custom_caption"])
     elif mode == "keep":
-        cap = s.get("original_caption") or ""
+        cap = _clean_caption(s.get("original_caption") or "")
     elif mode == "none":
         cap = ""
     else:
-        cap = await T.get_caption()
+        cap = _clean_caption(await T.get_caption())
 
-    preview = cap[:200] + ("…" if len(cap) > 200 else "")
+    preview = cap[:250] + ("…" if len(cap) > 250 else "")
 
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -928,6 +1034,7 @@ async def _show_caption(q: CallbackQuery, key: int) -> None:
         F.DIV, "",
         f"📌 {F.sc('mode')} · <b>{F.sc(mode)}</b>",
         "",
+        F.DIV_S,
         f"<code>{F.sc(preview) if preview else '(empty)'}</code>",
     ])
 
@@ -963,7 +1070,52 @@ async def _show_caption(q: CallbackQuery, key: int) -> None:
 
 
 # ============================================================
-# CAPTION / BUTTONS HELPERS
+# TIMER PICKER
+# ============================================================
+
+async def _show_timer(
+    q: CallbackQuery, key: int, context: str,
+) -> None:
+    s = _s_get(key) or {}
+    timer = s.get("timer_secs", 0)
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"⏱ <b>{F.fb('AUTO-DELETE TIMER')}</b>",
+        F.DIV, "",
+        f"🎯 {F.sc('context')} · <b>{F.sc(context)}</b>",
+        "",
+        f"📌 {F.sc('never = stays forever')}",
+        f"📌 {F.sc('others = auto-delete after')}",
+        "",
+        f"⏱ {F.sc('current')} · <b>{_fmt_timer(timer)}</b>",
+    ])
+
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for secs, label in TIMERS:
+        mark = "✅ " if secs == timer else ""
+        row.append(InlineKeyboardButton(
+            f"{mark}{label}",
+            callback_data=_cb(f"timer_set:{secs}:{context}"),
+        ))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(
+        f"⬅ {F.sc('back')}",
+        callback_data=_cb("home"),
+    )])
+
+    await _edit(q, text, InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+# ============================================================
+# CAPTION / BUTTON HELPERS
 # ============================================================
 
 async def _effective_caption(key: int) -> str:
@@ -971,23 +1123,22 @@ async def _effective_caption(key: int) -> str:
     mode = s.get("caption_mode", "auto")
 
     if mode == "custom" and s.get("custom_caption") is not None:
-        return s["custom_caption"]
+        return _clean_caption(s["custom_caption"])
     if mode == "keep":
-        return s.get("original_caption") or ""
+        return _clean_caption(s.get("original_caption") or "")
     if mode == "none":
         return ""
 
     from plugins.broadcast import templates as T
-    return await T.get_caption()
+    return _clean_caption(await T.get_caption())
 
 
 async def _effective_buttons(key: int) -> List[Dict[str, Any]]:
     from plugins.broadcast import templates as T
     return await T.get_buttons()
 
-
 # ============================================================
-# ROUTER
+# CALLBACK ROUTER — handles all bca: actions
 # ============================================================
 
 @Client.on_callback_query(
@@ -1003,14 +1154,87 @@ async def bc_router(client: Client, q: CallbackQuery):
     parts = str(q.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
 
+    # ── CANCEL works without session ──
     if action == "cancel":
         _s_drop(key)
+        _debounce.pop(key, None)
         try:
             await q.message.delete()
         except Exception:
             pass
         return await q.answer("cancelled")
 
+    # ── Source picker actions work without full session ──
+    if action == "multi_all":
+        docs = await _list_sources(limit=10)
+        if not docs:
+            return await q.answer("⚠️ no files", show_alert=True)
+        srcs = [
+            (int(d["message_id"]), d.get("name") or "file")
+            for d in docs
+        ]
+        if not s:
+            _s_set(key, broadcast_channel_id=int(docs[0]["chat_id"]))
+        _s_upd(
+            key,
+            source_list=srcs,
+            use_all=True,
+            source_chat_id=int(docs[0]["chat_id"]),
+            source_msg_id=int(docs[0]["message_id"]),
+            source_name=f"{len(srcs)} FILES",
+            original_caption="",
+            caption_mode="auto",
+            custom_caption=None,
+            timer_secs=0,
+            user_filter="all",
+        )
+        s2 = _s_get(key) or {}
+        s2["_ch_count"] = await _count_channels()
+        s2["_group_count"] = await _count_groups()
+        s2["_user_count"] = await _count_users()
+        text, kb = _main_text_kb(s2)
+        await _edit(q, text, kb)
+        return await q.answer(f"✅ {len(srcs)} files loaded")
+
+    if action == "multi_one":
+        idx = int(parts[2]) if len(parts) > 2 else 0
+        docs = await _list_sources(limit=10)
+        if idx < 0 or idx >= len(docs):
+            return await q.answer("❌ invalid", show_alert=True)
+        d = docs[idx]
+        if not s:
+            _s_set(key, broadcast_channel_id=int(d["chat_id"]))
+        _s_upd(
+            key,
+            source_chat_id=int(d["chat_id"]),
+            source_msg_id=int(d["message_id"]),
+            source_name=d.get("name") or "file",
+            original_caption="",
+            caption_mode="auto",
+            custom_caption=None,
+            timer_secs=0,
+            user_filter="all",
+            source_list=None,
+            use_all=False,
+        )
+        s2 = _s_get(key) or {}
+        s2["_ch_count"] = await _count_channels()
+        s2["_group_count"] = await _count_groups()
+        s2["_user_count"] = await _count_users()
+        text, kb = _main_text_kb(s2)
+        await _edit(q, text, kb)
+        return await q.answer("✅ file loaded")
+
+    if action == "sources":
+        if not s:
+            return await q.answer("⏱ expired", show_alert=True)
+        docs = await _list_sources(limit=10)
+        if not docs:
+            return await q.answer("no files", show_alert=True)
+        await _show_source_picker_edit(q, key, docs)
+        return await q.answer()
+
+    # ── Other actions need session ──
     if not s:
         return await q.answer(
             "⏱ session expired — re-upload the file",
@@ -1018,6 +1242,7 @@ async def bc_router(client: Client, q: CallbackQuery):
         )
 
     try:
+        # ═══ HOME ═══
         if action == "home":
             s["_ch_count"] = await _count_channels()
             s["_group_count"] = await _count_groups()
@@ -1026,96 +1251,100 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer()
 
-        if action == "multi_all":
-            docs = await _list_sources(limit=10)
-            if not docs:
-                return await q.answer("no files", show_alert=True)
-            srcs = [
-                (int(d["message_id"]), d.get("name") or "file")
-                for d in docs
-            ]
-            _s_upd(key, source_list=srcs, use_all=True)
+        # ═══ SETTINGS ═══
+        if action == "settings":
+            return await _show_settings(q, key)
 
-            s2 = _s_get(key) or {}
-            s2["_ch_count"] = await _count_channels()
-            s2["_group_count"] = await _count_groups()
-            s2["_user_count"] = await _count_users()
-            text, kb = _main_text_kb(s2)
-            await _edit(q, text, kb)
-            return await q.answer(f"✅ {len(srcs)} files loaded")
+        if action == "clear_sources":
+            await _clear_sources()
+            await q.answer("🗑 sources cleared")
+            return await q.answer("🗑 cleared", show_alert=True)
 
-        if action == "multi_one":
-            idx = int(parts[2]) if len(parts) > 2 else 0
-            docs = await _list_sources(limit=10)
-            if idx < 0 or idx >= len(docs):
-                return await q.answer("invalid", show_alert=True)
-            d = docs[idx]
-            ch_id = int(getattr(config, "BROADCAST_CHANNEL_ID", 0))
-
-            _s_upd(
-                key,
-                source_chat_id=ch_id,
-                source_msg_id=int(d["message_id"]),
-                source_name=d.get("name") or "file",
-                original_caption="",
-                caption_mode="auto",
-                custom_caption=None,
-                timer_secs=0,
-                user_filter="all",
-                source_list=None,
-                use_all=False,
-            )
-
-            s2 = _s_get(key) or {}
-            s2["_ch_count"] = await _count_channels()
-            s2["_group_count"] = await _count_groups()
-            s2["_user_count"] = await _count_users()
-            text, kb = _main_text_kb(s2)
-            await _edit(q, text, kb)
-            return await q.answer("✅ file loaded")
-
-        if action == "sources":
-            res = await _show_multi_source(key)
-            if not res:
-                return await q.answer("only 1 file", show_alert=True)
-            text, kb = res
+        # ═══ GLOBAL CAPTION ═══
+        if action == "cap_edit_global":
+            _s_upd(key, awaiting="global_caption")
+            text = "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"✏ <b>{F.fb('EDIT GLOBAL CAPTION')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('send new global caption')}",
+                f"📌 {F.sc('supports HTML + variables')}",
+                f"📌 {F.sc('send')} <code>-</code> {F.sc('to reset')}",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"❌ {F.sc('cancel')}",
+                    callback_data=_cb("settings"),
+                ),
+            ]])
             await _edit(q, text, kb)
             return await q.answer()
 
-        if action == "src":
-            idx = int(parts[2]) if len(parts) > 2 else 0
-            srcs = s.get("source_list") or []
-            if idx < 0 or idx >= len(srcs):
-                return await q.answer("❌ invalid", show_alert=True)
-            mid, name = srcs[idx]
-            ch_id = s.get("broadcast_channel_id")
-
-            _s_upd(
-                key,
-                source_chat_id=int(ch_id),
-                source_msg_id=int(mid),
-                source_name=name,
-                original_caption="",
-                caption_mode="auto",
-                custom_caption=None,
-                timer_secs=0,
-                user_filter="all",
-            )
-
-            s2 = _s_get(key) or {}
-            s2["_ch_count"] = await _count_channels()
-            s2["_group_count"] = await _count_groups()
-            s2["_user_count"] = await _count_users()
-            text, kb = _main_text_kb(s2)
+        if action == "cap_show_global":
+            from plugins.broadcast import templates as T
+            cap = await T.get_caption()
+            text = "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('GLOBAL CAPTION')}</b>",
+                F.DIV, "",
+                f"<code>{_esc(cap)[:600]}</code>",
+                "",
+                F.DIV_S,
+                f"<i>{F.sc('variables:')}</i>",
+                f"<code>{{file_name}} {{file_size}} {{rating}} {{year}}</code>",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"⬅ {F.sc('back')}",
+                    callback_data=_cb("settings"),
+                ),
+            ]])
             await _edit(q, text, kb)
-            return await q.answer("✅ source loaded")
+            return await q.answer()
 
+        # ═══ GLOBAL BUTTONS ═══
+        if action == "g_btns":
+            return await _show_global_buttons(q)
+
+        if action == "g_btns_add":
+            _s_upd(key, awaiting="g_btn_add")
+            text = "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"➕ <b>{F.fb('ADD GLOBAL BUTTON')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('send as:')}",
+                f"<code>Name | https://url</code>",
+                "",
+                f"<i>{F.sc('example:')}</i>",
+                f"<code>Join Channel | @mychannel</code>",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"❌ {F.sc('cancel')}",
+                    callback_data=_cb("g_btns"),
+                ),
+            ]])
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        if action == "g_btns_rm":
+            idx = int(parts[2]) if len(parts) > 2 else 0
+            from plugins.broadcast import templates as T
+            btns = await T.get_buttons()
+            if 0 <= idx < len(btns):
+                btns.pop(idx)
+                await T.set_buttons(btns)
+                await q.answer("🗑 removed")
+            return await _show_global_buttons(q)
+
+        if action == "g_btns_clear":
+            from plugins.broadcast import templates as T
+            await T.set_buttons([])
+            await q.answer("🗑 cleared")
+            return await _show_global_buttons(q)
+
+        # ═══ CHANNELS ═══
         if action == "channels":
             return await _show_channels(q, key)
-
-        if action == "ch_all_timer":
-            _s_upd(key, timer_context="ch_all")
-            return await _show_timer(q, key, "all channels")
 
         if action == "ch":
             cid = int(parts[2]) if len(parts) > 2 else 0
@@ -1134,6 +1363,7 @@ async def bc_router(client: Client, q: CallbackQuery):
         if action == "ch_all_go":
             return await _run_channels_all(client, q, key)
 
+        # ═══ CHANNEL BUTTONS ═══
         if action == "ch_btns":
             cid = int(parts[2]) if len(parts) > 2 else 0
             return await _show_channel_buttons(q, cid)
@@ -1142,7 +1372,7 @@ async def bc_router(client: Client, q: CallbackQuery):
             cid = int(parts[2]) if len(parts) > 2 else 0
             from plugins.broadcast import channels as CH
             await CH.set_buttons(cid, [])
-            await q.answer("✏ empty custom list")
+            await q.answer("✏ empty list ready")
             return await _show_channel_buttons(q, cid)
 
         if action == "ch_btns_rst":
@@ -1170,9 +1400,10 @@ async def bc_router(client: Client, q: CallbackQuery):
             _s_upd(key, awaiting="btn_add_ch", cap_target_ch=cid)
             text = "\n".join([
                 f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"➕ <b>{F.fb('ADD BUTTON')}</b>",
+                f"➕ <b>{F.fb('ADD CHANNEL BUTTON')}</b>",
                 F.DIV, "",
-                f"📌 {F.sc('send')} <code>Name | URL</code>",
+                f"📌 {F.sc('send as:')}",
+                f"<code>Name | https://url</code>",
             ])
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -1183,12 +1414,44 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer()
 
+        # ═══ CHANNEL CAPTION OVERRIDES ═══
+        if action == "cap_edit_ch":
+            cid = int(parts[2]) if len(parts) > 2 else 0
+            _s_upd(key, awaiting="caption_ch", cap_target_ch=cid)
+            text = "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"✏ <b>{F.fb('CHANNEL CAPTION')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('send new caption for this channel')}",
+                f"📌 {F.sc('send')} <code>-</code> {F.sc('for empty')}",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"❌ {F.sc('cancel')}",
+                    callback_data=_cb(f"ch:{cid}"),
+                ),
+            ]])
+            await _edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_keep_ch":
+            cid = int(parts[2]) if len(parts) > 2 else 0
+            _s_upd(key, caption_mode="keep", custom_caption=None)
+            return await _show_channel_editor(q, key, cid)
+
+        if action == "cap_global_ch":
+            cid = int(parts[2]) if len(parts) > 2 else 0
+            _s_upd(key, caption_mode="auto", custom_caption=None)
+            return await _show_channel_editor(q, key, cid)
+
+        if action == "cap_none_ch":
+            cid = int(parts[2]) if len(parts) > 2 else 0
+            _s_upd(key, caption_mode="none", custom_caption=None)
+            return await _show_channel_editor(q, key, cid)
+
+        # ═══ GROUPS ═══
         if action == "groups":
             return await _show_groups(q, key)
-
-        if action == "gr_all_timer":
-            _s_upd(key, timer_context="gr_all")
-            return await _show_timer(q, key, "all groups")
 
         if action == "gr":
             gid = int(parts[2]) if len(parts) > 2 else 0
@@ -1202,6 +1465,7 @@ async def bc_router(client: Client, q: CallbackQuery):
             gid = int(parts[2]) if len(parts) > 2 else 0
             return await _run_single_group(client, q, key, gid)
 
+        # ═══ USERS ═══
         if action == "users":
             return await _show_users(q, key)
 
@@ -1213,22 +1477,20 @@ async def bc_router(client: Client, q: CallbackQuery):
         if action == "us_go":
             return await _run_users(client, q, key)
 
+        # ═══ MAIN TIMER ═══
         if action == "main_timer":
             _s_upd(key, timer_context="main")
             return await _show_timer(q, key, "general")
 
+        # ═══ TIMER SET ═══
         if action == "timer_set":
             secs = int(parts[2]) if len(parts) > 2 else 0
             ctx = ":".join(parts[3:]) if len(parts) > 3 else ""
             _s_upd(key, timer_secs=secs)
 
-            if ctx == "ch_all":
-                return await _show_timer(q, key, "all channels")
             if ctx.startswith("ch:"):
                 cid = int(ctx.split(":", 1)[1])
                 return await _show_channel_editor(q, key, cid)
-            if ctx == "gr_all":
-                return await _show_timer(q, key, "all groups")
             if ctx.startswith("gr:"):
                 gid = int(ctx.split(":", 1)[1])
                 return await _show_timer(q, key, f"group {gid}")
@@ -1249,6 +1511,7 @@ async def bc_router(client: Client, q: CallbackQuery):
 
             return await _show_timer(q, key, ctx or "general")
 
+        # ═══ CAPTION ═══
         if action == "cap":
             return await _show_caption(q, key)
 
@@ -1275,43 +1538,11 @@ async def bc_router(client: Client, q: CallbackQuery):
             await _edit(q, text, kb)
             return await q.answer()
 
-        if action == "cap_edit_ch":
-            cid = int(parts[2])
-            _s_upd(key, awaiting="caption_ch", cap_target_ch=cid)
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"✏ <b>{F.fb('CHANNEL CAPTION')}</b>",
-                F.DIV, "",
-                f"📌 {F.sc('send new caption for this channel')}",
-                f"📌 {F.sc('send')} <code>-</code> {F.sc('for empty')}",
-            ])
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"❌ {F.sc('cancel')}",
-                    callback_data=_cb(f"ch:{cid}"),
-                ),
-            ]])
-            await _edit(q, text, kb)
-            return await q.answer()
-
-        if action == "cap_keep_ch":
-            cid = int(parts[2])
-            _s_upd(key, caption_mode="keep", custom_caption=None)
-            return await _show_channel_editor(q, key, cid)
-
-        if action == "cap_global_ch":
-            cid = int(parts[2])
-            _s_upd(key, caption_mode="auto", custom_caption=None)
-            return await _show_channel_editor(q, key, cid)
-
-        if action == "cap_none_ch":
-            cid = int(parts[2])
-            _s_upd(key, caption_mode="none", custom_caption=None)
-            return await _show_channel_editor(q, key, cid)
-
+        # ═══ PREVIEW ═══
         if action == "preview":
             return await _show_preview(q, key)
 
+        # ═══ STOP ═══
         if action == "stop":
             from plugins.broadcast import engine as E
             ok = E.cancel()
@@ -1330,6 +1561,52 @@ async def bc_router(client: Client, q: CallbackQuery):
 
 
 # ============================================================
+# SOURCE PICKER (edit existing message)
+# ============================================================
+
+async def _show_source_picker_edit(
+    q: CallbackQuery, key: int, docs: List[Dict[str, Any]],
+) -> None:
+    n = len(docs)
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📦 <b>{F.fb('SELECT SOURCE')}</b>",
+        F.DIV, "",
+        f"📊 {F.sc('ready')} · <b>{n} {F.sc('files')}</b>",
+        "",
+        f"📌 {F.sc('send order')} · <i>{F.sc('oldest first')}</i>",
+        "",
+        F.DIV_S,
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"🎯 {F.sc('USE ALL')} ({n} {F.sc('files')})",
+            callback_data=_cb("multi_all"),
+        )],
+    ]
+
+    for i, d in enumerate(docs, 1):
+        name = (d.get("name") or "file")[:36]
+        rows.append([InlineKeyboardButton(
+            f"{i}. 📦 {name}",
+            callback_data=_cb(f"multi_one:{i-1}"),
+        )])
+
+    rows.append([InlineKeyboardButton(
+        f"⬅ {F.sc('back')}",
+        callback_data=_cb("home"),
+    )])
+    rows.append([InlineKeyboardButton(
+        f"❌ {F.sc('cancel')}",
+        callback_data=_cb("cancel"),
+    )])
+
+    await _edit(q, "\n".join(lines), InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+# ============================================================
 # PREVIEW
 # ============================================================
 
@@ -1338,10 +1615,13 @@ async def _show_preview(q: CallbackQuery, key: int) -> None:
     cap = await _effective_caption(key)
     btns = await _effective_buttons(key)
 
-    name = s.get("source_name") or "file"
-    timer = s.get("timer_secs", 0)
+    if s.get("use_all") and s.get("source_list"):
+        name = f"{len(s['source_list'])} FILES"
+    else:
+        name = s.get("source_name") or "file"
 
-    preview = cap[:300] + ("…" if len(cap) > 300 else "")
+    timer = s.get("timer_secs", 0)
+    preview = cap[:350] + ("…" if len(cap) > 350 else "")
 
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -1357,7 +1637,7 @@ async def _show_preview(q: CallbackQuery, key: int) -> None:
         F.DIV_S,
         f"🔘 <b>{F.fb('BUTTONS')}</b> · <b>{len(btns)}</b>",
     ]
-    for b in btns[:6]:
+    for b in btns[:8]:
         lines.append(
             f"   • <b>{F.sc(str(b.get('name'))[:40])}</b>"
         )
@@ -1390,7 +1670,20 @@ async def _show_preview(q: CallbackQuery, key: int) -> None:
 
 
 # ============================================================
-# RUNNERS
+# HTML escape helper
+# ============================================================
+
+def _esc(text) -> str:
+    if text is None:
+        return ""
+    return (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+# ============================================================
+# RUNNERS — kick off broadcast
 # ============================================================
 
 async def _run_single_channel(
@@ -1412,14 +1705,14 @@ async def _run_single_channel(
     if mode == "custom" and s.get("custom_caption") is not None:
         cap = _clean_caption(s["custom_caption"])
     elif mode == "keep":
-        cap = s.get("original_caption") or ""
+        cap = _clean_caption(s.get("original_caption") or "")
     elif mode == "none":
         cap = ""
     elif ch_cap is not None:
         cap = _clean_caption(ch_cap)
     else:
         from plugins.broadcast import templates as T
-        cap = await T.get_caption()
+        cap = _clean_caption(await T.get_caption())
 
     if ch_btns is not None:
         btns = ch_btns
@@ -1428,22 +1721,29 @@ async def _run_single_channel(
 
     timer = s.get("timer_secs", 0)
 
-    sources = s.get("source_list") if s.get("use_all") else None
+    sources = None
+    if s.get("use_all") and s.get("source_list"):
+        sources = list(s["source_list"])
+
+    chat_id = s["source_chat_id"]
+    msg_id = s["source_msg_id"]
+
     _s_drop(key)
     await q.answer("🚀 starting...")
 
     if sources:
         asyncio.create_task(_do_send_multi(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], sources,
+            chat_id, sources,
             [cid], "channel", timer, cap, btns,
         ))
     else:
         asyncio.create_task(_do_send(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], s["source_msg_id"],
+            chat_id, msg_id,
             [cid], "channel", timer, cap, btns,
         ))
+
 
 async def _run_single_group(
     client: Client, q: CallbackQuery, key: int, gid: int,
@@ -1456,21 +1756,27 @@ async def _run_single_group(
     btns = await _effective_buttons(key)
     timer = s.get("timer_secs", 0)
 
-    sources = s.get("source_list") if s.get("use_all") else None
+    sources = None
+    if s.get("use_all") and s.get("source_list"):
+        sources = list(s["source_list"])
+
+    chat_id = s["source_chat_id"]
+    msg_id = s["source_msg_id"]
+
     _s_drop(key)
     await q.answer("🚀 starting...")
 
     if sources:
         asyncio.create_task(_do_send_multi(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], sources,
-            [cid], "channel", timer, cap, btns,
+            chat_id, sources,
+            [gid], "group", timer, cap, btns,
         ))
     else:
         asyncio.create_task(_do_send(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], s["source_msg_id"],
-            [cid], "channel", timer, cap, btns,
+            chat_id, msg_id,
+            [gid], "group", timer, cap, btns,
         ))
 
 
@@ -1501,21 +1807,27 @@ async def _run_groups_all(
     btns = await _effective_buttons(key)
     timer = s.get("timer_secs", 0)
 
-    sources = s.get("source_list") if s.get("use_all") else None
+    sources = None
+    if s.get("use_all") and s.get("source_list"):
+        sources = list(s["source_list"])
+
+    chat_id = s["source_chat_id"]
+    msg_id = s["source_msg_id"]
+
     _s_drop(key)
-    await q.answer("🚀 starting...")
+    await q.answer(f"🚀 starting · {len(targets)} groups")
 
     if sources:
         asyncio.create_task(_do_send_multi(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], sources,
-            [cid], "channel", timer, cap, btns,
+            chat_id, sources,
+            targets, "groups", timer, cap, btns,
         ))
     else:
         asyncio.create_task(_do_send(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], s["source_msg_id"],
-            [cid], "channel", timer, cap, btns,
+            chat_id, msg_id,
+            targets, "groups", timer, cap, btns,
         ))
 
 
@@ -1570,21 +1882,27 @@ async def _run_users(
     cap = await _effective_caption(key)
     btns = await _effective_buttons(key)
 
-    sources = s.get("source_list") if s.get("use_all") else None
+    sources = None
+    if s.get("use_all") and s.get("source_list"):
+        sources = list(s["source_list"])
+
+    chat_id = s["source_chat_id"]
+    msg_id = s["source_msg_id"]
+
     _s_drop(key)
-    await q.answer("🚀 starting...")
+    await q.answer(f"🚀 starting · {len(targets)} users")
 
     if sources:
         asyncio.create_task(_do_send_multi(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], sources,
-            [cid], "channel", timer, cap, btns,
+            chat_id, sources,
+            targets, "users", timer, cap, btns,
         ))
     else:
         asyncio.create_task(_do_send(
             client, q.message.chat.id, q.message.id,
-            s["source_chat_id"], s["source_msg_id"],
-            [cid], "channel", timer, cap, btns,
+            chat_id, msg_id,
+            targets, "users", timer, cap, btns,
         ))
 
 
@@ -1603,18 +1921,32 @@ async def _run_channels_all(
 
     timer = s.get("timer_secs", 0)
 
+    sources = None
+    if s.get("use_all") and s.get("source_list"):
+        sources = list(s["source_list"])
+
+    chat_id = s["source_chat_id"]
+    msg_id = s["source_msg_id"]
+
     _s_drop(key)
     await q.answer(f"🚀 starting · {len(enabled)} channels")
 
-    asyncio.create_task(_do_channels_all(
-        client, q.message.chat.id, q.message.id,
-        s["source_chat_id"], s["source_msg_id"],
-        enabled, timer,
-    ))
+    if sources:
+        asyncio.create_task(_do_channels_all_multi(
+            client, q.message.chat.id, q.message.id,
+            chat_id, sources,
+            enabled, timer,
+        ))
+    else:
+        asyncio.create_task(_do_channels_all(
+            client, q.message.chat.id, q.message.id,
+            chat_id, msg_id,
+            enabled, timer,
+        ))
 
 
 # ============================================================
-# SEND ENGINE (standard)
+# SEND ENGINE — SINGLE FILE
 # ============================================================
 
 async def _do_send(
@@ -1712,7 +2044,110 @@ async def _do_send(
 
 
 # ============================================================
-# SEND ENGINE (channels all — per-channel caption)
+# SEND ENGINE — MULTI FILE (loop sources in upload order)
+# ============================================================
+
+async def _do_send_multi(
+    client: Client,
+    panel_chat: int, panel_msg: int,
+    source_chat: int,
+    sources: List[Tuple[int, str]],
+    targets: List[int],
+    kind: str,
+    timer: int,
+    cap_tpl: Optional[str] = None,
+    btns: Optional[List[Dict]] = None,
+) -> None:
+    """Send MULTIPLE files to MULTIPLE targets — oldest first."""
+    from plugins.broadcast import engine as E
+
+    total_src = len(sources)
+    total_targets = len(targets)
+    grand_total = total_src * total_targets
+    started = time.time()
+    grand_sent = 0
+    grand_failed = 0
+    grand_blocked = 0
+
+    for idx, (src_msg_id, src_name) in enumerate(sources, 1):
+        # progress header
+        try:
+            lines = [
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"🚀 <b>{F.fb('MULTI-FILE BROADCAST')}</b>",
+                F.DIV, "",
+                f"📦 {F.sc('file')} · <b>{idx}/{total_src}</b>",
+                f"📛 <code>{src_name[:40]}</code>",
+                "",
+                F.DIV_S,
+                f"🎯 {F.sc('targets')} · <b>{total_targets}</b>",
+                f"📊 {F.sc('grand progress')} · "
+                f"<b>{grand_sent + grand_failed}/{grand_total}</b>",
+                "",
+                f"✅ {F.sc('total sent')} · <b>{grand_sent}</b>",
+                f"❌ {F.sc('total failed')} · <b>{grand_failed}</b>",
+            ]
+            if timer > 0:
+                lines.insert(
+                    7,
+                    f"⏱ {F.sc('timer')} · <b>{_fmt_timer(timer)}</b>",
+                )
+            await client.edit_message_text(
+                chat_id=panel_chat, message_id=panel_msg,
+                text="\n".join(lines),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        f"⏹ {F.sc('stop')}",
+                        callback_data="bca:stop",
+                    ),
+                ]]),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
+        try:
+            result = await E.run_broadcast(
+                client=client,
+                source_chat_id=source_chat,
+                source_msg_id=src_msg_id,
+                targets=targets,
+                kind=kind,
+                caption_template=cap_tpl,
+                buttons_list=btns,
+                autodelete_seconds=timer,
+                owner=0,
+            )
+            grand_sent += result.get("sent", 0)
+            grand_failed += result.get("failed", 0)
+            grand_blocked += result.get("blocked", 0)
+
+            # Check for cancel
+            if not result.get("ok", True):
+                break
+        except Exception as e:
+            logger.exception(f"[BC-MULTI] {src_name}: {e}")
+            grand_failed += total_targets
+
+        # small pause between files
+        await asyncio.sleep(0.5)
+
+    elapsed = time.time() - started
+    await _render_done(
+        client, panel_chat, panel_msg,
+        f"{kind} · {total_src} files", grand_total,
+        {
+            "sent": grand_sent,
+            "failed": grand_failed,
+            "blocked": grand_blocked,
+        },
+        elapsed, timer,
+    )
+
+
+# ============================================================
+# SEND ENGINE — ALL CHANNELS (per-channel caption) — SINGLE FILE
 # ============================================================
 
 async def _do_channels_all(
@@ -1838,6 +2273,141 @@ async def _do_channels_all(
 
 
 # ============================================================
+# SEND ENGINE — ALL CHANNELS — MULTI FILE
+# ============================================================
+
+async def _do_channels_all_multi(
+    client: Client,
+    panel_chat: int, panel_msg: int,
+    source_chat: int,
+    sources: List[Tuple[int, str]],
+    channels: List[Dict[str, Any]],
+    timer: int,
+) -> None:
+    from plugins.broadcast import templates as T
+    from plugins.broadcast import state as BS
+
+    total_src = len(sources)
+    total_ch = len(channels)
+    grand_total = total_src * total_ch
+    started = time.time()
+    grand_sent = 0
+    grand_failed = 0
+
+    global_cap = await T.get_caption()
+    global_btns = await T.get_buttons()
+
+    for idx, (src_msg_id, src_name) in enumerate(sources, 1):
+        try:
+            src_msg = await client.get_messages(
+                source_chat, src_msg_id,
+            )
+        except Exception:
+            continue
+
+        for ch in channels:
+            cid = ch.get("chat_id")
+            custom_cap = ch.get("caption")
+            custom_btns = ch.get("buttons")
+            cap_tpl = custom_cap if custom_cap is not None else global_cap
+            btns = custom_btns if custom_btns is not None else global_btns
+
+            caption = T.build_caption(src_msg, cap_tpl)
+            kb = T.build_buttons_kb(btns)
+
+            try:
+                sent_msg = await client.copy_message(
+                    chat_id=int(cid),
+                    from_chat_id=source_chat,
+                    message_id=src_msg_id,
+                    caption=caption,
+                    reply_markup=kb,
+                )
+                grand_sent += 1
+                if timer > 0 and sent_msg:
+                    try:
+                        await BS.schedule_autodelete(
+                            int(cid), sent_msg.id, timer, "",
+                        )
+                    except Exception:
+                        pass
+            except FloodWait as e:
+                await asyncio.sleep(int(e.value) + 2)
+                try:
+                    sent_msg = await client.copy_message(
+                        chat_id=int(cid),
+                        from_chat_id=source_chat,
+                        message_id=src_msg_id,
+                        caption=caption,
+                        reply_markup=kb,
+                    )
+                    grand_sent += 1
+                    if timer > 0 and sent_msg:
+                        try:
+                            await BS.schedule_autodelete(
+                                int(cid), sent_msg.id, timer, "",
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    grand_failed += 1
+            except Exception:
+                grand_failed += 1
+
+            # live progress
+            try:
+                done = grand_sent + grand_failed
+                pct = (done / grand_total * 100) if grand_total else 0
+                bar = P.bar(pct, "indexing", width=14)
+                lines = [
+                    f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                    f"🚀 <b>{F.fb('MULTI-FILE × ALL CHANNELS')}</b>",
+                    F.DIV, "",
+                    f"📦 {F.sc('file')} · <b>{idx}/{total_src}</b>",
+                    f"📛 <code>{src_name[:35]}</code>",
+                    f"📢 {F.sc('now')} · "
+                    f"<code>{str(ch.get('title', '?'))[:28]}</code>",
+                ]
+                if timer > 0:
+                    lines.append(
+                        f"⏱ {F.sc('timer')} · <b>{_fmt_timer(timer)}</b>"
+                    )
+                lines += [
+                    "",
+                    f"<code>{bar}</code>",
+                    "",
+                    f"✅ {F.sc('sent')} · <b>{grand_sent}</b>",
+                    f"❌ {F.sc('failed')} · <b>{grand_failed}</b>",
+                    "",
+                    f"📊 <code>{done}/{grand_total}</code>",
+                ]
+                await client.edit_message_text(
+                    chat_id=panel_chat, message_id=panel_msg,
+                    text="\n".join(lines),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            f"⏹ {F.sc('stop')}",
+                            callback_data="bca:stop",
+                        ),
+                    ]]),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.4)
+
+    elapsed = time.time() - started
+    await _render_done(
+        client, panel_chat, panel_msg,
+        f"channels · {total_src} files", grand_total,
+        {"sent": grand_sent, "failed": grand_failed, "blocked": 0},
+        elapsed, timer,
+    )
+
+
+# ============================================================
 # FINAL REPORT
 # ============================================================
 
@@ -1890,9 +2460,8 @@ async def _render_done(
     except Exception:
         pass
 
-
 # ============================================================
-# TEXT INPUT
+# TEXT INPUT HANDLER
 # ============================================================
 
 @Client.on_message(
@@ -1911,7 +2480,10 @@ async def bc_text_input(client: Client, message: Message):
         return
 
     awaiting = s.get("awaiting")
-    if awaiting not in ("caption", "caption_ch", "btn_add_ch"):
+    if awaiting not in (
+        "caption", "caption_ch", "btn_add_ch",
+        "global_caption", "g_btn_add",
+    ):
         return
 
     text = (message.text or "").strip()
@@ -1921,6 +2493,7 @@ async def bc_text_input(client: Client, message: Message):
     except Exception:
         pass
 
+    # ═══ CAPTION (custom for current source) ═══
     if awaiting == "caption":
         if text == "-":
             _s_upd(key, caption_mode="none",
@@ -1936,6 +2509,7 @@ async def bc_text_input(client: Client, message: Message):
         )
         return
 
+    # ═══ CHANNEL CAPTION OVERRIDE ═══
     if awaiting == "caption_ch":
         cid = s.get("cap_target_ch")
         _s_upd(key, awaiting=None)
@@ -1949,100 +2523,99 @@ async def bc_text_input(client: Client, message: Message):
             )
         return
 
+    # ═══ ADD CHANNEL BUTTON ═══
     if awaiting == "btn_add_ch":
         cid = s.get("cap_target_ch")
         _s_upd(key, awaiting=None)
-        if cid and "|" in text:
-            name, url = [p.strip() for p in text.split("|", 1)]
-            if name and url:
-                if url.startswith("@"):
-                    url = f"https://t.me/{url[1:]}"
-                elif not url.startswith(("http://", "https://", "tg://")):
-                    if "." in url and " " not in url:
-                        url = f"https://{url}"
-                    else:
-                        return
-                from plugins.broadcast import channels as CH
-                ch = await CH.get_channel(int(cid))
-                existing = ch.get("buttons") if ch else None
-                btns = list(existing) if existing is not None else []
-                btns.append({"name": name[:60], "url": url})
-                await CH.set_buttons(int(cid), btns)
-                await message.reply_text(
-                    f"{F.EMO['check']} <b>Button added</b>",
-                    parse_mode=ParseMode.HTML,
-                )
-        return
-
-async def _do_send_multi(
-    client: Client,
-    panel_chat: int, panel_msg: int,
-    source_chat: int,
-    sources: List[Tuple[int, str]],
-    targets: List[int],
-    kind: str,
-    timer: int,
-    cap_tpl: Optional[str] = None,
-    btns: Optional[List[Dict]] = None,
-) -> None:
-    """Send MULTIPLE files to MULTIPLE targets."""
-    from plugins.broadcast import engine as E
-    from plugins.broadcast import templates as T
-
-    total_sources = len(sources)
-    total_targets = len(targets)
-    grand_total = total_sources * total_targets
-
-    started = time.time()
-    grand_sent = 0
-    grand_failed = 0
-
-    for idx, (src_msg_id, src_name) in enumerate(sources, 1):
-        try:
-            await client.edit_message_text(
-                chat_id=panel_chat, message_id=panel_msg,
-                text="\n".join([
-                    f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                    f"🚀 <b>{F.fb('MULTI-FILE BROADCAST')}</b>",
-                    F.DIV, "",
-                    f"📦 {F.sc('file')} · <b>{idx}/{total_sources}</b>",
-                    f"📛 <code>{src_name[:40]}</code>",
-                    f"🎯 {F.sc('targets')} · <b>{total_targets}</b>",
-                ]),
+        if not cid:
+            return
+        if "|" not in text:
+            await message.reply_text(
+                "❌ <b>Format:</b> <code>Name | URL</code>",
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
-            pass
+            return
+        name, url = [p.strip() for p in text.split("|", 1)]
+        if not name or not url:
+            return
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif not url.startswith(("http://", "https://", "tg://")):
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                await message.reply_text(
+                    "❌ Invalid URL",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
 
-        try:
-            result = await E.run_broadcast(
-                client=client,
-                source_chat_id=source_chat,
-                source_msg_id=src_msg_id,
-                targets=targets,
-                kind=kind,
-                caption_template=cap_tpl,
-                buttons_list=btns,
-                autodelete_seconds=timer,
-                owner=0,
+        from plugins.broadcast import channels as CH
+        ch = await CH.get_channel(int(cid))
+        existing = ch.get("buttons") if ch else None
+        btns = list(existing) if existing is not None else []
+        btns.append({"name": name[:60], "url": url})
+        await CH.set_buttons(int(cid), btns)
+        await message.reply_text(
+            f"{F.EMO['check']} <b>Button added</b>\n"
+            f"<code>{_esc(name)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ═══ GLOBAL CAPTION ═══
+    if awaiting == "global_caption":
+        _s_upd(key, awaiting=None)
+        from plugins.broadcast import templates as T
+        if text == "-":
+            await T.set_caption(T.DEFAULT_CAPTION)
+            await message.reply_text(
+                f"{F.EMO['check']} <b>Global caption reset</b>",
+                parse_mode=ParseMode.HTML,
             )
-            grand_sent += result.get("sent", 0)
-            grand_failed += result.get("failed", 0)
-        except Exception as e:
-            logger.exception(f"[BC-MULTI] {src_name}: {e}")
-            grand_failed += total_targets
+        else:
+            await T.set_caption(text)
+            await message.reply_text(
+                f"{F.EMO['check']} <b>Global caption saved</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
 
-    elapsed = time.time() - started
-    await _render_done(
-        client, panel_chat, panel_msg,
-        f"{kind} · {total_sources} files", grand_total,
-        {"sent": grand_sent, "failed": grand_failed, "blocked": 0},
-        elapsed, timer,
-    )
+    # ═══ ADD GLOBAL BUTTON ═══
+    if awaiting == "g_btn_add":
+        _s_upd(key, awaiting=None)
+        if "|" not in text:
+            await message.reply_text(
+                "❌ <b>Format:</b> <code>Name | URL</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        name, url = [p.strip() for p in text.split("|", 1)]
+        if not name or not url:
+            return
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif not url.startswith(("http://", "https://", "tg://")):
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                await message.reply_text("❌ Invalid URL")
+                return
+
+        from plugins.broadcast import templates as T
+        btns = await T.get_buttons()
+        btns.append({"name": name[:60], "url": url})
+        await T.set_buttons(btns)
+        await message.reply_text(
+            f"{F.EMO['check']} <b>Global button added</b>\n"
+            f"<code>{_esc(name)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
 
 # ============================================================
-# ADMIN PANEL ENTRY — reads sources from DB
+# ADMIN PANEL ENTRY — /admin → [📢 Broadcast]
 # ============================================================
 
 async def bc_open_for_admin(client: Client, user_id: int) -> None:
@@ -2063,7 +2636,6 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
             pass
         return
 
-    # ✅ DB read — bots CANNOT use get_chat_history
     docs = await _list_sources(limit=10)
 
     if not docs:
@@ -2082,29 +2654,69 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
             pass
         return
 
-    src_list = [(int(d["message_id"]), d.get("name") or "file")
-                for d in docs]
+    _s_set(key, broadcast_channel_id=int(ch), awaiting=None)
 
-    _s_set(
-        key,
-        source_list=src_list,
-        broadcast_channel_id=int(ch),
-        awaiting=None,
-    )
+    if len(docs) == 1:
+        d = docs[0]
+        _s_upd(
+            key,
+            source_chat_id=int(d["chat_id"]),
+            source_msg_id=int(d["message_id"]),
+            source_name=d.get("name") or "file",
+            original_caption="",
+            caption_mode="auto",
+            custom_caption=None,
+            timer_secs=0,
+            user_filter="all",
+            use_all=False,
+            source_list=None,
+        )
 
-    text = "\n".join([
+        s = _s_get(key) or {}
+        s["_ch_count"] = await _count_channels()
+        s["_group_count"] = await _count_groups()
+        s["_user_count"] = await _count_users()
+        text, kb = _main_text_kb(s)
+
+        try:
+            await client.send_message(
+                chat_id=user_id,
+                text=text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.exception(f"[BC-ADMIN] send: {e}")
+        return
+
+    # multiple files
+    n = len(docs)
+    lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"📢 <b>{F.fb('SELECT SOURCE')}</b>",
+        f"📦 <b>{F.fb('SELECT SOURCE')}</b>",
         F.DIV, "",
-        f"📌 {F.sc('pick a file from the broadcast channel')}",
-    ])
+        f"📊 {F.sc('ready')} · <b>{n} {F.sc('files')}</b>",
+        "",
+        f"📌 {F.sc('send order')} · <i>{F.sc('oldest first')}</i>",
+        "",
+        F.DIV_S,
+    ]
 
-    rows = []
-    for i, (mid, name) in enumerate(src_list):
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"🎯 {F.sc('USE ALL')} ({n} {F.sc('files')})",
+            callback_data=_cb("multi_all"),
+        )],
+    ]
+
+    for i, d in enumerate(docs, 1):
+        name = (d.get("name") or "file")[:36]
         rows.append([InlineKeyboardButton(
-            f"📦 {name[:42]}",
-            callback_data=_cb(f"src:{i}"),
+            f"{i}. 📦 {name}",
+            callback_data=_cb(f"multi_one:{i-1}"),
         )])
+
     rows.append([InlineKeyboardButton(
         f"❌ {F.sc('cancel')}",
         callback_data=_cb("cancel"),
@@ -2113,7 +2725,7 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
     try:
         await client.send_message(
             chat_id=user_id,
-            text=text,
+            text="\n".join(lines),
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -2130,7 +2742,10 @@ def snapshot() -> Dict[str, Any]:
     return {
         "watcher_enabled": _FILTER is not None,
         "active_sessions": len(_sessions),
+        "debounce": len(_debounce),
     }
 
 
 __all__ = ["snapshot", "bc_open_for_admin"]
+
+
