@@ -1046,15 +1046,14 @@ async def _render_preview(client, batch, conf) -> str:
         if src_msg:
             caption_display = TPL.build_caption(src_msg, cap_tpl)
         else:
-            caption_display = _esc(cap_tpl)
+            caption_display = cap_tpl
 
     else:  # global
         cap_tpl = await DB.get_global_caption()
         if src_msg:
             caption_display = TPL.build_caption(src_msg, cap_tpl)
         else:
-            caption_display = _esc(cap_tpl)
-
+            caption_display = cap_tpl
     lines = [
         f"👁️ <b>{fb('PREVIEW')}</b>",
         "",
