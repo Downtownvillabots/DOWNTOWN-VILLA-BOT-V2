@@ -1,13 +1,15 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — BROADCAST WATCHER (BATCH EDITION)
+# 🏨 DOWNTOWN VILLA — BROADCAST WATCHER (IN-CHANNEL CONFIRM)
 # ============================================================
-# Upload N files → ONE reply in channel with per-file toggles
-# Select files → "Broadcast selected (N)" → confirmation in PM
+# Upload N files → ONE message with per-file toggles
+# Tap "Broadcast selected" → destination picker in SAME message
+# All confirmation steps edit that same message.
 # ============================================================
 
 from __future__ import annotations
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
@@ -18,7 +20,8 @@ from pyrogram.types import (
 
 from plugins.broadcast.config import (
     BROADCAST_CHANNEL_ID, ADMINS, DEBOUNCE_SECONDS,
-    DIV, DIV2, fb, sc, _is_admin, _fmt_int,
+    BROADCAST_BATCH_SIZE, BROADCAST_CONCURRENCY, DEFAULT_DELAY,
+    DIV, DIV2, fb, sc, _is_admin, _fmt_int, _progress_colored,
 )
 from plugins.broadcast import database as DB
 from plugins.broadcast import keyboards as KB
@@ -27,8 +30,8 @@ from plugins.broadcast import templates as TPL
 
 logger = logging.getLogger(__name__)
 
-_MANUAL_TARGETS: Dict[int, int] = {}
-_CONF: Dict[str, Dict[str, Any]] = {}  # sid → confirmation state
+_CONF: Dict[str, Dict[str, Any]] = {}
+_CONF_TTL = 3600
 
 
 def _extract_name(message: Message) -> str:
@@ -46,14 +49,18 @@ def _extract_name(message: Message) -> str:
     return "file"
 
 
-def _pick_admin(uid: Optional[int]) -> int:
-    if uid and _is_admin(uid):
-        return int(uid)
-    return int(ADMINS[0]) if ADMINS else 0
+def _get_conf(sid: str) -> Optional[Dict[str, Any]]:
+    c = _CONF.get(sid)
+    if not c:
+        return None
+    if time.time() - c.get("created", 0) > _CONF_TTL:
+        _CONF.pop(sid, None)
+        return None
+    return c
 
 
 # ═════════════════════════════════════════════════════════════
-# WATCHER — fires on every upload
+# WATCHER
 # ═════════════════════════════════════════════════════════════
 if BROADCAST_CHANNEL_ID:
 
@@ -74,8 +81,10 @@ if BROADCAST_CHANNEL_ID:
             if not batch:
                 sid = ST.register_source(message)
                 batch = ST.new_batch(key, sid)
-                batch["admin_id"] = _pick_admin(
-                    message.from_user.id if message.from_user else None
+                batch["admin_id"] = (
+                    int(message.from_user.id)
+                    if message.from_user and _is_admin(message.from_user.id)
+                    else (int(ADMINS[0]) if ADMINS else 0)
                 )
                 batch["reply_msg_id"] = None
 
@@ -114,7 +123,7 @@ async def _debounced_show(message: Message, key: int, msg_id: int):
         except Exception:
             pass
 
-    text, kb = _build_batch_view(batch)
+    text, kb = _build_batch_view(batch, stage="toggles")
     try:
         sent = await message.reply_text(
             text,
@@ -128,36 +137,143 @@ async def _debounced_show(message: Message, key: int, msg_id: int):
         logger.warning(f"[BC-WATCH] {e}")
 
 
-def _build_batch_view(batch: Dict[str, Any]):
+# ═════════════════════════════════════════════════════════════
+# VIEW BUILDER (multi-stage)
+# ═════════════════════════════════════════════════════════════
+def _build_batch_view(
+    batch: Dict[str, Any],
+    stage: str = "toggles",
+    conf: Optional[Dict[str, Any]] = None,
+    extra: Optional[str] = None,
+) -> Any:
     files = batch["files"]
-    n = len(files)
-    selected = sum(1 for f in files if f["selected"])
+    sid = batch["sid"]
+    selected = [f for f in files if f["selected"]]
+
+    if stage == "toggles":
+        lines = [
+            f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"📦 <b>{fb('BATCH READY')}</b>",
+            DIV, "",
+            f"📊 {sc('files')} · <b>{len(files)}</b>",
+            f"✅ {sc('selected')} · <b>{len(selected)}</b>",
+            "", DIV2, "",
+        ]
+        for i, f in enumerate(files, 1):
+            mark = "✅" if f["selected"] else "☐"
+            name = (f.get("name") or "file")[:50]
+            lines.append(f"{mark} <b>{i}.</b> <code>{name}</code>")
+        lines += [
+            "", DIV2, "",
+            f"📌 {sc('tap a number to toggle')}",
+            f"📌 {sc('tap broadcast when ready')}",
+        ]
+        return "\n".join(lines), KB.kb_batch(batch, sc)
+
+    # ─── confirmation stages ───
+    conf = conf or {}
+    dest = conf.get("destination") or "—"
+    cap_mode = conf.get("caption_mode") or "—"
+    timer = conf.get("timer_days", 0)
+    timer_label = "♾️ never" if not timer else f"⏱️ {timer}d"
+    ch_id = conf.get("channel_id")
+    ch_label = "—"
+    if ch_id == "all":
+        ch_label = "ALL"
+    elif isinstance(ch_id, int):
+        ch_label = str(ch_id)
 
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"📦 <b>{fb('BATCH READY')}</b>",
+        f"🚀 <b>{fb('CONFIRM BROADCAST')}</b>",
         DIV, "",
-        f"📊 {sc('files')} · <b>{n}</b>",
-        f"✅ {sc('selected')} · <b>{selected}</b>",
-        "", DIV2, "",
+        f"📦 {sc('files')} · <b>{len(selected)}</b>",
+        f"🎯 {sc('destination')} · <b>{dest}</b>",
+        f"📢 {sc('target')} · <code>{ch_label}</code>",
+        f"📝 {sc('caption')} · <b>{cap_mode}</b>",
+        f"⏱️ {sc('timer')} · <b>{timer_label}</b>",
     ]
-    for i, f in enumerate(files, 1):
-        mark = "✅" if f["selected"] else "☐"
-        name = (f.get("name") or "file")[:50]
-        lines.append(f"{mark} <b>{i}.</b> <code>{name}</code>")
+    if extra:
+        lines += ["", DIV2, "", extra]
 
-    lines += [
-        "", DIV2, "",
-        f"📌 {sc('tap a number to toggle')}",
-        f"📌 {sc('tap broadcast when ready')}",
-    ]
+    if stage == "dest":
+        kb = KB.kb_conf_destination(sid)
 
-    return "\n".join(lines), KB.kb_batch(batch, sc)
+    elif stage == "channels":
+        ch_list = conf.get("_channels") or []
+        kb = KB.kb_conf_channels(sid, ch_list)
+
+    elif stage == "groups":
+        total = conf.get("_groups_count", 0)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"✅ SEND TO {total} GROUPS",
+                callback_data=f"bcconf:{sid}:groups_go",
+            )],
+            [InlineKeyboardButton(
+                "◀️ BACK", callback_data=f"bcconf:{sid}:back"
+            )],
+            [InlineKeyboardButton(
+                "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel"
+            )],
+        ])
+
+    elif stage == "users":
+        total = conf.get("_users_count", 0)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"✅ SEND TO {total} USERS",
+                callback_data=f"bcconf:{sid}:users_go",
+            )],
+            [InlineKeyboardButton(
+                "◀️ BACK", callback_data=f"bcconf:{sid}:back"
+            )],
+            [InlineKeyboardButton(
+                "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel"
+            )],
+        ])
+
+    elif stage == "manual":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "◀️ BACK", callback_data=f"bcconf:{sid}:back"
+            )],
+            [InlineKeyboardButton(
+                "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel"
+            )],
+        ])
+
+    elif stage == "caption":
+        has_ch = bool(ch_id)
+        kb = KB.kb_conf_caption(sid, has_ch)
+
+    elif stage == "timer":
+        kb = KB.kb_conf_timer(sid)
+
+    elif stage == "final":
+        kb = KB.kb_conf_confirm(sid)
+
+    else:
+        kb = KB.kb_conf_destination(sid)
+
+    return "\n".join(lines), kb
 
 
 # ═════════════════════════════════════════════════════════════
-# BATCH CALLBACKS — toggles in channel
+# BATCH TOGGLES
 # ═════════════════════════════════════════════════════════════
+async def _refresh_toggles(q: CallbackQuery, batch: Dict[str, Any]):
+    text, kb = _build_batch_view(batch, stage="toggles")
+    try:
+        await q.message.edit_text(
+            text, reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+
+
 @Client.on_callback_query(
     filters.regex(r"^bcbatch:tog:([a-f0-9]+):(\d+)$"), group=-500
 )
@@ -170,15 +286,7 @@ async def cb_batch_tog(client, q):
     if idx < 0 or idx >= len(batch["files"]):
         return await q.answer("❌ Invalid", show_alert=True)
     batch["files"][idx]["selected"] = not batch["files"][idx]["selected"]
-    text, kb = _build_batch_view(batch)
-    try:
-        await q.message.edit_text(
-            text, reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _refresh_toggles(q, batch)
     await q.answer()
 
 
@@ -192,16 +300,8 @@ async def cb_batch_all(client, q):
         return await q.answer("⏱️ Expired", show_alert=True)
     for f in batch["files"]:
         f["selected"] = True
-    text, kb = _build_batch_view(batch)
-    try:
-        await q.message.edit_text(
-            text, reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
-    await q.answer("✅ All selected")
+    await _refresh_toggles(q, batch)
+    await q.answer("✅ All")
 
 
 @Client.on_callback_query(
@@ -214,67 +314,8 @@ async def cb_batch_none(client, q):
         return await q.answer("⏱️ Expired", show_alert=True)
     for f in batch["files"]:
         f["selected"] = False
-    text, kb = _build_batch_view(batch)
-    try:
-        await q.message.edit_text(
-            text, reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
+    await _refresh_toggles(q, batch)
     await q.answer("☐ Cleared")
-
-
-@Client.on_callback_query(
-    filters.regex(r"^bcbatch:bcast:([a-f0-9]+)$"), group=-500
-)
-async def cb_batch_bcast(client, q):
-    sid = q.matches[0].group(1)
-    batch = ST.find_batch_by_sid(sid)
-    if not batch:
-        return await q.answer("⏱️ Expired", show_alert=True)
-
-    selected = [f for f in batch["files"] if f["selected"]]
-    if not selected:
-        return await q.answer("⚠️ Select at least 1", show_alert=True)
-
-    admin_id = batch.get("admin_id")
-    if not admin_id:
-        return await q.answer("⚠️ No admin", show_alert=True)
-
-    # Save confirmation state
-    _CONF[sid] = {
-        "batch_sid": sid,
-        "admin_id": admin_id,
-        "files": selected,
-        "destination": None,
-        "channel_id": None,
-        "caption_mode": None,
-        "timer_days": 0,
-        "created": asyncio.get_event_loop().time(),
-    }
-
-    # Send confirmation panel to admin PM
-    text = "\n".join([
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🚀 <b>{fb('CONFIRM BROADCAST')}</b>",
-        DIV, "",
-        f"📦 {sc('files')} · <b>{len(selected)}</b>",
-        "", DIV2, "",
-        f"📌 {sc('pick destination type')}",
-    ])
-    try:
-        await client.send_message(
-            chat_id=admin_id,
-            text=text,
-            reply_markup=KB.kb_conf_destination(sid),
-            parse_mode=ParseMode.HTML,
-        )
-        await q.answer("📩 Check your PM")
-    except Exception as e:
-        logger.exception(f"[BC-BATCH] {e}")
-        await q.answer("❌ Cannot open PM", show_alert=True)
 
 
 @Client.on_callback_query(
@@ -294,41 +335,65 @@ async def cb_batch_no(client, q):
 
 
 # ═════════════════════════════════════════════════════════════
-# CONFIRMATION FLOW — PM panel
+# START CONFIRM — same message, not PM
 # ═════════════════════════════════════════════════════════════
-def _conf_header(sid: str, extra: Optional[str] = None) -> str:
-    conf = _CONF.get(sid) or {}
-    files = conf.get("files") or []
-    dest = conf.get("destination") or "—"
-    cap_mode = conf.get("caption_mode") or "—"
-    timer = conf.get("timer_days", 0)
-    timer_label = "♾️ never" if not timer else f"⏱️ {timer}d"
+@Client.on_callback_query(
+    filters.regex(r"^bcbatch:bcast:([a-f0-9]+)$"), group=-500
+)
+async def cb_batch_bcast(client, q):
+    sid = q.matches[0].group(1)
+    batch = ST.find_batch_by_sid(sid)
+    if not batch:
+        return await q.answer("⏱️ Expired", show_alert=True)
 
-    lines = [
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"🚀 <b>{fb('CONFIRM BROADCAST')}</b>",
-        DIV, "",
-        f"📦 {sc('files')} · <b>{len(files)}</b>",
-        f"🎯 {sc('destination')} · <b>{dest}</b>",
-        f"📝 {sc('caption')} · <b>{cap_mode}</b>",
-        f"⏱️ {sc('timer')} · <b>{timer_label}</b>",
-    ]
-    if extra:
-        lines += ["", DIV2, "", extra]
-    return "\n".join(lines)
+    selected = [f for f in batch["files"] if f["selected"]]
+    if not selected:
+        return await q.answer("⚠️ Select at least 1", show_alert=True)
+
+    _CONF[sid] = {
+        "batch_sid": sid,
+        "files": selected,
+        "destination": None,
+        "channel_id": None,
+        "caption_mode": None,
+        "timer_days": 0,
+        "manual_await": False,
+        "created": time.time(),
+    }
+
+    text, kb = _build_batch_view(
+        batch, stage="dest", conf=_CONF[sid],
+        extra=f"📌 {sc('pick destination')}",
+    )
+    try:
+        await q.message.edit_text(
+            text, reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"[BC-BCAST] edit: {e}")
+    await q.answer()
 
 
+# ═════════════════════════════════════════════════════════════
+# CONFIRM — destination picker
+# ═════════════════════════════════════════════════════════════
 @Client.on_callback_query(
     filters.regex(r"^bcconf:([a-f0-9]+):dest:(\w+)$"), group=-500
 )
 async def cb_conf_dest(client, q):
     sid = q.matches[0].group(1)
     dest = q.matches[0].group(2)
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
+    if not batch:
+        return await q.answer("⏱️ Expired", show_alert=True)
 
     conf["destination"] = dest
 
@@ -337,40 +402,53 @@ async def cb_conf_dest(client, q):
         enabled = [c for c in channels if c.get("enabled", True)]
         if not enabled:
             return await q.answer("⚠️ No channels", show_alert=True)
-        text = _conf_header(sid, f"📌 {sc('pick a channel')}")
-        await _safe_edit_pm(q, text, KB.kb_conf_channels(sid, enabled))
-        return await q.answer()
+        conf["_channels"] = enabled
+        text, kb = _build_batch_view(
+            batch, stage="channels", conf=conf,
+            extra=f"📌 {sc('pick a channel')}",
+        )
+        await _edit_or_answer(q, text, kb)
+        return
 
     if dest == "groups":
         total = await DB.count_groups()
         if total == 0:
             return await q.answer("⚠️ No groups", show_alert=True)
+        conf["_groups_count"] = total
         conf["channel_id"] = None
-        text = _conf_header(sid, f"📊 {sc('groups')} · <b>{total}</b>")
-        return await _show_caption_picker(client, q, sid, text)
+        text, kb = _build_batch_view(
+            batch, stage="groups", conf=conf,
+            extra=f"📊 {sc('groups')} · <b>{total}</b>",
+        )
+        await _edit_or_answer(q, text, kb)
+        return
 
     if dest == "users":
         total = await DB.count_users()
         if total == 0:
             return await q.answer("⚠️ No users", show_alert=True)
+        conf["_users_count"] = total
         conf["channel_id"] = None
-        text = _conf_header(sid, f"📊 {sc('users')} · <b>{total}</b>")
-        return await _show_caption_picker(client, q, sid, text)
+        text, kb = _build_batch_view(
+            batch, stage="users", conf=conf,
+            extra=f"📊 {sc('users')} · <b>{total}</b>",
+        )
+        await _edit_or_answer(q, text, kb)
+        return
 
     if dest == "manual":
         conf["manual_await"] = True
-        text = _conf_header(sid, "\n".join([
-            f"🎯 {sc('send the chat id or @username in PM')}",
-            f"📌 {sc('bot must be able to post there')}",
-        ]))
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "❌ CANCEL",
-                callback_data=f"bcconf:{sid}:cancel",
-            )
-        ]])
-        await _safe_edit_pm(q, text, kb)
-        return await q.answer()
+        conf["destination"] = "manual"
+        text, kb = _build_batch_view(
+            batch, stage="manual", conf=conf,
+            extra="\n".join([
+                f"🎯 {sc('send the target chat id here')}",
+                f"📌 {sc('example')} · <code>-1001234567890</code>",
+                f"📌 {sc('or')} · <code>@username</code>",
+            ]),
+        )
+        await _edit_or_answer(q, text, kb)
+        return
 
 
 @Client.on_callback_query(
@@ -379,13 +457,20 @@ async def cb_conf_dest(client, q):
 async def cb_conf_ch(client, q):
     sid = q.matches[0].group(1)
     cid = int(q.matches[0].group(2))
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
     conf["channel_id"] = cid
-    text = _conf_header(sid, f"📢 {sc('channel')} · <code>{cid}</code>")
-    await _show_caption_picker(client, q, sid, text)
-    await q.answer()
+
+    text, kb = _build_batch_view(
+        batch, stage="caption", conf=conf,
+        extra=f"📝 {sc('choose caption mode')}",
+    )
+    await _edit_or_answer(q, text, kb)
 
 
 @Client.on_callback_query(
@@ -393,27 +478,63 @@ async def cb_conf_ch(client, q):
 )
 async def cb_conf_chall(client, q):
     sid = q.matches[0].group(1)
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
     conf["channel_id"] = "all"
-    text = _conf_header(
-        sid, f"📢 {sc('all channels')} · <b>ALL</b>"
+    conf["destination"] = "channels"
+
+    text, kb = _build_batch_view(
+        batch, stage="caption", conf=conf,
+        extra=f"📝 {sc('choose caption mode')}",
     )
-    await _show_caption_picker(client, q, sid, text)
-    await q.answer()
+    await _edit_or_answer(q, text, kb)
 
 
-async def _show_caption_picker(client, q, sid, text):
-    conf = _CONF.get(sid) or {}
-    has_channel = bool(conf.get("channel_id"))
-    await _safe_edit_pm(
-        q, text, KB.kb_conf_caption(sid, has_channel)
+@Client.on_callback_query(
+    filters.regex(r"^bcconf:([a-f0-9]+):groups_go$"), group=-500
+)
+async def cb_conf_groups_go(client, q):
+    sid = q.matches[0].group(1)
+    conf = _get_conf(sid)
+    if not conf:
+        return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
+    conf["channel_id"] = None
+
+    text, kb = _build_batch_view(
+        batch, stage="caption", conf=conf,
+        extra=f"📝 {sc('choose caption mode')}",
     )
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    await _edit_or_answer(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bcconf:([a-f0-9]+):users_go$"), group=-500
+)
+async def cb_conf_users_go(client, q):
+    sid = q.matches[0].group(1)
+    conf = _get_conf(sid)
+    if not conf:
+        return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
+    conf["channel_id"] = None
+
+    text, kb = _build_batch_view(
+        batch, stage="caption", conf=conf,
+        extra=f"📝 {sc('choose caption mode')}",
+    )
+    await _edit_or_answer(q, text, kb)
 
 
 @Client.on_callback_query(
@@ -422,13 +543,20 @@ async def _show_caption_picker(client, q, sid, text):
 async def cb_conf_cap(client, q):
     sid = q.matches[0].group(1)
     mode = q.matches[0].group(2)
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
     conf["caption_mode"] = mode
-    text = _conf_header(sid, f"📝 {sc('caption mode selected')}")
-    await _safe_edit_pm(q, text, KB.kb_conf_timer(sid))
-    await q.answer()
+
+    text, kb = _build_batch_view(
+        batch, stage="timer", conf=conf,
+        extra=f"⏱️ {sc('pick a timer')}",
+    )
+    await _edit_or_answer(q, text, kb)
 
 
 @Client.on_callback_query(
@@ -437,40 +565,20 @@ async def cb_conf_cap(client, q):
 async def cb_conf_timer(client, q):
     sid = q.matches[0].group(1)
     days = int(q.matches[0].group(2))
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
     conf["timer_days"] = days
-    text = _conf_header(sid, f"✅ {sc('ready to send')}")
-    await _safe_edit_pm(q, text, KB.kb_conf_confirm(sid))
-    await q.answer()
 
-
-@Client.on_callback_query(
-    filters.regex(r"^bcconf:([a-f0-9]+):chcap$"), group=-500
-)
-async def cb_conf_chcap(client, q):
-    sid = q.matches[0].group(1)
-    conf = _CONF.get(sid)
-    if not conf:
-        return await q.answer("⏱️ Expired", show_alert=True)
-    text = _conf_header(sid, f"📝 {sc('choose caption mode')}")
-    has_channel = bool(conf.get("channel_id"))
-    await _safe_edit_pm(q, text, KB.kb_conf_caption(sid, has_channel))
-    await q.answer()
-
-
-@Client.on_callback_query(
-    filters.regex(r"^bcconf:([a-f0-9]+):chtimer$"), group=-500
-)
-async def cb_conf_chtimer(client, q):
-    sid = q.matches[0].group(1)
-    conf = _CONF.get(sid)
-    if not conf:
-        return await q.answer("⏱️ Expired", show_alert=True)
-    text = _conf_header(sid, f"⏱️ {sc('choose timer')}")
-    await _safe_edit_pm(q, text, KB.kb_conf_timer(sid))
-    await q.answer()
+    text, kb = _build_batch_view(
+        batch, stage="final", conf=conf,
+        extra=f"✅ {sc('ready to send')}",
+    )
+    await _edit_or_answer(q, text, kb)
 
 
 @Client.on_callback_query(
@@ -478,14 +586,61 @@ async def cb_conf_chtimer(client, q):
 )
 async def cb_conf_back(client, q):
     sid = q.matches[0].group(1)
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
     conf["destination"] = None
     conf["channel_id"] = None
-    text = _conf_header(sid, f"📌 {sc('pick destination type')}")
-    await _safe_edit_pm(q, text, KB.kb_conf_destination(sid))
-    await q.answer()
+    conf["caption_mode"] = None
+    conf["timer_days"] = 0
+
+    text, kb = _build_batch_view(
+        batch, stage="dest", conf=conf,
+        extra=f"📌 {sc('pick destination')}",
+    )
+    await _edit_or_answer(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bcconf:([a-f0-9]+):chcap$"), group=-500
+)
+async def cb_conf_chcap(client, q):
+    sid = q.matches[0].group(1)
+    conf = _get_conf(sid)
+    if not conf:
+        return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
+    text, kb = _build_batch_view(
+        batch, stage="caption", conf=conf,
+        extra=f"📝 {sc('choose caption mode')}",
+    )
+    await _edit_or_answer(q, text, kb)
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bcconf:([a-f0-9]+):chtimer$"), group=-500
+)
+async def cb_conf_chtimer(client, q):
+    sid = q.matches[0].group(1)
+    conf = _get_conf(sid)
+    if not conf:
+        return await q.answer("⏱️ Expired", show_alert=True)
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+
+    batch = ST.find_batch_by_sid(sid)
+    text, kb = _build_batch_view(
+        batch, stage="timer", conf=conf,
+        extra=f"⏱️ {sc('pick a timer')}",
+    )
+    await _edit_or_answer(q, text, kb)
 
 
 @Client.on_callback_query(
@@ -494,6 +649,9 @@ async def cb_conf_back(client, q):
 async def cb_conf_cancel(client, q):
     sid = q.matches[0].group(1)
     _CONF.pop(sid, None)
+    batch = ST.find_batch_by_sid(sid)
+    if batch:
+        ST.clear_batch(batch["chat_id"])
     try:
         await q.message.delete()
     except Exception:
@@ -506,30 +664,45 @@ async def cb_conf_cancel(client, q):
 )
 async def cb_conf_send(client, q):
     sid = q.matches[0].group(1)
-    conf = _CONF.get(sid)
+    conf = _get_conf(sid)
     if not conf:
         return await q.answer("⏱️ Expired", show_alert=True)
     if not _is_admin(q.from_user.id):
         return await q.answer("⛔", show_alert=True)
 
-    # Validate
     if not conf.get("destination"):
         return await q.answer("⚠️ Pick destination", show_alert=True)
     if not conf.get("caption_mode"):
         return await q.answer("⚠️ Pick caption mode", show_alert=True)
 
     await q.answer("🚀 Starting…")
-    asyncio.create_task(
-        _execute_batch(client, q, sid, conf)
-    )
+    asyncio.create_task(_execute_batch(client, q, sid, conf))
+
+
+async def _edit_or_answer(q: CallbackQuery, text: str, kb):
+    try:
+        await q.message.edit_text(
+            text, reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.debug(f"[BC-CONF] edit: {e}")
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
 
 # ═════════════════════════════════════════════════════════════
-# EXECUTE
+# EXECUTE BATCH — sends and updates the SAME message in channel
 # ═════════════════════════════════════════════════════════════
 async def _execute_batch(client, q, sid, conf):
-    from plugins.broadcast.config import AUTODELETE_SECONDS
-    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    from plugins.broadcast.config import (
+        AUTODELETE_SECONDS, BROADCAST_BATCH_SIZE,
+        BROADCAST_CONCURRENCY, DEFAULT_DELAY,
+    )
 
     files = conf["files"]
     dest = conf["destination"]
@@ -560,17 +733,21 @@ async def _execute_batch(client, q, sid, conf):
         targets = [int(conf.get("manual_target") or 0)]
         kind = "channel"
     else:
-        return
+        targets = []
+        kind = "?"
 
     targets = [t for t in targets if t]
     if not targets:
         try:
-            await q.message.edit_text("⚠️ No valid targets")
+            await q.message.edit_text(
+                "⚠️ No valid targets",
+                parse_mode=ParseMode.HTML,
+            )
         except Exception:
             pass
         return
 
-    # ─── Global caption template (for wrap modes) ───
+    # ─── Global caption template ───
     global_cap = await DB.get_global_caption()
     global_btns = await DB.get_global_buttons()
 
@@ -582,6 +759,7 @@ async def _execute_batch(client, q, sid, conf):
 
     progress_msg = q.message
 
+    # ─── Loop through files ───
     for idx, f in enumerate(files, 1):
         try:
             src_msg = await client.get_messages(
@@ -594,14 +772,18 @@ async def _execute_batch(client, q, sid, conf):
 
         # ─── Build caption per mode ───
         if cap_mode == "own":
-            own_clean = TPL.clean_caption(f.get("original_caption") or "")
+            own_clean = TPL.clean_caption(
+                f.get("original_caption") or ""
+            )
             caption = own_clean if own_clean else ""
-            kb = None  # No buttons in own mode
+            kb = None
         elif cap_mode == "global":
             caption = TPL.build_caption(src_msg, global_cap)
             kb = TPL.build_buttons_kb(global_btns)
         elif cap_mode == "channel":
-            ch = await DB.get_channel(int(ch_id)) if ch_id not in ("all", None) else None
+            ch = None
+            if isinstance(ch_id, int):
+                ch = await DB.get_channel(int(ch_id))
             if ch:
                 cap_tpl = (
                     ch.get("caption")
@@ -637,6 +819,10 @@ async def _execute_batch(client, q, sid, conf):
                     f"🎯 {sc('targets')} · <b>{total_targets}</b>",
                     f"✅ {sc('sent')} · <b>{grand_sent}</b>",
                     f"❌ {sc('failed')} · <b>{grand_failed}</b>",
+                    "",
+                    _progress_colored(
+                        grand_sent + grand_failed, grand_total
+                    ),
                 ]),
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
@@ -649,12 +835,11 @@ async def _execute_batch(client, q, sid, conf):
         except Exception:
             pass
 
-        # ─── Send to all targets ───
-        from plugins.broadcast.config import BROADCAST_BATCH_SIZE
-        sem = asyncio.Semaphore(5)
+        # ─── Send to targets (concurrent) ───
+        sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
         lock = asyncio.Lock()
 
-        async def _send_one(tid):
+        async def _one(tid):
             async with sem:
                 try:
                     sent = None
@@ -679,22 +864,31 @@ async def _execute_batch(client, q, sid, conf):
                             )
                         except Exception:
                             pass
+                    await asyncio.sleep(DEFAULT_DELAY)
                     return "sent"
                 except Exception as e:
-                    logger.debug(f"[BC-CONF] {tid}: {type(e).__name__}")
+                    logger.debug(
+                        f"[BC-EXEC] {tid}: {type(e).__name__}"
+                    )
                     return "failed"
 
-        results = await asyncio.gather(
-            *[_send_one(t) for t in targets],
-            return_exceptions=True,
-        )
-        for r in results:
-            if r == "sent":
-                grand_sent += 1
-            else:
-                grand_failed += 1
+        try:
+            batch_targets = []
+            for i in range(0, total_targets, BROADCAST_BATCH_SIZE):
+                sub = targets[i:i + BROADCAST_BATCH_SIZE]
+                res = await asyncio.gather(
+                    *[_one(t) for t in sub],
+                    return_exceptions=True,
+                )
+                for r in res:
+                    if r == "sent":
+                        grand_sent += 1
+                    else:
+                        grand_failed += 1
+        except Exception as e:
+            logger.exception(f"[BC-EXEC] {e}")
 
-    # ─── Final report ───
+    # ─── Final report (SAME message) ───
     try:
         await client.edit_message_text(
             chat_id=progress_msg.chat.id,
@@ -720,7 +914,7 @@ async def _execute_batch(client, q, sid, conf):
     except Exception:
         pass
 
-    # Cleanup
+    # ─── Cleanup ───
     batch = ST.find_batch_by_sid(conf.get("batch_sid", ""))
     if batch:
         ST.clear_batch(batch["chat_id"])
@@ -738,21 +932,29 @@ async def _execute_batch(client, q, sid, conf):
 
 
 # ═════════════════════════════════════════════════════════════
-# MANUAL TARGET INPUT (PM)
+# MANUAL TARGET INPUT (in channel)
 # ═════════════════════════════════════════════════════════════
-@Client.on_message(
-    filters.private & filters.text & ~filters.regex(r"^/"),
-    group=-449,
-)
-async def conf_manual_input(client, message):
-    if not message.from_user or not _is_admin(message.from_user.id):
-        return
-    # find any conf waiting for manual target for this admin
-    for sid, conf in list(_CONF.items()):
-        if conf.get("admin_id") != message.from_user.id:
-            continue
-        if not conf.get("manual_await"):
-            continue
+if BROADCAST_CHANNEL_ID:
+
+    @Client.on_message(
+        filters.chat(BROADCAST_CHANNEL_ID) & filters.text
+        & ~filters.regex(r"^/"),
+        group=-498,
+    )
+    async def conf_manual_input(client, message):
+        if not message.from_user or not _is_admin(message.from_user.id):
+            return
+        # find any conf waiting for manual target
+        target_sid = None
+        for sid, conf in list(_CONF.items()):
+            if not conf.get("manual_await"):
+                continue
+            target_sid = sid
+            break
+        if not target_sid:
+            return
+
+        conf = _CONF[target_sid]
         text = (message.text or "").strip()
         try:
             if text.startswith("@"):
@@ -761,40 +963,50 @@ async def conf_manual_input(client, message):
             else:
                 tid = int(text)
         except Exception as e:
+            try:
+                message.stop_propagation()
+            except Exception:
+                pass
             await message.reply_text(f"❌ {e}")
             return
+
         conf["manual_await"] = False
         conf["manual_target"] = tid
         conf["channel_id"] = tid
         conf["destination"] = "manual"
+
         try:
             message.stop_propagation()
         except Exception:
             pass
-        await message.reply_text(
-            f"✅ Target saved · <code>{tid}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+
+        # Confirm and move to caption
+        batch = ST.find_batch_by_sid(target_sid)
+        if batch and batch.get("reply_msg_id"):
+            try:
+                text_view, kb = _build_batch_view(
+                    batch, stage="caption", conf=conf,
+                    extra=f"📝 {sc('choose caption mode')}",
+                )
+                await client.edit_message_text(
+                    chat_id=batch["chat_id"],
+                    message_id=batch["reply_msg_id"],
+                    text=text_view,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
 
 # ═════════════════════════════════════════════════════════════
-# HELPERS
-# ═════════════════════════════════════════════════════════════
-async def _safe_edit_pm(q: CallbackQuery, text: str, kb):
-    try:
-        await q.message.edit_text(
-            text, reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        if "not modified" not in str(e).lower():
-            logger.debug(f"[BC-CONF] edit: {e}")
-
-
-# ═════════════════════════════════════════════════════════════
-# ADMIN PANEL ENTRY
+# ADMIN PANEL ENTRY (/admin → 📢 Broadcast)
 # ═════════════════════════════════════════════════════════════
 async def bc_open_for_admin(client: Client, user_id: int) -> None:
     """Called from /admin → 📢 Broadcast."""
@@ -802,7 +1014,7 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
         try:
             await client.send_message(
                 chat_id=user_id,
-                text=f"⚠️ <b>BROADCAST_CHANNEL_ID not set</b>",
+                text="⚠️ <b>BROADCAST_CHANNEL_ID not set</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
@@ -834,7 +1046,7 @@ async def bc_open_for_admin(client: Client, user_id: int) -> None:
                 f"📢 <b>{fb('BROADCAST')}</b>",
                 DIV, "",
                 f"📌 {sc('upload files to the broadcast channel')}",
-                f"📌 {sc('the batch panel will open there')}",
+                f"📌 {sc('the batch panel opens there')}",
                 "",
                 f"📊 {sc('files in queue')} · <b>{len(docs)}</b>",
             ]),
