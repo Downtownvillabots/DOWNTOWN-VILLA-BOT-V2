@@ -314,6 +314,168 @@ def kb_back(target: str = "bc:main"):
     ]])
 
 
+def kb_batch(batch: Dict[str, Any], sc_fn) -> InlineKeyboardMarkup:
+    """Multi-file toggle panel (posted in broadcast channel)."""
+    files = batch["files"]
+    sid = batch["sid"]
+    selected = sum(1 for f in files if f["selected"])
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    # Toggle row — up to 5 per row
+    row: List[InlineKeyboardButton] = []
+    for i, f in enumerate(files):
+        mark = "✅" if f["selected"] else "☐"
+        row.append(InlineKeyboardButton(
+            f"{mark} {i + 1}",
+            callback_data=f"bcbatch:tog:{sid}:{i}",
+        ))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    # All / None
+    rows.append([
+        InlineKeyboardButton("✅ ALL", callback_data=f"bcbatch:all:{sid}"),
+        InlineKeyboardButton("☐ NONE", callback_data=f"bcbatch:none:{sid}"),
+    ])
+
+    # Broadcast button (only when something is selected)
+    if selected > 0:
+        rows.append([InlineKeyboardButton(
+            f"🚀 BROADCAST SELECTED ({selected})",
+            callback_data=f"bcbatch:bcast:{sid}",
+        )])
+
+    rows.append([InlineKeyboardButton(
+        "❌ CANCEL", callback_data=f"bcbatch:no:{sid}",
+    )])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_conf_destination(sid: str) -> InlineKeyboardMarkup:
+    """PM confirmation — pick destination type."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📢 CHANNELS",
+                callback_data=f"bcconf:{sid}:dest:channels",
+            ),
+            InlineKeyboardButton(
+                "👥 GROUPS",
+                callback_data=f"bcconf:{sid}:dest:groups",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "👤 USERS",
+                callback_data=f"bcconf:{sid}:dest:users",
+            ),
+            InlineKeyboardButton(
+                "🎯 MANUAL",
+                callback_data=f"bcconf:{sid}:dest:manual",
+            ),
+        ],
+        [InlineKeyboardButton(
+            "❌ CANCEL",
+            callback_data=f"bcconf:{sid}:cancel",
+        )],
+    ])
+
+
+def kb_conf_channels(
+    sid: str, channels: List[Dict[str, Any]]
+) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            "🎯 SEND TO ALL CHANNELS",
+            callback_data=f"bcconf:{sid}:chall",
+        )],
+    ]
+    for c in channels:
+        title = (c.get("title") or "?")[:34]
+        cid = c.get("chat_id")
+        marks = ""
+        if c.get("caption") is not None:
+            marks += "📝"
+        if c.get("buttons") is not None:
+            marks += "🔘"
+        if not marks:
+            marks = "⚪"
+        rows.append([InlineKeyboardButton(
+            f"{marks} {title}",
+            callback_data=f"bcconf:{sid}:ch:{cid}",
+        )])
+    rows.append([InlineKeyboardButton(
+        "◀️ BACK", callback_data=f"bcconf:{sid}:back",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_conf_caption(sid: str, has_channel: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            "📄 USE FILE'S OWN CAPTION",
+            callback_data=f"bcconf:{sid}:cap:own",
+        )],
+        [InlineKeyboardButton(
+            "🌐 USE GLOBAL CAPTION",
+            callback_data=f"bcconf:{sid}:cap:global",
+        )],
+    ]
+    if has_channel:
+        rows.append([InlineKeyboardButton(
+            "📢 USE CHANNEL CAPTION",
+            callback_data=f"bcconf:{sid}:cap:channel",
+        )])
+    rows.append([InlineKeyboardButton(
+        "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_conf_timer(sid: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for d, _, label in AUTODELETE_PRESETS:
+        icon = "⏱️" if d else "♾️"
+        row.append(InlineKeyboardButton(
+            f"{icon} {label}",
+            callback_data=f"bcconf:{sid}:timer:{d}",
+        ))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(
+        "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_conf_confirm(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "🚀 SEND NOW", callback_data=f"bcconf:{sid}:send",
+        )],
+        [InlineKeyboardButton(
+            "📝 CHANGE CAPTION MODE",
+            callback_data=f"bcconf:{sid}:chcap",
+        )],
+        [InlineKeyboardButton(
+            "⏱️ CHANGE TIMER",
+            callback_data=f"bcconf:{sid}:chtimer",
+        )],
+        [InlineKeyboardButton(
+            "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel",
+        )],
+    ])
+
+
 __all__ = [
     "cb", "kb_main", "kb_channels", "kb_channel_view",
     "kb_caption", "kb_buttons", "kb_button_view",
@@ -322,4 +484,6 @@ __all__ = [
     "kb_channel_picker", "kb_confirm_groups",
     "kb_user_timer", "kb_user_timer_confirm",
     "kb_confirm_batch", "kb_cancel_session", "kb_back",
+    "kb_batch", "kb_conf_destination", "kb_conf_channels",
+    "kb_conf_caption", "kb_conf_timer", "kb_conf_confirm",
 ]
