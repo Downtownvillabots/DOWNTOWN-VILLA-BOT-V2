@@ -304,6 +304,83 @@ async def cb_groups(client, q):
 
 
 @Client.on_callback_query(
+    filters.regex(r"^bc:gr_view:(-?\d+)$"), group=-500
+)
+async def cb_gr_view(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    gid = int(q.matches[0].group(1))
+    r = await V.view_group_detail(gid)
+    if r is None:
+        return await q.answer("⚠️ Not found", show_alert=True)
+    await V.safe_edit(q, r[0], r[1])
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bc:gr_cap:(-?\d+)$"), group=-500
+)
+async def cb_gr_cap(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    gid = int(q.matches[0].group(1))
+    ST.new_session(q.from_user.id, "gr_edit_caption", chat_id=gid)
+    text = "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"✏️ <b>{fb('SET GROUP CAPTION')}</b>",
+        DIV, "",
+        f"📝 {sc('send the new caption as next message')}",
+        f"📌 {sc('send')} <code>-</code> {sc('to clear')}",
+    ])
+    await V.safe_edit(q, text, KB.kb_cancel_session())
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bc:gr_btn:(-?\d+)$"), group=-500
+)
+async def cb_gr_btn(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    gid = int(q.matches[0].group(1))
+    ST.new_session(q.from_user.id, "gr_add_button", chat_id=gid)
+    text = "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"🔘 <b>{fb('ADD GROUP BUTTON')}</b>",
+        DIV, "",
+        f"📝 {sc('send as:')}",
+        f"<code>Name | URL</code>",
+    ])
+    await V.safe_edit(q, text, KB.kb_cancel_session())
+    await q.answer()
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bc:gr_timer:(-?\d+)$"), group=-500
+)
+async def cb_gr_timer(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    gid = int(q.matches[0].group(1))
+    await q.answer(
+        f"⏱️ Timer set at broadcast — pick when you send",
+        show_alert=True,
+    )
+
+
+@Client.on_callback_query(
+    filters.regex(r"^bc:gr_send:(-?\d+)$"), group=-500
+)
+async def cb_gr_send(client, q):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("⛔", show_alert=True)
+    await q.answer(
+        "📌 Upload a file to the broadcast channel first",
+        show_alert=True,
+    )
+
+
+@Client.on_callback_query(
     filters.regex(r"^bc:do_users$"), group=-500
 )
 async def cb_do_users(client, q):
