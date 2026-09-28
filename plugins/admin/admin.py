@@ -48,7 +48,7 @@ from core import rocket
 from utils import fonts as F
 from utils import format as FM
 from utils import progress as P
-from plugins.broadcast import broadcast_panel
+from plugins.broadcast import panel as broadcast_panel
 
 logger = logging.getLogger(__name__)
 
