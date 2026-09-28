@@ -57,8 +57,9 @@ async def count_users() -> int:
     if c is None:
         return 0
     try:
-        return await c.estimated_document_count()
-    except Exception:
+        return await c.count_documents({})
+    except Exception as e:
+        logger.warning(f"[BC] count_users: {e}")
         return 0
 
 
@@ -98,8 +99,9 @@ async def count_groups() -> int:
     if c is None:
         return 0
     try:
-        return await c.estimated_document_count()
-    except Exception:
+        return await c.count_documents({})
+    except Exception as e:
+        logger.warning(f"[BC] count_groups: {e}")
         return 0
 
 
