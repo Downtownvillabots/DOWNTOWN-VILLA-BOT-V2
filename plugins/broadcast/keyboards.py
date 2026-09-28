@@ -515,10 +515,13 @@ def kb_groups_list(groups: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
             callback_data=f"bc:gr_view:{gid}",
         )])
     rows.append([
+        InlineKeyboardButton("➕ ADD GROUP", callback_data="bc:gr_add"),
         InlineKeyboardButton("🔄 REFRESH", callback_data="bc:groups"),
-        InlineKeyboardButton("◀️ BACK", callback_data="bc:main"),
     ])
-    rows.append([InlineKeyboardButton("❌ CLOSE", callback_data="bc:close")])
+    rows.append([
+        InlineKeyboardButton("◀️ BACK", callback_data="bc:main"),
+        InlineKeyboardButton("❌ CLOSE", callback_data="bc:close"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
