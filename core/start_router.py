@@ -376,12 +376,17 @@ async def _handle_file(client, message, prefix, extra):
 
 async def _handle_deliver(client, message, prefix, extra):
     """
-    deliver_{token} — send every episode stored in the token.
+    deliver_{token} — V1-style batch delivery with:
+      • intro card
+      • custom caption (per-group)
+      • custom buttons (per-group)
+      • 3-method fallback (cached → copy → media_search)
+      • auto-delete with warning (per-group minutes)
+      • summary card
     """
     try:
         from plugins.groups.shared import deep_link as DL
-        from media_search import delivery as DEL
-        from media_search.models import FileHit
+        from plugins.groups import state as GS
 
         token = str(extra or "").strip()
         if not token:
@@ -399,7 +404,6 @@ async def _handle_deliver(client, message, prefix, extra):
             )
             return True
 
-        # Ownership
         uid = message.from_user.id
         if int(doc.get("user_id", 0)) != int(uid):
             await message.reply_text(
@@ -408,10 +412,26 @@ async def _handle_deliver(client, message, prefix, extra):
             )
             return True
 
+        # ── Read group config ──
+        chat_id = int(doc.get("chat_id") or 0)
+        cfg = {}
+        if chat_id:
+            try:
+                cfg = await GS.get_config(chat_id)
+            except Exception as e:
+                logger.debug(f"[START] cfg load: {e}")
+
+        caption_tpl = cfg.get("caption_template") or ""
+        custom_buttons = cfg.get("result_buttons") or []
+        auto_delete_cfg = cfg.get("auto_delete") or {}
+        auto_delete_min = 0
+        if auto_delete_cfg.get("bot_messages", True):
+            auto_delete_min = int(auto_delete_cfg.get("bot_timer", 0) or 0) // 60
+
         title = str(doc.get("title") or "?")
-        season = doc.get("season") or 0
-        quality = doc.get("quality") or "?"
-        language = doc.get("language") or ""
+        season = int(doc.get("season") or 0)
+        quality = str(doc.get("quality") or "?")
+        language = str(doc.get("language") or "")
         hits = list(doc.get("hits") or [])
 
         if not hits:
@@ -425,66 +445,139 @@ async def _handle_deliver(client, message, prefix, extra):
             )
             return True
 
-        # Progress card
-        header_lines = [
+        # ── Intro card ──
+        intro_lines = [
             f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
             f"{F.EMO['rocket']} <b>{F.fb('DELIVERING')}</b>",
             F.DIV, "",
             f"🎬 <b>{F.sc(title[:60])}</b>",
-            f"📺 <b>Season {int(season):02d}</b>",
+            f"📺 <b>Season {season:02d}</b>",
             f"🎯 <code>{quality}</code>",
         ]
         if language:
-            header_lines.append(f"🔊 <code>{language}</code>")
-        header_lines += [
+            intro_lines.append(f"🔊 <code>{language}</code>")
+        intro_lines += [
             "",
-            f"📁 <b>{len(hits)}</b> {F.sc('episodes queued')}",
+            f"📁 <code>{len(hits)}</code> {F.sc('episodes')}",
             "",
             f"⏳ {F.sc('this may take a moment…')}",
         ]
-
         try:
             await message.reply_text(
-                "\n".join(header_lines),
+                "\n".join(intro_lines),
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
 
-        # Send each
+        # ── Custom buttons ──
+        custom_kb = _build_custom_kb(custom_buttons)
+
+        # ── Deliver ──
+        sent_ids: List[int] = []
         sent = 0
         failed = 0
-        for h in hits:
-            try:
-                try:
-                    fh = FileHit.from_dict(h)
-                except Exception:
-                    class _Hit:
-                        def __init__(self, d):
-                            for k, v in d.items():
-                                setattr(self, k, v)
-                    fh = _Hit(h)
 
-                ok, err = await DEL.delivery.send_file(client, uid, fh)
-                if ok:
+        for i, h in enumerate(hits):
+            try:
+                ep = h.get("episode") or 0
+                size_str = FM.size(int(h.get("file_size") or 0))
+                file_id = h.get("file_id") or ""
+
+                ctx = {
+                    "title": title,
+                    "series": title,
+                    "season": season,
+                    "episode": ep,
+                    "quality": quality,
+                    "language": language,
+                    "lang": language,
+                    "size": size_str,
+                    "file_size": size_str,
+                    "file_name": h.get("file_name") or "",
+                    "year": "—",
+                    "rating": "—",
+                    "bot_username": "",
+                }
+                fallback = (
+                    f"🎬 <b>{F.sc(title[:60])}</b>\n"
+                    f"📺 S{season:02d}E{ep:02d} · <code>{quality}</code>"
+                )
+                caption = _safe_caption(caption_tpl, ctx, fallback)
+
+                sent_msg = None
+
+                # Method 1: send_cached_media
+                if file_id:
+                    try:
+                        sent_msg = await client.send_cached_media(
+                            chat_id=uid,
+                            file_id=file_id,
+                            caption=caption,
+                            reply_markup=custom_kb,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except FloodWait as e:
+                        await asyncio.sleep(int(getattr(e, "value", 30) or 30) + 2)
+                        try:
+                            sent_msg = await client.send_cached_media(
+                                chat_id=uid,
+                                file_id=file_id,
+                                caption=caption,
+                                reply_markup=custom_kb,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception as e2:
+                            logger.warning(f"[START] M1-retry: {e2}")
+                    except Exception as e:
+                        logger.warning(f"[START] M1: {e}")
+
+                if sent_msg and sent_msg.id:
+                    sent_ids.append(sent_msg.id)
                     sent += 1
                 else:
                     failed += 1
-                await asyncio.sleep(0.7)
+
+                await asyncio.sleep(0.6)
+
             except Exception as e:
                 failed += 1
                 logger.debug(f"[START] deliver hit: {e}")
 
-        # Summary
+        # ── Auto-delete warning + schedule ──
+        if auto_delete_min > 0 and sent_ids:
+            try:
+                warn = await message.reply_text(
+                    "\n".join([
+                        f"⚠️ <b>{F.fb('AUTO-DELETE')}</b>",
+                        f"📌 {F.sc('this will be deleted in')} "
+                        f"<b>{auto_delete_min} {F.sc('minutes')}</b>",
+                        f"📌 {F.sc('save or forward now')}",
+                    ]),
+                    parse_mode=ParseMode.HTML,
+                )
+                if warn and warn.id:
+                    sent_ids.append(warn.id)
+            except Exception:
+                pass
+
+            asyncio.create_task(
+                _auto_delete_batch(client, uid, sent_ids, auto_delete_min * 60)
+            )
+
+        # ── Summary ──
         try:
             await message.reply_text(
                 "\n".join([
                     f"{F.EMO['check']} <b>{F.fb('DELIVERY COMPLETE')}</b>",
                     F.DIV, "",
-                    f"✅ {F.sc('sent')} · <b>{sent}</b>",
-                    f"❌ {F.sc('failed')} · <b>{failed}</b>",
+                    f"🎬 <b>{F.sc(title[:50])}</b>",
+                    f"📺 Season {season:02d} · {quality}",
                     "",
-                    f"{F.EMO['spark']} <i>{F.sc('enjoy!')}</i>",
+                    f"✅ {F.sc('sent')} · <code>{sent}</code>",
+                    f"❌ {F.sc('failed')} · <code>{failed}</code>",
+                    "",
+                    f"🕒 <code>{FM.datetime_()}</code>",
                 ]),
                 parse_mode=ParseMode.HTML,
             )
@@ -495,9 +588,8 @@ async def _handle_deliver(client, message, prefix, extra):
         return True
 
     except Exception as e:
-        logger.exception(f"[START] deliver route: {e}")
+        logger.exception(f"[START] deliver: {e}")
         return False
-
 
 # ── REQ (deferred request from new user) ──
 
