@@ -41,6 +41,7 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from plugins.groups.shared import deep_link as DL
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,103 @@ async def create_deliver_token(
     except Exception as e:
         logger.exception(f"[DL] create_deliver: {e}")
         return None
+
+
+# ============================================================
+# SECTION 5b — CREATE PREMIUM TOKEN
+# ============================================================
+
+async def create_premium_token(
+    user_id: int,
+    chat_id: int,
+    title: str,
+    slug: str,
+    tmdb_id: Optional[int],
+    hits: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    Store a premium watch token.
+
+    Used when a premium user searches in the series group:
+    the flow creates a premium token, deep-links to PM,
+    and PM opens the premium watch session.
+    """
+    c = _coll()
+    if c is None:
+        return None
+
+    if not hits:
+        return None
+
+    try:
+        token = _new_token()
+        now = datetime.now(timezone.utc)
+
+        # Clean hits
+        clean_hits: List[Dict[str, Any]] = []
+        for h in hits[:MAX_HITS_PER_DELIVER]:
+            if not h or not h.get("file_id"):
+                continue
+            clean_hits.append({
+                "file_id": str(h.get("file_id") or ""),
+                "file_unique_id": h.get("file_unique_id"),
+                "file_name": str(h.get("file_name") or ""),
+                "file_size": int(h.get("file_size") or 0),
+                "title": str(h.get("title") or ""),
+                "year": h.get("year"),
+                "type": str(h.get("type") or "series"),
+                "quality": h.get("quality"),
+                "codec": h.get("codec"),
+                "audio_languages": list(h.get("audio_languages") or []),
+                "subtitle_languages": list(h.get("subtitle_languages") or []),
+                "has_subtitle": bool(h.get("has_subtitle")),
+                "series_title": h.get("series_title"),
+                "season": h.get("season"),
+                "episode": h.get("episode"),
+            })
+
+        if not clean_hits:
+            return None
+
+        await c.insert_one({
+            "token": token,
+            "kind": "premium",
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "title": str(title)[:200],
+            "slug": str(slug)[:100],
+            "tmdb_id": int(tmdb_id) if tmdb_id else None,
+            "hits": clean_hits,
+            "total": len(clean_hits),
+            "created_at": now,
+            "expires_at": now + timedelta(seconds=TTL_SECONDS),
+            "used": False,
+        })
+
+        logger.debug(
+            f"[DL] premium token created: {token} "
+            f"({len(clean_hits)} hits · '{title[:30]}')"
+        )
+        return token
+
+    except Exception as e:
+        logger.exception(f"[DL] create_premium: {e}")
+        return None
+
+
+async def get_premium_batch(token: str) -> Optional[Dict[str, Any]]:
+    """Shortcut for premium tokens."""
+    doc = await get_token(token)
+    if not doc or doc.get("kind") != "premium":
+        return None
+    return {
+        "title": doc.get("title") or "",
+        "slug": doc.get("slug") or "",
+        "tmdb_id": doc.get("tmdb_id"),
+        "hits": list(doc.get("hits") or []),
+    }
+
+
 
 
 # ============================================================
