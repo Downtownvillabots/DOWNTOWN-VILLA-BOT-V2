@@ -666,6 +666,19 @@ def _norm(s: str) -> str:
 
 
 async def smart_db_search(title: str) -> Optional[Dict[str, Any]]:
+    """
+    Search DB with the FULL query only.
+
+    No prefix fallback here — that path caused 'money hist'
+    to spuriously match 'Breaking Bad'. Typos are handled
+    by the spell-check step and IMDB/TMDB suggestions, which
+    run AFTER this function returns None.
+
+    Optional: last-word-drop retry — only when the shortened
+    query still has ≥ 2 words (avoids the 'money' single-word
+    false positive).
+    """
+    # ── Full query ──
     try:
         hits, _ = await SEARCH.quick_search(title, is_series=True)
     except Exception as e:
@@ -680,11 +693,14 @@ async def smart_db_search(title: str) -> Optional[Dict[str, Any]]:
         )
         return {"matched_title": matched, "hits": hits}
 
+    # ── Drop trailing words — only if result is ≥ 2 words ──
+    # This lets "breaking bad season 1" fall back to "breaking bad"
+    # but blocks "money hist" → "money" (single word = too risky).
     norm = _norm(title)
     words = norm.split()
-    for i in range(len(words) - 1, max(0, len(words) - 4), -1):
+    for i in range(len(words) - 1, 1, -1):   # i >= 2  (never i=1)
         partial = " ".join(words[:i])
-        if len(partial) < 3:
+        if len(partial) < 6:
             continue
         try:
             hits, _ = await SEARCH.quick_search(partial, is_series=True)
@@ -696,9 +712,13 @@ async def smart_db_search(title: str) -> Optional[Dict[str, Any]]:
                 or hits[0].get("title")
                 or partial
             )
+            logger.info(
+                f"[SERIES-H] partial match: {title!r} → "
+                f"{matched!r} (via {partial!r})"
+            )
             return {"matched_title": matched, "hits": hits}
-    return None
 
+    return None
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 10 — TMDB ENRICHMENT
