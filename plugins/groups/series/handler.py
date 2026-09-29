@@ -1310,6 +1310,320 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 16b — PM DELIVERY HANDLER (self-contained)
+# ═══════════════════════════════════════════════════════════════════════════
+# Runs FIRST (group -100000) so no other /start handler can steal
+# the deliver_ payload. Reads the token from deep_link store and
+# sends every episode file to the user's PM.
+#
+# Depends on nothing external — no start_router.py needed.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@Client.on_message(
+    filters.private & filters.command("start"),
+    group=-100000,
+)
+async def series_delivery_start(client: Client, message: Message):
+    if not message.from_user:
+        return
+
+    cmd = getattr(message, "command", None) or []
+    if len(cmd) < 2:
+        return
+
+    payload = str(cmd[1] or "").strip()
+    if not payload.startswith("deliver_"):
+        return
+
+    token = payload[8:].strip()
+    if not token:
+        return
+
+    # Claim the message — nothing else will see it
+    try:
+        message.stop_propagation()
+    except Exception:
+        pass
+
+    uid = int(message.from_user.id)
+    logger.info(f"[SERIES-H] ▶️ deliver start uid={uid} token={token[:10]}…")
+
+    # ── Load token ──
+    try:
+        doc = await DL.get_token(token)
+    except Exception as e:
+        logger.exception(f"[SERIES-H] get_token crash: {e}")
+        doc = None
+
+    if not doc:
+        logger.warning(f"[SERIES-H] ❌ token NOT FOUND: {token}")
+        try:
+            await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['warn']} <b>{fb('LINK EXPIRED')}</b>",
+                    DIV, "",
+                    f"📌 {sc('please search again in the group')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    kind = doc.get("kind")
+    owner = int(doc.get("user_id", 0))
+    logger.info(
+        f"[SERIES-H] token kind={kind} owner={owner} uid={uid}"
+    )
+
+    if kind != "deliver":
+        logger.warning(f"[SERIES-H] wrong token kind: {kind}")
+        try:
+            await message.reply_text("❌ Invalid token")
+        except Exception:
+            pass
+        return
+
+    if owner != uid:
+        try:
+            await message.reply_text(
+                f"{F.EMO['cross']} {sc('this link is not for you')}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Extract payload ──
+    title = str(doc.get("title") or "?")
+    try:
+        season = int(doc.get("season") or 0)
+    except (TypeError, ValueError):
+        season = 0
+    quality = str(doc.get("quality") or "?")
+    language = str(doc.get("language") or "")
+    hits = list(doc.get("hits") or [])
+    chat_id = int(doc.get("chat_id") or 0)
+
+    logger.info(
+        f"[SERIES-H] deliver: title={title!r} S{season:02d} "
+        f"q={quality} files={len(hits)} chat={chat_id}"
+    )
+
+    if not hits:
+        try:
+            await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['cross']} <b>{fb('NO FILES')}</b>",
+                    DIV, "",
+                    f"📌 {sc('please search again in the group')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Load group config ──
+    caption_tpl = ""
+    custom_buttons: List[Dict[str, Any]] = []
+    auto_delete_min = 0
+
+    if chat_id:
+        try:
+            cfg = await S.get_config(chat_id)
+            caption_tpl = cfg.get("caption_template") or ""
+            custom_buttons = cfg.get("result_buttons") or []
+            ad = cfg.get("auto_delete") or {}
+            if ad.get("bot_messages", True):
+                auto_delete_min = int(ad.get("bot_timer", 0) or 0) // 60
+            logger.info(
+                f"[SERIES-H] cfg: caption={'Y' if caption_tpl else 'N'} "
+                f"buttons={len(custom_buttons)} autodel={auto_delete_min}m"
+            )
+        except Exception as e:
+            logger.warning(f"[SERIES-H] cfg load: {e}")
+
+    custom_kb = build_extra_kb(custom_buttons)
+
+    # ── Intro card ──
+    try:
+        intro_lines = [
+            f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
+            f"{F.EMO['rocket']} <b>{fb('DELIVERING')}</b>",
+            DIV, "",
+            f"🎬 <b>{esc(title[:60])}</b>",
+            f"📺 <b>Season {season:02d}</b>",
+            f"🎯 <code>{esc(quality)}</code>",
+        ]
+        if language:
+            intro_lines.append(f"🔊 <code>{esc(language)}</code>")
+        intro_lines += [
+            "",
+            f"📁 <code>{len(hits)}</code> episodes",
+            "",
+            f"⏳ {sc('please wait…')}",
+        ]
+        await message.reply_text(
+            "\n".join(intro_lines),
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info(f"[SERIES-H] ✅ intro sent")
+    except Exception as e:
+        logger.warning(f"[SERIES-H] intro fail: {e}")
+
+    # ── Deliver files ──
+    sent_ids: List[int] = []
+    sent = 0
+    failed = 0
+
+    for i, h in enumerate(hits):
+        try:
+            if not isinstance(h, dict):
+                failed += 1
+                continue
+
+            ep = h.get("episode") or 0
+            size_str = fmt_size(h.get("file_size") or 0)
+            file_id = str(h.get("file_id") or "")
+
+            logger.info(
+                f"[SERIES-H] [{i+1}/{len(hits)}] ep={ep} "
+                f"fid={'Y' if file_id else 'N'}"
+            )
+
+            if not file_id:
+                failed += 1
+                logger.warning(f"[SERIES-H] no file_id for ep={ep}")
+                continue
+
+            # Caption
+            ctx = {
+                "title": title, "series": title,
+                "season": season, "episode": ep,
+                "quality": quality, "language": language,
+                "lang": language, "size": size_str,
+                "file_size": size_str,
+                "file_name": h.get("file_name") or "",
+                "year": "—", "rating": "—", "bot_username": "",
+            }
+            fallback = (
+                f"🎬 <b>{esc(title[:60])}</b>\n"
+                f"📺 S{season:02d}E{int(ep):02d} · "
+                f"<code>{esc(quality)}</code>"
+            )
+            caption = safe_caption(caption_tpl, ctx, fallback)
+
+            sent_msg = None
+            try:
+                sent_msg = await client.send_cached_media(
+                    chat_id=uid,
+                    file_id=file_id,
+                    caption=caption,
+                    reply_markup=custom_kb,
+                    parse_mode=ParseMode.HTML,
+                )
+            except FloodWait as e:
+                w = int(getattr(e, "value", 30) or 30)
+                logger.warning(f"[SERIES-H] flood {w}s")
+                await asyncio.sleep(w + 2)
+                try:
+                    sent_msg = await client.send_cached_media(
+                        chat_id=uid, file_id=file_id,
+                        caption=caption, reply_markup=custom_kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as e2:
+                    logger.warning(f"[SERIES-H] retry: {e2}")
+            except UserIsBlocked:
+                logger.warning(f"[SERIES-H] user blocked — stopping")
+                break
+            except Exception as e:
+                logger.warning(
+                    f"[SERIES-H] send fail: {type(e).__name__}: {e}"
+                )
+
+            if sent_msg and getattr(sent_msg, "id", None):
+                sent_ids.append(sent_msg.id)
+                sent += 1
+                logger.info(f"[SERIES-H] ✅ ep={ep}")
+            else:
+                failed += 1
+                logger.warning(f"[SERIES-H] ❌ ep={ep}")
+
+            await asyncio.sleep(DELIVER_BATCH_DELAY)
+
+        except Exception as e:
+            failed += 1
+            logger.exception(f"[SERIES-H] ep crash: {e}")
+
+    logger.info(
+        f"[SERIES-H] ═══ delivery done: sent={sent} failed={failed} ═══"
+    )
+
+    # ── Auto-delete schedule ──
+    if auto_delete_min > 0 and sent_ids:
+        try:
+            warn = await message.reply_text(
+                "\n".join([
+                    f"⚠️ <b>{fb('AUTO-DELETE')}</b>",
+                    f"📌 {sc('this will be deleted in')} "
+                    f"<b>{auto_delete_min} {sc('minutes')}</b>",
+                    f"📌 {sc('save or forward now')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            if warn and warn.id:
+                sent_ids.append(warn.id)
+        except Exception:
+            pass
+
+        asyncio.create_task(
+            _pm_auto_delete(client, uid, sent_ids, auto_delete_min * 60)
+        )
+
+    # ── Summary ──
+    try:
+        await message.reply_text(
+            "\n".join([
+                f"{F.EMO['check']} <b>{fb('DELIVERY COMPLETE')}</b>",
+                DIV, "",
+                f"🎬 <b>{esc(title[:50])}</b>",
+                f"📺 Season {season:02d} · {esc(quality)}",
+                "",
+                f"✅ {sc('sent')} · <code>{sent}</code>",
+                f"❌ {sc('failed')} · <code>{failed}</code>",
+                "",
+                f"🕒 <code>{now_ist()}</code>",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    # Mark used
+    try:
+        await DL.mark_used(token)
+    except Exception:
+        pass
+
+
+async def _pm_auto_delete(client, chat_id: int, msg_ids: List[int], seconds: int):
+    try:
+        await asyncio.sleep(seconds)
+        for mid in msg_ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception:
+                pass
+        logger.info(f"[SERIES-H] autodel: deleted {len(msg_ids)} msgs")
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.debug(f"[SERIES-H] autodel: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SECTION 17 — WIZARD RENDERERS
 # ═══════════════════════════════════════════════════════════════════════════
 async def render_language(
