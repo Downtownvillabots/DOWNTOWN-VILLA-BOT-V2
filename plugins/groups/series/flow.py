@@ -1,33 +1,41 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — SERIES FLOW CONFIG READER
+# 🏨 DOWNTOWN VILLA — SERIES FLOW READER (v2)
 # ============================================================
 #
-# Reads the per-group flow config and resolves:
-#   • Which steps are enabled (from /admin → Flow Editor)
-#   • What order they should run in
-#   • Per-step settings (per_row, auto_skip, threshold, max_items)
+# Reads the per-group flow config + custom order from DB.
+# Every step + setting is controlled by:
+#   • /admin → 🎯 Flow Editor → 👥 Groups → <group> → 📺 Series Search
 #
-# Series has more steps than movie:
-#   base_search → spell_check → suggestions → language
-#     → season → episode → quality → file_delivery
+# What this exposes:
+#   • Custom step order (from cfg.flow_order.series)
+#   • Enabled/disabled steps
+#   • Per-row layout (1-4)
+#   • Auto-skip if one
+#   • Max items
+#   • Spell check: threshold, max_corrections
+#   • Suggestions: min_score, provider, show_rating, show_year, show_icon
+#   • Delivery: sort_order, show_quality, show_name, name_max_len
+#   • Display: poster, rating, year, genre, language toggles
 #
-# Used by:
-#   • groups/series/handler.py   (wizard gating)
-#
-# This module is READ-ONLY — writes go through state.save_field()
-# when an admin toggles a step in the panel.
+# READ-ONLY. Writes go through state.save_field() when admin taps.
 #
 # Public API:
-#   get_effective_cfg(chat_id)               → dict
-#   get_step_order(chat_id)                  → list[str]
-#   get_enabled_steps(chat_id)               → list[str]
-#   is_step_enabled(chat_id, step_key)       → bool
-#   is_auto_skip(chat_id, step_key)          → bool
-#   get_step_cfg(chat_id, step_key)          → dict
-#   get_per_row(chat_id, step_key)           → int
-#   get_max_items(chat_id, step_key, d)      → int
-#   label_for(step_key) / icon_for(step_key) → str
-#   get_sort_order(chat_id)                  → str
+#   get_effective_cfg(chat_id)                → dict
+#   get_step_order(chat_id)                   → list[str]
+#   get_enabled_steps(chat_id)                → list[str]
+#   is_step_enabled(chat_id, key)             → bool
+#   is_auto_skip(chat_id, key)                → bool
+#   get_step_cfg(chat_id, key)                → dict
+#   get_per_row(chat_id, key)                 → int (1-4)
+#   get_max_items(chat_id, key)               → int
+#   get_spell_threshold(chat_id)              → int
+#   get_max_corrections(chat_id)              → int
+#   get_suggestion_min_score(chat_id)         → int
+#   get_suggestion_provider(chat_id)          → str
+#   get_suggestion_display(chat_id)           → dict {show_rating, show_year, show_icon}
+#   get_delivery_settings(chat_id)            → dict {sort_order, show_quality, show_name, name_max_len}
+#   get_display_settings(chat_id)             → dict {poster, rating, year, genre, language}
+#   label_for(key) / icon_for(key)            → str
 #
 # ============================================================
 
@@ -42,10 +50,10 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# SECTION 1 — DEFAULT STEP ORDER (series flow)
+# SECTION 1 — DEFAULTS
 # ============================================================
 
-DEFAULT_SERIES_STEPS: List[str] = [
+DEFAULT_ORDER: List[str] = [
     "base_search",
     "spell_check",
     "suggestions",
@@ -56,17 +64,16 @@ DEFAULT_SERIES_STEPS: List[str] = [
     "file_delivery",
 ]
 
-# Steps that cannot be disabled
+# Steps that must always run
 MANDATORY_STEPS = {"base_search", "file_delivery"}
 
-# Steps that support auto-skip-if-one
+# Steps with auto-skip behavior
 AUTO_SKIP_STEPS = {"language", "season", "episode", "quality"}
 
+# Steps that appear in the wizard UI (skip the search-pipeline steps)
+WIZARD_STEPS = {"language", "season", "episode", "quality", "file_delivery"}
 
-# ============================================================
-# SECTION 2 — STEP METADATA
-# ============================================================
-
+# Step icons + labels (for UI)
 STEP_LABELS: Dict[str, str] = {
     "base_search":   "Search",
     "spell_check":   "Spell Check",
@@ -91,188 +98,263 @@ STEP_ICONS: Dict[str, str] = {
 
 
 # ============================================================
-# SECTION 3 — READ EFFECTIVE CONFIG
+# SECTION 2 — READ CONFIG
 # ============================================================
 
 async def get_effective_cfg(chat_id: int) -> Dict[str, Any]:
-    """
-    Return the group config with `flow` filled from defaults.
-    Every known step key is guaranteed present with all fields.
-    """
+    """Group config with flow + flow_order normalized."""
     cfg = await S.get_config(chat_id)
+
+    # Ensure flow dict exists
     flow = dict(cfg.get("flow") or {})
-
-    for step in DEFAULT_SERIES_STEPS:
-        if step not in flow:
-            flow[step] = _default_step_cfg(step)
-        else:
-            step_cfg = dict(flow[step])
-            step_cfg.setdefault("enabled", True)
-            step_cfg.setdefault("per_row", _default_per_row(step))
-            if step in AUTO_SKIP_STEPS:
-                step_cfg.setdefault("auto_skip", True)
-            flow[step] = step_cfg
-
+    for key in DEFAULT_ORDER:
+        step = dict(flow.get(key) or {})
+        step.setdefault("enabled", True)
+        step.setdefault("per_row", _default_per_row(key))
+        if key in AUTO_SKIP_STEPS:
+            step.setdefault("auto_skip", True)
+        flow[key] = step
     cfg["flow"] = flow
+
+    # Ensure flow_order
+    flow_order = dict(cfg.get("flow_order") or {})
+    if not isinstance(flow_order.get("series"), list):
+        flow_order["series"] = []
+    cfg["flow_order"] = flow_order
+
     return cfg
 
 
-def _default_step_cfg(step: str) -> Dict[str, Any]:
-    base = {
-        "enabled": True,
-        "per_row": _default_per_row(step),
-    }
-    if step in AUTO_SKIP_STEPS:
-        base["auto_skip"] = True
-    return base
-
-
-def _default_per_row(step: str) -> int:
-    if step == "episode":
+def _default_per_row(key: str) -> int:
+    if key == "episode":
         return 4
-    if step in ("language", "season", "quality"):
+    if key in ("language", "season", "quality"):
         return 2
-    if step == "file_delivery":
-        return 1
-    return 2
+    return 1
 
 
 # ============================================================
-# SECTION 4 — STEP ORDER
+# SECTION 3 — ORDER (custom → fallback to default)
 # ============================================================
 
 async def get_step_order(chat_id: int) -> List[str]:
     """
-    Return the full step order (including disabled).
-    Future: read custom order from cfg["flow_order"].
+    Return the step order for this group.
+    Custom order from DB takes priority. Missing steps
+    are appended from DEFAULT_ORDER at the end.
     """
-    return list(DEFAULT_SERIES_STEPS)
+    cfg = await get_effective_cfg(chat_id)
+    custom = list((cfg.get("flow_order") or {}).get("series") or [])
+
+    # Keep only valid keys, no duplicates
+    order: List[str] = []
+    seen: set = set()
+    for k in custom:
+        if k in DEFAULT_ORDER and k not in seen:
+            order.append(k)
+            seen.add(k)
+
+    # Append any missing (from default)
+    for k in DEFAULT_ORDER:
+        if k not in seen:
+            order.append(k)
+
+    return order
 
 
 async def get_enabled_steps(chat_id: int) -> List[str]:
-    """
-    Return only the enabled steps in flow order.
-    Mandatory steps are always included.
-    """
+    """Enabled steps in custom order. Mandatory always included."""
+    order = await get_step_order(chat_id)
     cfg = await get_effective_cfg(chat_id)
     flow = cfg.get("flow") or {}
 
     out: List[str] = []
-    for step in DEFAULT_SERIES_STEPS:
-        if step in MANDATORY_STEPS:
-            out.append(step)
+    for k in order:
+        if k in MANDATORY_STEPS:
+            out.append(k)
             continue
-        if flow.get(step, {}).get("enabled", True):
-            out.append(step)
+        if flow.get(k, {}).get("enabled", True):
+            out.append(k)
     return out
 
 
+async def get_wizard_steps(chat_id: int) -> List[str]:
+    """
+    Only the wizard-visible steps (language/season/episode/quality/delivery)
+    in custom order + enabled. Used by the handler to know where to start.
+    """
+    enabled = await get_enabled_steps(chat_id)
+    return [k for k in enabled if k in WIZARD_STEPS]
+
+
 # ============================================================
-# SECTION 5 — STEP QUERIES
+# SECTION 4 — STEP QUERIES
 # ============================================================
 
-async def is_step_enabled(chat_id: int, step_key: str) -> bool:
-    """
-    True if this step should run for this group.
-    Mandatory steps always return True.
-    """
-    if step_key in MANDATORY_STEPS:
+async def is_step_enabled(chat_id: int, key: str) -> bool:
+    if key in MANDATORY_STEPS:
         return True
-
     cfg = await get_effective_cfg(chat_id)
-    flow = cfg.get("flow") or {}
-    step_cfg = flow.get(step_key) or {}
-    return bool(step_cfg.get("enabled", True))
+    step = (cfg.get("flow") or {}).get(key) or {}
+    return bool(step.get("enabled", True))
 
 
-async def is_auto_skip(chat_id: int, step_key: str) -> bool:
-    """
-    True if the step should auto-skip when only one option exists.
-    Only meaningful for AUTO_SKIP_STEPS.
-    """
-    if step_key not in AUTO_SKIP_STEPS:
+async def is_auto_skip(chat_id: int, key: str) -> bool:
+    if key not in AUTO_SKIP_STEPS:
         return False
-
     cfg = await get_effective_cfg(chat_id)
-    flow = cfg.get("flow") or {}
-    step_cfg = flow.get(step_key) or {}
-    return bool(step_cfg.get("auto_skip", True))
+    step = (cfg.get("flow") or {}).get(key) or {}
+    return bool(step.get("auto_skip", True))
 
 
-async def get_step_cfg(
-    chat_id: int, step_key: str,
-) -> Dict[str, Any]:
-    """Return config for one step. Non-empty."""
+async def get_step_cfg(chat_id: int, key: str) -> Dict[str, Any]:
     cfg = await get_effective_cfg(chat_id)
-    flow = cfg.get("flow") or {}
-    return dict(flow.get(step_key) or {})
+    return dict((cfg.get("flow") or {}).get(key) or {})
 
 
-# ============================================================
-# SECTION 6 — STEP LABELS (for UI)
-# ============================================================
-
-def label_for(step_key: str) -> str:
-    return STEP_LABELS.get(step_key, step_key)
-
-
-def icon_for(step_key: str) -> str:
-    return STEP_ICONS.get(step_key, "⚙️")
-
-
-# ============================================================
-# SECTION 7 — RESOLVERS
-# ============================================================
-
-async def get_sort_order(chat_id: int) -> str:
-    """Return "small_to_big" or "big_to_small"."""
-    cfg = await S.get_config(chat_id)
-    return str(cfg.get("sort_order", "small_to_big"))
-
-
-async def get_per_row(chat_id: int, step_key: str) -> int:
-    """Return per_row for a step (1-4)."""
-    step_cfg = await get_step_cfg(chat_id, step_key)
+async def get_per_row(chat_id: int, key: str) -> int:
+    step = await get_step_cfg(chat_id, key)
     try:
-        n = int(step_cfg.get("per_row", 2))
+        n = int(step.get("per_row", _default_per_row(key)))
     except (TypeError, ValueError):
-        n = 2
+        n = _default_per_row(key)
     return max(1, min(4, n))
 
 
-async def get_max_items(
-    chat_id: int,
-    step_key: str,
-    default: int = 10,
-) -> int:
-    """Return max_items for a step (1-30)."""
-    step_cfg = await get_step_cfg(chat_id, step_key)
+async def get_max_items(chat_id: int, key: str, default: int = 10) -> int:
+    step = await get_step_cfg(chat_id, key)
     try:
-        n = int(step_cfg.get("max_items", default))
+        n = int(step.get("max_items", default))
     except (TypeError, ValueError):
         n = default
     return max(1, min(30, n))
 
 
 # ============================================================
-# SECTION 8 — PUBLIC EXPORTS
+# SECTION 5 — ADVANCED SETTINGS
+# ============================================================
+
+async def get_spell_threshold(chat_id: int) -> int:
+    """0-100 — higher = stricter spelling. Default 82."""
+    step = await get_step_cfg(chat_id, "spell_check")
+    try:
+        n = int(step.get("threshold", 82))
+    except (TypeError, ValueError):
+        n = 82
+    return max(60, min(95, n))
+
+
+async def get_max_corrections(chat_id: int) -> int:
+    """1-3 — how many retry attempts on spell fail."""
+    step = await get_step_cfg(chat_id, "spell_check")
+    try:
+        n = int(step.get("max_corrections", 1))
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(3, n))
+
+
+async def get_suggestion_min_score(chat_id: int) -> int:
+    """0-100 — minimum fuzzy score to show a suggestion. Default 45."""
+    step = await get_step_cfg(chat_id, "suggestions")
+    try:
+        n = int(step.get("min_score", 45))
+    except (TypeError, ValueError):
+        n = 45
+    return max(20, min(90, n))
+
+
+async def get_suggestion_provider(chat_id: int) -> str:
+    """'tmdb' | 'imdb' | 'both'"""
+    step = await get_step_cfg(chat_id, "suggestions")
+    p = str(step.get("provider", "both")).lower()
+    if p not in ("tmdb", "imdb", "both"):
+        return "both"
+    return p
+
+
+async def get_suggestion_display(chat_id: int) -> Dict[str, bool]:
+    """What to show on suggestion buttons."""
+    step = await get_step_cfg(chat_id, "suggestions")
+    return {
+        "show_rating": bool(step.get("show_rating", True)),
+        "show_year":   bool(step.get("show_year", True)),
+        "show_icon":   bool(step.get("show_icon", True)),
+    }
+
+
+async def get_delivery_settings(chat_id: int) -> Dict[str, Any]:
+    """Sort order + button format for file delivery."""
+    step = await get_step_cfg(chat_id, "file_delivery")
+    sort_order = str(step.get("sort_order", "small_to_big"))
+    if sort_order not in ("small_to_big", "big_to_small"):
+        sort_order = "small_to_big"
+
+    return {
+        "sort_order":     sort_order,
+        "show_quality":   bool(step.get("show_quality", True)),
+        "show_name":      bool(step.get("show_name", True)),
+        "name_max_len":   int(step.get("name_max_len", 34) or 34),
+        "size_format":    str(step.get("size_format", "short")),
+    }
+
+
+async def get_display_settings(chat_id: int) -> Dict[str, bool]:
+    """Poster / rating / year / genre / language toggles (metadata section)."""
+    cfg = await get_effective_cfg(chat_id)
+    meta = cfg.get("metadata") or {}
+    return {
+        "poster":   bool(meta.get("poster", True)),
+        "rating":   bool(meta.get("rating", True)),
+        "year":     bool(meta.get("year", True)),
+        "genre":    bool(meta.get("genre", True)),
+        "language": bool(meta.get("language", True)),
+    }
+
+
+# ============================================================
+# SECTION 6 — LABELS
+# ============================================================
+
+def label_for(key: str) -> str:
+    return STEP_LABELS.get(key, key)
+
+
+def icon_for(key: str) -> str:
+    return STEP_ICONS.get(key, "⚙️")
+
+
+# ============================================================
+# SECTION 7 — PUBLIC EXPORTS
 # ============================================================
 
 __all__ = [
-    "DEFAULT_SERIES_STEPS",
+    "DEFAULT_ORDER",
     "MANDATORY_STEPS",
     "AUTO_SKIP_STEPS",
+    "WIZARD_STEPS",
     "STEP_LABELS",
     "STEP_ICONS",
+    # Read
     "get_effective_cfg",
     "get_step_order",
     "get_enabled_steps",
+    "get_wizard_steps",
+    # Step queries
     "is_step_enabled",
     "is_auto_skip",
     "get_step_cfg",
-    "label_for",
-    "icon_for",
-    "get_sort_order",
     "get_per_row",
     "get_max_items",
+    # Advanced
+    "get_spell_threshold",
+    "get_max_corrections",
+    "get_suggestion_min_score",
+    "get_suggestion_provider",
+    "get_suggestion_display",
+    "get_delivery_settings",
+    "get_display_settings",
+    # Labels
+    "label_for",
+    "icon_for",
 ]
