@@ -2,34 +2,6 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (v1 UX · v2 POWER)
 # ============================================================
-# ONE file. All v1 behaviour + all v2 features.
-#
-# v1 things kept:
-#   • sg:  callbacks (single prefix)
-#   • TMDB posters in language/season views
-#   • Request channel with gsreq admin buttons
-#   • NAME IN CAPS ⭐rating suggestion buttons
-#   • In-memory sessions
-#   • Direct PM redirect after quality
-#
-# v2 things kept:
-#   • Configurable wizard steps (from admin panel Flow Editor)
-#   • Episode picker step
-#   • Cooldown (silent, 3s)
-#   • Spell-check via SUGG module
-#   • Per-group layout (per_row, max_items, auto_skip)
-#   • Force-sub gate before delivery
-#   • Deep-link delivery (works even if user never started bot)
-#   • Premium user redirect
-#   • Reads caption/buttons/auto-delete from state.py
-#
-# Flow:
-#   group text → search → suggestions → language → season
-#             → [episode] → quality → PM delivery
-#
-# Callback prefix: sg:
-# Handler group: -9999 (runs before movie handler at -510)
-# ============================================================
 
 from __future__ import annotations
 
@@ -250,7 +222,7 @@ def cleanup_cooldown() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 4 — FLOW LAYOUT READERS (v2 admin panel config)
+# SECTION 4 — FLOW LAYOUT READERS
 # ═══════════════════════════════════════════════════════════════════════════
 async def get_per_row(chat_id: int, key: str, default: int = 2) -> int:
     try:
@@ -280,26 +252,15 @@ async def step_enabled(chat_id: int, key: str) -> bool:
 
 
 async def step_auto_skip(chat_id: int, key: str) -> bool:
-    """
-    v1 UX: NEVER auto-skip. Always show the picker, even if only
-    one option. Admin can still hide a whole step by disabling it
-    in the Flow Editor — but we never silently skip on count==1.
-    """
     return False
 
 
 async def wizard_steps(chat_id: int) -> List[str]:
-    """
-    v1 UX: always use the fixed v1 order, extended with the
-    optional episode step. The admin panel controls per-step
-    ENABLE/DISABLE (via is_step_enabled) and LAYOUT (per_row,
-    max_items) — but never the order.
-    """
     return ["language", "season", "episode", "quality", "file_delivery"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 5 — VIEWS (v1 style)
+# SECTION 5 — VIEWS
 # ═══════════════════════════════════════════════════════════════════════════
 def view_suggestions(raw: str, items: List[Dict[str, Any]]) -> str:
     lines = [
@@ -383,7 +344,7 @@ def view_redirecting(title: str, season: int, quality: str, count: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 6 — KEYBOARDS (v1 style, layout from admin panel)
+# SECTION 6 — KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
 def kb_suggestions(items: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
@@ -402,8 +363,7 @@ def kb_suggestions(items: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(label, callback_data=f"sg:pick:{i}")
         ])
     rows.append([
-        InlineKeyboardButton("📩 REQUEST TO ADMIN",
-                              callback_data="sg:request")
+        InlineKeyboardButton("📩 REQUEST TO ADMIN", callback_data="sg:request")
     ])
     rows.append([
         InlineKeyboardButton("❌ CLOSE", callback_data="sg:close")
@@ -521,7 +481,7 @@ def kb_qualities(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7 — RENDER (edit or send, with optional poster)
+# SECTION 7 — RENDER
 # ═══════════════════════════════════════════════════════════════════════════
 async def render(
     client: Client, chat_id: int, msg_id: int,
@@ -579,7 +539,7 @@ async def render(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8 — SAFE CAPTION + CUSTOM BUTTONS (read from admin panel)
+# SECTION 8 — SAFE CAPTION + CUSTOM BUTTONS
 # ═══════════════════════════════════════════════════════════════════════════
 class _SafeDict(dict):
     def __missing__(self, key):
@@ -620,8 +580,9 @@ def build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMark
         rows.append([InlineKeyboardButton(name, url=url)])
     return InlineKeyboardMarkup(rows) if rows else None
 
+
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 9 — DB SEARCH (v1 smart search + v2 cache)
+# SECTION 9 — DB SEARCH
 # ═══════════════════════════════════════════════════════════════════════════
 def _norm(s: str) -> str:
     if not s:
@@ -634,12 +595,6 @@ def _norm(s: str) -> str:
 
 
 async def smart_db_search(title: str) -> Optional[Dict[str, Any]]:
-    """
-    v1-style smart DB search:
-      1. Try full title
-      2. Fall back to progressively shorter prefixes
-    Returns {"matched_title", "hits"} or None.
-    """
     try:
         hits, _ = await SEARCH.quick_search(title, is_series=True)
     except Exception as e:
@@ -684,18 +639,12 @@ async def enrich_with_tmdb(
     poster_override: Optional[str] = None,
     year_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Build the 'chosen' dict:
-      tmdb_id, title, year, poster, tmdb_langs, tmdb_seasons,
-      local_langs, local_seasons
-    """
     tmdb_id: Optional[int] = tmdb_id_override
     poster: Optional[str] = poster_override
     year: str = str(year_override) if year_override else ""
     tmdb_langs: List[str] = ["English"]
     tmdb_seasons: List[Dict[str, Any]] = []
 
-    # ── TMDB search (title + year) ──
     if tmdb_id is None or poster is None or not year:
         try:
             from providers import tmdb_provider as TP
@@ -714,7 +663,6 @@ async def enrich_with_tmdb(
         except Exception as e:
             logger.debug(f"[SERIES-H] tmdb search: {e}")
 
-    # ── TMDB languages ──
     try:
         langs = await STMDB.get_series_languages(matched_title)
         if langs:
@@ -722,7 +670,6 @@ async def enrich_with_tmdb(
     except Exception as e:
         logger.debug(f"[SERIES-H] tmdb langs: {e}")
 
-    # ── TMDB seasons ──
     try:
         seasons = await STMDB.get_series_seasons(matched_title)
         if seasons:
@@ -730,7 +677,6 @@ async def enrich_with_tmdb(
     except Exception as e:
         logger.debug(f"[SERIES-H] tmdb seasons: {e}")
 
-    # ── Fallback year from hits ──
     if not year and hits:
         for h in hits:
             y = h.get("year")
@@ -754,7 +700,7 @@ async def enrich_with_tmdb(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 11 — REQUEST CHANNEL (v1: search_requests + gsreq callbacks)
+# SECTION 11 — REQUEST CHANNEL
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_system_db():
     try:
@@ -910,8 +856,6 @@ async def check_fsub(
         try:
             m = await client.get_chat_member(int(ch), user_id)
         except Exception:
-            # If we can't verify, treat as missing so we don't
-            # silently allow unverified users
             missing.append(int(ch))
             continue
         st = getattr(m, "status", None)
@@ -1020,7 +964,7 @@ async def handle_no_results(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 14 — PREMIUM HOOK (v2)
+# SECTION 14 — PREMIUM HOOK
 # ═══════════════════════════════════════════════════════════════════════════
 async def is_premium(uid: int) -> bool:
     try:
@@ -1098,10 +1042,6 @@ async def try_premium_redirect(
 async def goto_step(
     client: Client, target: Message, uid: int, step: str,
 ) -> None:
-    """
-    Render the requested wizard step. Auto-skips empty steps
-    (e.g. if no seasons, jump straight to quality).
-    """
     s = sess_get(uid)
     if not s:
         return
@@ -1130,7 +1070,6 @@ async def goto_step(
 async def advance(
     client: Client, target: Message, uid: int, current: str,
 ) -> None:
-    """Move to the next enabled wizard step after `current`."""
     s = sess_get(uid)
     if not s:
         return
@@ -1176,7 +1115,6 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             chat_id = message.chat.id
             uid = message.from_user.id
 
-            # ── Per-group config gates ──
             try:
                 cfg = await S.get_config(chat_id)
             except Exception:
@@ -1190,12 +1128,10 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if mode == "movie":
                 return
 
-            # ── Cooldown ──
             if not cooldown_ok(uid):
                 return
             cleanup_cooldown()
 
-            # ── Claim message ──
             try:
                 message.stop_propagation()
             except Exception:
@@ -1203,7 +1139,6 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
 
             logger.info(f"[SERIES-H] search {txt!r} from {uid}")
 
-            # ── Status card ──
             try:
                 status = await message.reply_text("🔎 ꜱᴇᴀʀᴄʜɪɴɢ…")
             except Exception:
@@ -1214,10 +1149,8 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             except Exception:
                 pass
 
-            # ── DB search ──
             db_match = await smart_db_search(txt)
 
-            # ── Premium redirect (v2) ──
             if db_match and await is_premium(uid):
                 if await try_premium_redirect(
                     client, message, status, txt,
@@ -1225,7 +1158,6 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                 ):
                     return
 
-            # ── DB HIT → start wizard ──
             if db_match:
                 matched_title = db_match["matched_title"]
                 hits = db_match["hits"]
@@ -1241,14 +1173,12 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                     chosen=chosen, hits=hits,
                 )
 
-                # First wizard step
                 steps = await wizard_steps(chat_id)
                 first = steps[0] if steps else "language"
                 return await goto_step(
                     client, status, uid, first,
                 )
 
-            # ── Spell-check retry (v2) ──
             if await step_enabled(chat_id, "spell_check"):
                 corrected: Optional[str] = None
                 try:
@@ -1282,7 +1212,6 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                         first = steps[0] if steps else "language"
                         return await goto_step(client, status, uid, first)
 
-            # ── Suggestions (v1 style) ──
             items: List[Dict[str, Any]] = []
             try:
                 items = await SUGG.get_suggestions_for_group(
@@ -1340,7 +1269,6 @@ async def render_language(
     hits = s["data"].get("hits") or []
     chat_id = s["data"].get("chat_id") or target.chat.id
 
-    # Local languages from DB hits
     local: List[str] = []
     for h in hits:
         for l in (h.get("audio_languages") or []):
@@ -1350,7 +1278,6 @@ async def render_language(
 
     tmdb_langs = c.get("tmdb_langs") or ["English"]
 
-    # Order: languages with files first, then TMDB-only
     ordered: List[str] = []
     for l in tmdb_langs:
         if l in local and l not in ordered:
@@ -1368,7 +1295,6 @@ async def render_language(
     c["local_langs"] = local
     sess_set(uid, chosen=c)
 
-    # Auto-skip
     if len(ordered) == 1 and await step_auto_skip(chat_id, "language"):
         sess_set(uid, selected_language=ordered[0])
         return await advance(client, target, uid, "language")
@@ -1396,7 +1322,6 @@ async def render_season(
     lang = c.get("selected_language")
     filtered = SEARCH.filter_by_language(hits, lang) if lang else list(hits)
 
-    # Local seasons from filtered hits
     local_seasons: Dict[int, List[int]] = defaultdict(list)
     for h in filtered:
         sn = h.get("season")
@@ -1414,10 +1339,8 @@ async def render_season(
         local_seasons[sn_i].append(ep_i)
 
     local_map = {k: sorted(set(v)) for k, v in local_seasons.items()}
-
     tmdb_seasons = c.get("tmdb_seasons") or []
 
-    # Build seasons list to show: merge TMDB + local
     merged: List[Dict[str, Any]] = []
     seen_sns: Set[int] = set()
     for t in tmdb_seasons:
@@ -1450,7 +1373,6 @@ async def render_season(
     c["merged_seasons"] = merged
     sess_set(uid, chosen=c)
 
-    # Auto-skip single season
     if len(merged) == 1 and await step_auto_skip(chat_id, "season"):
         sess_set(uid, selected_season=merged[0]["season"])
         return await advance(client, target, uid, "season")
@@ -1487,7 +1409,6 @@ async def render_episode(
 
     local_eps = SEARCH.unique_episodes(season_hits, season=season_i) or []
 
-    # TMDB episodes for that season
     tmdb_eps: List[int] = []
     try:
         title = c.get("title") or ""
@@ -1505,7 +1426,6 @@ async def render_episode(
     c["local_eps"] = local_eps
     sess_set(uid, chosen=c)
 
-    # Auto-skip single episode
     if len(all_eps) == 1 and await step_auto_skip(chat_id, "episode"):
         sess_set(uid, selected_episode=all_eps[0])
         return await advance(client, target, uid, "episode")
@@ -1530,9 +1450,19 @@ async def render_quality(
 
     season = c.get("selected_season")
     episode = c.get("selected_episode")
-    files = c.get("files_by_season") or []
+    
+    # FIX: Pre-fill files_by_season if episode step was disabled/skipped
+    files = c.get("files_by_season")
+    if not files and season is not None:
+        filtered = c.get("filtered_hits") or s["data"].get("hits") or []
+        try:
+            season_i = int(season)
+            files = SEARCH.filter_by_season(filtered, season_i)
+        except (TypeError, ValueError):
+            files = filtered
+    elif not files:
+        files = s["data"].get("hits") or []
 
-    # Narrow by episode if we reached this via episode step
     if episode is not None:
         try:
             ep_i = int(episode)
@@ -1543,6 +1473,11 @@ async def render_quality(
             pass
 
     quals = SEARCH.unique_qualities(files) if files else []
+    
+    # FIX: Fallback to all qualities from season hits if episode filtering was empty
+    if not quals and files:
+        quals = SEARCH.unique_qualities(c.get("files_by_season") or [])
+
     if not quals:
         return await advance(client, target, uid, "quality")
 
@@ -1550,7 +1485,6 @@ async def render_quality(
     c["files_for_quality"] = files
     sess_set(uid, chosen=c)
 
-    # Auto-skip single quality
     if len(quals) == 1 and await step_auto_skip(chat_id, "quality"):
         sess_set(uid, selected_quality=quals[0])
         return await advance(client, target, uid, "quality")
@@ -1566,7 +1500,7 @@ async def render_quality(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 18 — DELIVERY (redirect to PM via deep link — v1 behaviour)
+# SECTION 18 — DELIVERY
 # ═══════════════════════════════════════════════════════════════════════════
 async def deliver_to_pm(
     client: Client, target: Message, uid: int,
@@ -1589,7 +1523,6 @@ async def deliver_to_pm(
 
     files = c.get("files_for_quality") or c.get("files_by_season") or []
 
-    # Filter to the exact quality we selected (keep UNKNOWN as fallback)
     final: List[Dict[str, Any]] = []
     q_up = str(quality).upper()
     for f in files:
@@ -1602,7 +1535,6 @@ async def deliver_to_pm(
     if not final:
         final = list(files)
 
-    # Dedupe by episode / file_id — prefer smaller size (v1 rule)
     final = _dedupe_episodes(final)
     final.sort(key=lambda x: (int(x.get("episode") or 0)))
 
@@ -1616,13 +1548,11 @@ async def deliver_to_pm(
                 f"📌 {sc('please try a different quality')}",
             ]),
             InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ CLOSE",
-                                      callback_data="sg:close"),
+                InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
             ]]),
             None,
         )
 
-    # ── Force-sub gate ──
     ok, missing = await check_fsub(client, uid, chat_id)
     if not ok:
         kb = await kb_fsub(client, missing)
@@ -1638,7 +1568,6 @@ async def deliver_to_pm(
             kb, None,
         )
 
-    # ── Create deliver token (start_router.py handles PM side) ──
     token = await DL.create_deliver_token(
         user_id=uid, chat_id=chat_id,
         title=title, season=season_i,
@@ -1655,13 +1584,11 @@ async def deliver_to_pm(
                 f"📌 {sc('please try again')}",
             ]),
             InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ CLOSE",
-                                      callback_data="sg:close"),
+                InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
             ]]),
             None,
         )
 
-    # ── Bot username for deep link ──
     bot_username = ""
     try:
         me = await client.identity()
@@ -1674,7 +1601,6 @@ async def deliver_to_pm(
             bot_username = ""
 
     if not bot_username:
-        # Fallback: tell user to search again later
         sess_drop(uid)
         return await render(
             client, chat_id, target.id,
@@ -1689,7 +1615,6 @@ async def deliver_to_pm(
 
     deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
 
-    # ── Show redirect card ──
     await render(
         client, chat_id, target.id,
         view_redirecting(title, season_i, quality, len(final)),
@@ -1708,7 +1633,6 @@ async def deliver_to_pm(
 
 
 def _dedupe_episodes(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep smallest file per (season, episode)."""
     by_ep: Dict[Tuple[int, int], Dict[str, Any]] = {}
     no_ep: List[Dict[str, Any]] = []
     for f in files:
@@ -1756,11 +1680,11 @@ async def cb_pick(client: Client, q: CallbackQuery):
         uid = q.from_user.id
         s = sess_get(uid)
         if not s:
-            return await q.answer("⏱️ session expired", show_alert=True)
+            return await q.answer("⏱️ session expired — search again", show_alert=True)
 
         items = s["data"].get("suggestions") or []
         if idx >= len(items):
-            return await q.answer("⚠️ invalid", show_alert=True)
+            return await q.answer("⚠️ invalid selection", show_alert=True)
 
         chosen = items[idx]
         tmdb_id = chosen.get("tmdb_id")
@@ -1773,7 +1697,6 @@ async def cb_pick(client: Client, q: CallbackQuery):
         db_match = await smart_db_search(title)
 
         if not db_match:
-            # No DB hit → request channel
             token = await post_to_request_channel(
                 client, uid, title,
                 year=year or None, tmdb_id=tmdb_id,
@@ -1793,8 +1716,7 @@ async def cb_pick(client: Client, q: CallbackQuery):
                         f"📌 {sc('admin will review your request')}",
                     ]),
                     InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ CLOSE",
-                                              callback_data="sg:close"),
+                        InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
                     ]]),
                     None,
                 )
@@ -1812,8 +1734,7 @@ async def cb_pick(client: Client, q: CallbackQuery):
                     f"📌 {sc('not available right now')}",
                 ]),
                 InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE",
-                                          callback_data="sg:close"),
+                    InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
                 ]]),
                 None,
             )
@@ -1854,7 +1775,7 @@ async def cb_request(client: Client, q: CallbackQuery):
     try:
         s = sess_get(q.from_user.id)
         if not s:
-            return await q.answer("⏱️ expired", show_alert=True)
+            return await q.answer("⏱️ session expired", show_alert=True)
         raw = s["data"].get("raw_query") or ""
         await q.answer("📩 sending…")
         token = await post_to_request_channel(
@@ -1873,8 +1794,7 @@ async def cb_request(client: Client, q: CallbackQuery):
                     f"📌 {sc('admin will review soon')}",
                 ]),
                 InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE",
-                                          callback_data="sg:close"),
+                    InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
                 ]]),
                 None,
             )
@@ -1892,12 +1812,12 @@ async def cb_lang(client: Client, q: CallbackQuery):
         uid = q.from_user.id
         s = sess_get(uid)
         if not s:
-            return await q.answer("⏱️ expired", show_alert=True)
+            return await q.answer("⏱️ session expired — search again", show_alert=True)
 
         c = s["data"].get("chosen") or {}
         ordered = c.get("ordered_langs") or []
         if idx >= len(ordered):
-            return await q.answer("⚠️ invalid", show_alert=True)
+            return await q.answer("⚠️ invalid language selection", show_alert=True)
 
         lang = ordered[idx]
         c["selected_language"] = lang
@@ -1923,12 +1843,12 @@ async def cb_seas(client: Client, q: CallbackQuery):
         uid = q.from_user.id
         s = sess_get(uid)
         if not s:
-            return await q.answer("⏱️ expired", show_alert=True)
+            return await q.answer("⏱️️ session expired — search again", show_alert=True)
 
         c = s["data"].get("chosen") or {}
         merged = c.get("merged_seasons") or []
         if idx >= len(merged):
-            return await q.answer("⚠️ invalid", show_alert=True)
+            return await q.answer("⚠️ invalid season selection", show_alert=True)
 
         season = int(merged[idx]["season"])
         c["selected_season"] = season
@@ -1954,7 +1874,7 @@ async def cb_ep(client: Client, q: CallbackQuery):
         uid = q.from_user.id
         s = sess_get(uid)
         if not s:
-            return await q.answer("⏱️ expired", show_alert=True)
+            return await q.answer("⏱️ session expired — search again", show_alert=True)
 
         c = s["data"].get("chosen") or {}
         c["selected_episode"] = ep
@@ -1971,7 +1891,7 @@ async def cb_ep(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 23 — CALLBACKS: QUALITY → DELIVERY
+# SECTION 23 — CALLBACKS: QUALITY
 # ═══════════════════════════════════════════════════════════════════════════
 @Client.on_callback_query(filters.regex(r"^sg:qual:(\d+)$"), group=-9999)
 async def cb_qual(client: Client, q: CallbackQuery):
@@ -1980,12 +1900,12 @@ async def cb_qual(client: Client, q: CallbackQuery):
         uid = q.from_user.id
         s = sess_get(uid)
         if not s:
-            return await q.answer("⏱️ expired", show_alert=True)
+            return await q.answer("⏱️ session expired — search again", show_alert=True)
 
         c = s["data"].get("chosen") or {}
         quals = c.get("available_qualities") or []
         if idx >= len(quals):
-            return await q.answer("⚠️ invalid", show_alert=True)
+            return await q.answer("⚠️ invalid quality selection", show_alert=True)
 
         quality = quals[idx]
         c["selected_quality"] = quality
@@ -2025,11 +1945,11 @@ async def cb_fsub_check(client: Client, q: CallbackQuery):
 async def cb_back_sugg(client: Client, q: CallbackQuery):
     s = sess_get(q.from_user.id)
     if not s:
-        return await q.answer("⏱️ expired", show_alert=True)
+        return await q.answer("⏱️ session expired — search again", show_alert=True)
     items = s["data"].get("suggestions") or []
     raw = s["data"].get("raw_query") or ""
     if not items:
-        return await q.answer("⚠️ no suggestions", show_alert=True)
+        return await q.answer("⚠️ no suggestions stored", show_alert=True)
     await render(
         client, q.message.chat.id, q.message.id,
         view_suggestions(raw, items),
@@ -2041,18 +1961,27 @@ async def cb_back_sugg(client: Client, q: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sg:back_lang$"), group=-9999)
 async def cb_back_lang(client: Client, q: CallbackQuery):
+    s = sess_get(q.from_user.id)
+    if not s:
+        return await q.answer("⏱️ session expired — search again", show_alert=True)
     await render_language(client, q.message, q.from_user.id)
     await q.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^sg:back_seas$"), group=-9999)
 async def cb_back_seas(client: Client, q: CallbackQuery):
+    s = sess_get(q.from_user.id)
+    if not s:
+        return await q.answer("⏱️ session expired — search again", show_alert=True)
     await render_season(client, q.message, q.from_user.id)
     await q.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^sg:back_ep$"), group=-9999)
 async def cb_back_ep(client: Client, q: CallbackQuery):
+    s = sess_get(q.from_user.id)
+    if not s:
+        return await q.answer("⏱️ session expired — search again", show_alert=True)
     await render_episode(client, q.message, q.from_user.id)
     await q.answer()
 
@@ -2077,7 +2006,6 @@ async def cb_gsreq(client: Client, q: CallbackQuery):
     except Exception:
         return await q.answer("❌ invalid", show_alert=True)
 
-    # Admin check
     if not is_admin(q.from_user.id):
         try:
             m = await client.get_chat_member(
@@ -2092,7 +2020,7 @@ async def cb_gsreq(client: Client, q: CallbackQuery):
 
     req = await get_request(token)
     if not req:
-        return await q.answer("⚠️ not found", show_alert=True)
+        return await q.answer("⚠️ request not found", show_alert=True)
 
     user_id = req.get("user_id")
     title = req.get("movie_name") or ""
@@ -2168,12 +2096,12 @@ async def cb_greq_search(client: Client, q: CallbackQuery):
     try:
         parts = q.data.split(":", 2)
         if len(parts) < 3:
-            return await q.answer("❌ invalid", show_alert=True)
+            return await q.answer("❌ invalid payload", show_alert=True)
         _, b64t, b64y = parts
         title = b64d(b64t)
         year = b64d(b64y) or ""
         if not title:
-            return await q.answer("❌ error", show_alert=True)
+            return await q.answer("❌ error reading search query", show_alert=True)
 
         uid = q.from_user.id
         logger.info(f"[SERIES-H] req search {title!r} for {uid}")
@@ -2195,8 +2123,7 @@ async def cb_greq_search(client: Client, q: CallbackQuery):
                     f"📌 {sc('try again in a few minutes')}",
                 ]),
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE",
-                                          callback_data="sg:close"),
+                    InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
                 ]]),
                 parse_mode=ParseMode.HTML,
             )
@@ -2215,7 +2142,6 @@ async def cb_greq_search(client: Client, q: CallbackQuery):
             chosen=chosen, hits=hits,
         )
 
-        # Render language picker
         chat_id = q.message.chat.id
         steps = await wizard_steps(chat_id)
         first = steps[0] if steps else "language"
@@ -2229,11 +2155,8 @@ async def cb_greq_search(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 26 — PM /start HANDLER (catches non-deliver payloads)
+# SECTION 26 — PM /start HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
-# NOTE: `deliver_{token}` and `prem_{token}` are handled by
-# `core/start_router.py` (already in your tree). This handler only
-# catches stray /start messages here so users aren't left hanging.
 @Client.on_message(
     filters.command("start") & filters.private,
     group=-9998,
@@ -2246,11 +2169,9 @@ async def pm_start_fallback(client: Client, message: Message):
         if len(cmd) < 2:
             return
         payload = str(cmd[1] or "")
-        # If start_router owns the payload, let it handle it
         if payload.startswith(("deliver_", "prem_", "file_",
                                 "req_", "gs_", "ref_", "wo_")):
             return
-        # Otherwise a stray /start with no known payload
         try:
             message.stop_propagation()
         except Exception:
@@ -2304,14 +2225,11 @@ def snapshot() -> Dict[str, Any]:
 
 
 __all__ = [
-    # Entry
     "series_group_search",
-    # Wizard
     "render_language", "render_season",
     "render_episode", "render_quality",
     "deliver_to_pm",
     "goto_step", "advance",
-    # Callbacks
     "cb_pick", "cb_request",
     "cb_lang", "cb_seas", "cb_ep", "cb_qual",
     "cb_fsub_check",
@@ -2320,7 +2238,6 @@ __all__ = [
     "cb_close",
     "cb_gsreq", "cb_greq_search",
     "pm_start_fallback",
-    # Utilities (for other modules)
     "smart_db_search", "enrich_with_tmdb",
     "post_to_request_channel", "get_request", "update_request",
     "check_fsub", "kb_fsub",
