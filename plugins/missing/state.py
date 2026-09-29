@@ -1,22 +1,26 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — MISSING STATE
 # ============================================================
-#
-# Collections (SYSTEM DB):
-#   missing_presets  — saved scan presets
-#   missing_history  — scan history
-#   missing_settings — singleton config
-# ============================================================
-
 from __future__ import annotations
 import logging, time
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
 
-def _db():
+def _get_db():
+    try:
+        from database import db_manager
+        for name in ("get_system_db", "get_user_db"):
+            fn = getattr(db_manager, name, None)
+            if callable(fn):
+                try:
+                    d = fn()
+                    if d is not None: return d
+                except Exception:
+                    pass
+    except Exception:
+        pass
     try:
         from database import db_registry
         return db_registry.get_system_db()
@@ -25,31 +29,28 @@ def _db():
 
 
 def _c(name):
-    db = _db()
+    db = _get_db()
     return db[name] if db is not None else None
 
 
-def presets(): return _c("missing_presets")
-def history(): return _c("missing_history")
-def settings(): return _c("missing_settings")
+def settings_coll():  return _c("missing_settings")
+def history_coll():   return _c("missing_history")
+def buttons_coll():   return _c("missing_templates")
 
 
 # ── DEFAULTS ──
 DEFAULT_CFG = {
     "default_industry": "hollywood",
-    "default_max_pages": 15,
     "movies_per_part": 25,
     "show_rating": True,
     "show_popularity": True,
     "show_lang_code": True,
-    "caption_template": None,
-    "copy_friendly": True,      # wrap name in <code> for tap-to-copy
     "include_year": True,
 }
 
 
 async def get_cfg() -> Dict[str, Any]:
-    c = settings()
+    c = settings_coll()
     if c is None: return dict(DEFAULT_CFG)
     try:
         d = await c.find_one({"_id": "config"}) or {}
@@ -61,7 +62,7 @@ async def get_cfg() -> Dict[str, Any]:
 
 
 async def save_cfg(**fields) -> bool:
-    c = settings()
+    c = settings_coll()
     if c is None: return False
     try:
         fields["updated_at"] = time.time()
@@ -71,46 +72,9 @@ async def save_cfg(**fields) -> bool:
         return False
 
 
-# ── PRESETS ──
-async def save_preset(name: str, data: Dict[str, Any]) -> bool:
-    c = presets()
-    if c is None: return False
-    try:
-        await c.update_one(
-            {"name": name},
-            {"$set": {**data, "name": name, "saved_at": time.time()}},
-            upsert=True,
-        )
-        return True
-    except Exception:
-        return False
-
-
-async def list_presets() -> List[Dict[str, Any]]:
-    c = presets()
-    if c is None: return []
-    try:
-        cur = c.find({}).sort("saved_at", -1).limit(30)
-        docs = await cur.to_list(length=30)
-        for d in docs: d.pop("_id", None)
-        return docs
-    except Exception:
-        return []
-
-
-async def delete_preset(name: str) -> bool:
-    c = presets()
-    if c is None: return False
-    try:
-        r = await c.delete_one({"name": name})
-        return r.deleted_count > 0
-    except Exception:
-        return False
-
-
 # ── HISTORY ──
 async def log_scan(data: Dict[str, Any]) -> bool:
-    c = history()
+    c = history_coll()
     if c is None: return False
     try:
         await c.insert_one({**data, "created_at": time.time()})
@@ -120,7 +84,7 @@ async def log_scan(data: Dict[str, Any]) -> bool:
 
 
 async def recent_scans(limit: int = 15) -> List[Dict[str, Any]]:
-    c = history()
+    c = history_coll()
     if c is None: return []
     try:
         cur = c.find({}).sort("created_at", -1).limit(limit)
@@ -130,7 +94,7 @@ async def recent_scans(limit: int = 15) -> List[Dict[str, Any]]:
 
 
 async def clear_history() -> int:
-    c = history()
+    c = history_coll()
     if c is None: return 0
     try:
         r = await c.delete_many({})
@@ -139,8 +103,33 @@ async def clear_history() -> int:
         return 0
 
 
+# ── BUTTONS ──
+async def get_buttons() -> List[Dict[str, Any]]:
+    c = buttons_coll()
+    if c is None: return []
+    try:
+        d = await c.find_one({"_id": "buttons"})
+        return list(d.get("list") or []) if d else []
+    except Exception:
+        return []
+
+
+async def set_buttons(buttons: List[Dict[str, Any]]) -> bool:
+    c = buttons_coll()
+    if c is None: return False
+    try:
+        await c.update_one(
+            {"_id": "buttons"},
+            {"$set": {"list": buttons, "updated_at": time.time()}},
+            upsert=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
 __all__ = [
     "get_cfg", "save_cfg", "DEFAULT_CFG",
-    "save_preset", "list_presets", "delete_preset",
     "log_scan", "recent_scans", "clear_history",
+    "get_buttons", "set_buttons",
 ]
