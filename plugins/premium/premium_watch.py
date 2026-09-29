@@ -238,11 +238,11 @@ async def open_from_token(
 
         if tmdb_id:
             try:
-                from plugins.series_group import tmdb as T
-                details = await T.get_details(tmdb_id)
+                from plugins.groups.series import tmdb as T
+                details = await T.get_series_details(title)
                 if details:
-                    tmdb_seasons = T.extract_seasons(details)
-                    langs = T.extract_languages(details)
+                    tmdb_seasons = T.get_series_seasons(title)
+                    langs = T.get_series_languages(title)
                     language = langs[0] if langs else "English"
                     poster = details.get("poster_path")
             except Exception as e:
