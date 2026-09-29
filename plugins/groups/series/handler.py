@@ -1241,7 +1241,58 @@ async def _try_premium_redirect(
     except Exception as e:
         logger.exception(f"[SERIES-H] premium redirect: {e}")
         return False
+        
+# ============================================================
+# SECTION 15c — STEP-GATING TRANSITION
+# ============================================================
 
+async def _goto_step(
+    client: Client,
+    target: Message,
+    uid: int,
+    step_key: str,
+) -> None:
+    """
+    Render `step_key` if enabled, else jump to next enabled step.
+    Recursively walks forward until it finds an enabled step.
+    """
+    s = _wiz_get(uid)
+    if not s:
+        return
+    chat_id = s["chat_id"]
+
+    # Hard-stop guard
+    if step_key in ("close", "done", ""):
+        return
+
+    # If this step is enabled → render it
+    enabled = await SFLOW.is_step_enabled(chat_id, step_key)
+    if enabled:
+        if step_key == "language":
+            return await _render_language(client, target, uid)
+        if step_key == "season":
+            return await _render_season(client, target, uid)
+        if step_key == "episode":
+            return await _render_episode(client, target, uid)
+        if step_key == "quality":
+            return await _render_quality(client, target, uid)
+        if step_key == "file_delivery":
+            return await _render_delivery(client, target, uid)
+
+    # Disabled → find next in order
+    order = await SFLOW.get_step_order(chat_id)
+    try:
+        idx = order.index(step_key)
+    except ValueError:
+        idx = -1
+
+    for next_step in order[idx + 1:]:
+        if next_step in ("base_search", "spell_check", "suggestions"):
+            continue
+        return await _goto_step(client, target, uid, next_step)
+
+    # No more steps → deliver
+    return await _render_delivery(client, target, uid)
 
 # ============================================================
 # SECTION 16 — PUBLIC EXPORTS
