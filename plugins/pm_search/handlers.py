@@ -1,6 +1,14 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — PM SEARCH MAIN FLOW
 # ============================================================
+#
+# Uses plugins.groups.shared for:
+#   • DB search (SEARCH.quick_search)
+#   • Spell check + suggestions (SUGG)
+#
+# Everything else (panel, deliver, fsub, request) unchanged.
+#
+# ============================================================
 
 from __future__ import annotations
 import logging, time
@@ -21,6 +29,10 @@ from plugins.pm_search import panel as PN
 from plugins.pm_search import deliver as DL
 from plugins.pm_search import fsub as FS
 from plugins.pm_search import request as RQ
+
+# ── v2 imports (groups.shared) ──
+from plugins.groups.shared import search as SEARCH
+from plugins.groups.shared import suggestions as SUGG
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +90,10 @@ def _drop_session(sid: str) -> None:
     & ~filters.regex(r"^pmsa:")
     & ~filters.regex(r"^idx:")
     & ~filters.regex(r"^dtvb:")
-    & ~filters.regex(r"^adm:"),
+    & ~filters.regex(r"^adm:")
+    & ~filters.regex(r"^ga:")
+    & ~filters.regex(r"^glist:")
+    & ~filters.regex(r"^sgw:"),
     group=-500,
 )
 async def pm_text_handler(client: Client, message: Message):
@@ -136,8 +151,7 @@ async def _do_search(
     hits: List[Any] = []
     complete = True
     try:
-        from plugins.search import handlers as H
-        hits, complete = await H.quick_search(query)
+        hits, complete = await SEARCH.quick_search(query)
     except Exception as e:
         logger.exception(f"[PM-SEARCH] quick_search: {e}")
 
@@ -169,15 +183,13 @@ async def _do_search(
     # ── 2. Spell check → retry DB ──
     corrected: Optional[str] = None
     try:
-        from media_search.spell_check import ai_spell_check
-        corrected = await ai_spell_check(query)
+        corrected = await SUGG.ai_spell_check(query)
     except Exception as e:
         logger.debug(f"[PM-SEARCH] spell_check: {e}")
 
     if corrected and corrected.strip().lower() != query.strip().lower():
         try:
-            from plugins.search import handlers as H
-            hits2, _ = await H.quick_search(corrected)
+            hits2, _ = await SEARCH.quick_search(corrected)
         except Exception:
             hits2 = []
 
@@ -204,10 +216,12 @@ async def _do_search(
 
     items: List[Dict[str, Any]] = []
     try:
-        items = await IE.suggestions(
+        raw = await SUGG.suggestions(
             query,
             limit=int(cfg.get("suggestion_count", 6)),
         )
+        # Normalize to dict shape the panel expects
+        items = [SUGG.to_dict(x) for x in raw if x]
     except Exception as e:
         logger.debug(f"[PM-SEARCH] suggestions: {e}")
 
@@ -431,9 +445,8 @@ async def pms_router(client: Client, q: CallbackQuery):
 
             hits: List[Any] = []
             try:
-                from plugins.search import handlers as H
                 y = int(year_str) if str(year_str).isdigit() else None
-                hits, _ = await H.quick_search(title, year=y)
+                hits, _ = await SEARCH.quick_search(title, year=y)
             except Exception:
                 hits = []
 
@@ -485,6 +498,10 @@ async def show_results_for_request(
     query: str,
     year: Optional[str] = None,
 ) -> bool:
+    """
+    Fresh DB search + send PM panel.
+    Used by plugins.requests.request when admin taps ✅ UPDATED.
+    """
     try:
         cfg = await CFG.get_cfg()
 
@@ -494,8 +511,7 @@ async def show_results_for_request(
             y = int(year)
             q_text = f"{query} {year}"
 
-        from plugins.search import handlers as H
-        hits, _ = await H.quick_search(query, year=y)
+        hits, _ = await SEARCH.quick_search(query, year=y)
         if not hits:
             return False
 
