@@ -1,19 +1,17 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (v4 — DIRECT PM)
+# 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (FINAL)
 # ============================================================
-# Quality tap → files delivered DIRECTLY to user PM.
-# No button. No /start. Just files in PM.
+# Quality pick → URL button → user taps → /start deliver_XXX → files
+# Works for both new and existing users (V1 style)
 # ============================================================
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, UserIsBlocked
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -41,20 +39,6 @@ WIZARD_TTL = 900.0
 _last_seen: Dict[int, float] = {}
 _wizard: Dict[int, Dict[str, Any]] = {}
 
-# ── Background task registry (critical — prevents GC) ──
-_BG_TASKS: Set[asyncio.Task] = set()
-
-
-def _spawn(coro) -> asyncio.Task:
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
-    return task
-
-
-# ============================================================
-# COOLDOWN
-# ============================================================
 
 def _cooldown_ok(uid: int) -> bool:
     now = time.time()
@@ -72,10 +56,6 @@ def _cleanup_cooldown() -> None:
         if now - _last_seen[k] > 300:
             _last_seen.pop(k, None)
 
-
-# ============================================================
-# WIZARD SESSIONS
-# ============================================================
 
 def _wiz_new(uid: int, chat_id: int, **data) -> None:
     _wizard[int(uid)] = {
@@ -109,7 +89,7 @@ def _wiz_drop(uid: int) -> None:
 
 
 # ============================================================
-# ENTRY HANDLER
+# ENTRY
 # ============================================================
 
 @Client.on_message(
@@ -624,7 +604,7 @@ async def _render_quality(client, target, uid):
 
 
 # ============================================================
-# DELIVERY — DIRECT TO PM (no button, no /start)
+# DELIVERY — create token + show URL button
 # ============================================================
 
 async def _render_delivery(client, target, uid):
@@ -639,19 +619,15 @@ async def _render_delivery(client, target, uid):
     chat_id = s["chat_id"]
     hits = s.get("final_hits") or s.get("filtered_hits") or s.get("hits") or []
 
-    # Filter by season
     if season is not None:
         hs = SEARCH.filter_by_season(hits, season)
         if hs:
             hits = hs
-
-    # Filter by quality
     if quality:
         hq = SEARCH.filter_by_quality(hits, quality)
         if hq:
             hits = hq
 
-    # Episode behavior
     episode = s.get("selected_episode")
     if episode is not None:
         he = SEARCH.filter_by_episode(hits, episode)
@@ -676,347 +652,81 @@ async def _render_delivery(client, target, uid):
                 new_sz = int(h.get("file_size") or 0)
                 if new_sz and (cur_sz == 0 or new_sz < cur_sz):
                     by_ep[ep_int] = h
-        hits = [by_ep[k] for k in sorted(by_ep.keys())]
 
-    # Sort by episode number (ascending) — overrides size sort
-    def _ep_num(h):
-        try:
-            return int(h.get("episode") or 0)
-        except (TypeError, ValueError):
-            return 0
-    hits = sorted(hits, key=_ep_num)
+        def _ep_num(h):
+            try:
+                return int(h.get("episode") or 0)
+            except (TypeError, ValueError):
+                return 0
+        hits = sorted(by_ep.values(), key=_ep_num)
+
     if not hits:
         _wiz_drop(uid)
         await _show_request_prompt(client, target, query)
         return None
 
-       # ── Check if user has started the bot ──
-    user_started = False
+    token = await DL.create_deliver_token(
+        user_id=uid,
+        chat_id=chat_id,
+        title=query,
+        season=int(season or 0),
+        quality=str(quality or "UNKNOWN"),
+        language=str(language),
+        hits=hits,
+    )
+    if not token:
+        _wiz_drop(uid)
+        await _edit_status(target, "❌ token error")
+        return None
+
+    bot_username = ""
     try:
-        from database import db_registry
-        db = db_registry.get_user_db()
-        if db is not None:
-            doc = await db["users"].find_one(
-                {"user_id": uid}, {"_id": 1}
-            )
-            user_started = doc is not None
+        me = await client.identity()
+        bot_username = me.username or ""
     except Exception:
-        user_started = False
-
-    # ── If NOT started: show redirect button + create token ──
-    if not user_started:
-        logger.info(f"[SERIES-H] user {uid} never started bot → redirect button")
-
-        token = await DL.create_deliver_token(
-            user_id=uid,
-            chat_id=chat_id,
-            title=query,
-            season=int(season or 0),
-            quality=str(quality or "UNKNOWN"),
-            language=str(language),
-            hits=hits,
-        )
-        if not token:
-            _wiz_drop(uid)
-            await _edit_status(target, "❌ token error")
-            return None
-
-        bot_username = ""
         try:
-            me = await client.identity()
+            me = await client.get_me()
             bot_username = me.username or ""
         except Exception:
             pass
 
-        if not bot_username:
-            _wiz_drop(uid)
-            await _edit_status(target, "❌ bot username missing")
-            return None
-
-        deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
-
-        text = "\n".join([
-            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-            f"{F.EMO['rocket']} <b>{F.fb('START THE BOT FIRST')}</b>",
-            F.DIV, "",
-            f"🎬 <b>{F.sc(str(query)[:50])}</b>",
-            *([f"📺 <b>Season {int(season):02d}</b>"] if season else []),
-            *([f"🎯 <code>{quality}</code>"] if quality else []),
-            "",
-            f"📁 <b>{len(hits)}</b> ꜰɪʟᴇꜱ ʀᴇᴀᴅʏ",
-            "",
-            f"📌 {F.sc('you need to start the bot first')}",
-            f"📌 {F.sc('tap below then press START')}",
-        ])
-
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"{F.EMO['rocket']} {F.sc('start bot')}",
-                url=deep_link,
-            )],
-            [InlineKeyboardButton(
-                f"{F.EMO['cross']} {F.sc('cancel')}",
-                callback_data="sgw:close",
-            )],
-        ])
-
+    if not bot_username:
         _wiz_drop(uid)
-        await _edit_or_send(target, text, kb)
+        await _edit_status(target, "❌ bot username missing")
         return None
 
-    # ── User HAS started → deliver directly ──
-    cfg = await S.get_config(chat_id)
-    caption_tpl = cfg.get("caption_template") or ""
-    custom_buttons = cfg.get("result_buttons") or []
-    ad = cfg.get("auto_delete") or {}
-    auto_delete_min = 0
-    if ad.get("bot_messages", True):
-        auto_delete_min = int(ad.get("bot_timer", 0) or 0) // 60
+    deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
+    logger.info(f"[SERIES-H] token={token} link={deep_link}")
 
-    custom_kb = _build_custom_kb(custom_buttons)
-
-    # ── Group message: "SENDING" ──
-    group_text = "\n".join([
+    text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['rocket']} <b>{F.fb('SENDING TO YOUR PM')}</b>",
+        f"{F.EMO['rocket']} <b>{F.fb('READY TO DELIVER')}</b>",
         F.DIV, "",
         f"🎬 <b>{F.sc(str(query)[:50])}</b>",
-        *([f"📺 Season {int(season):02d}"] if season else []),
+        *([f"📺 <b>Season {int(season):02d}</b>"] if season else []),
         *([f"🎯 <code>{quality}</code>"] if quality else []),
+        *([f"🔊 <code>{language}</code>"] if language else []),
         "",
-        f"📁 <code>{len(hits)}</code> ꜰɪʟᴇꜱ",
+        f"📁 <b>{len(hits)}</b> ꜰɪʟᴇꜱ",
         "",
-        f"📌 {F.sc('check your pm in a moment')}",
+        f"📌 ᴛᴀᴘ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ʙᴇʟᴏᴡ",
+        f"📌 ꜰɪʟᴇꜱ ᴀʀʀɪᴠᴇ ɪɴ ᴘᴍ",
     ])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{F.EMO['rocket']} {F.sc('open bot pm')}",
+            url=deep_link,
+        )],
+        [InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('cancel')}",
+            callback_data="sgw:close",
+        )],
+    ])
+
     _wiz_drop(uid)
-    await _edit_or_send(target, group_text, None)
-
-    # ── Spawn direct PM delivery (with strong ref) ──
-    _spawn(_direct_pm_delivery(
-        client, uid, query, season or 0, quality or "?", language,
-        hits, caption_tpl, custom_kb, auto_delete_min,
-    ))
-
+    await _edit_or_send(target, text, kb)
     return None
-
-
-# ============================================================
-# DIRECT PM DELIVERY (background task)
-# ============================================================
-
-async def _direct_pm_delivery(
-    client, uid, title, season, quality, language,
-    hits, caption_tpl, custom_kb, auto_delete_min,
-):
-    try:
-        logger.info(
-            f"[SG-DIRECT] ▶️ uid={uid} title={title!r} "
-            f"S{season:02d} q={quality} hits={len(hits)}"
-        )
-
-        # Intro
-        intro = "\n".join([
-            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-            f"{F.EMO['rocket']} <b>{F.fb('DELIVERING')}</b>",
-            F.DIV, "",
-            f"🎬 <b>{F.sc(str(title)[:60])}</b>",
-            f"📺 <b>Season {int(season):02d}</b>",
-            f"🎯 <code>{quality}</code>",
-            *([f"🔊 <code>{language}</code>"] if language else []),
-            "",
-            f"📁 <code>{len(hits)}</code> episodes",
-        ])
-
-        try:
-            await client.send_message(
-                chat_id=uid, text=intro, parse_mode=ParseMode.HTML,
-            )
-            logger.info(f"[SG-DIRECT] ✅ intro sent to {uid}")
-        except UserIsBlocked:
-            logger.warning(f"[SG-DIRECT] ❌ user {uid} blocked")
-            return
-        except Exception as e:
-            logger.error(f"[SG-DIRECT] ❌ intro failed: {type(e).__name__}: {e}")
-            return
-
-        sent_ids = []
-        sent = 0
-        failed = 0
-
-        for i, h in enumerate(hits):
-            try:
-                ep = h.get("episode") or 0
-                size_str = FM.size(int(h.get("file_size") or 0))
-                file_id = str(h.get("file_id") or "")
-
-                logger.info(
-                    f"[SG-DIRECT] [{i+1}/{len(hits)}] ep={ep} "
-                    f"fid={'Y' if file_id else 'N'}"
-                )
-
-                if not file_id:
-                    failed += 1
-                    continue
-
-                ctx = {
-                    "title": title, "series": title,
-                    "season": season, "episode": ep,
-                    "quality": quality, "language": language,
-                    "lang": language, "size": size_str,
-                    "file_size": size_str,
-                    "file_name": h.get("file_name") or "",
-                    "year": "—", "rating": "—", "bot_username": "",
-                }
-                fallback = (
-                    f"🎬 <b>{F.sc(str(title)[:60])}</b>\n"
-                    f"📺 S{int(season):02d}E{int(ep):02d} · <code>{quality}</code>"
-                )
-                caption = _safe_caption(caption_tpl, ctx, fallback)
-
-                sent_msg = None
-                try:
-                    sent_msg = await client.send_cached_media(
-                        chat_id=uid,
-                        file_id=file_id,
-                        caption=caption,
-                        reply_markup=custom_kb,
-                        parse_mode=ParseMode.HTML,
-                    )
-                except FloodWait as e:
-                    w = int(getattr(e, "value", 30) or 30)
-                    logger.warning(f"[SG-DIRECT] flood {w}s")
-                    await asyncio.sleep(w + 2)
-                    try:
-                        sent_msg = await client.send_cached_media(
-                            chat_id=uid, file_id=file_id,
-                            caption=caption, reply_markup=custom_kb,
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except Exception as e2:
-                        logger.warning(f"[SG-DIRECT] retry: {e2}")
-                except Exception as e:
-                    logger.warning(
-                        f"[SG-DIRECT] send fail: {type(e).__name__}: {e}"
-                    )
-
-                if sent_msg and getattr(sent_msg, "id", None):
-                    sent_ids.append(sent_msg.id)
-                    sent += 1
-                    logger.info(f"[SG-DIRECT] ✅ ep={ep}")
-                else:
-                    failed += 1
-                    logger.warning(f"[SG-DIRECT] ❌ ep={ep}")
-
-                await asyncio.sleep(0.6)
-
-            except Exception as e:
-                failed += 1
-                logger.exception(f"[SG-DIRECT] ep crash: {e}")
-
-        logger.info(f"[SG-DIRECT] ═══ sent={sent} failed={failed} ═══")
-
-        # Auto-delete warning
-        if auto_delete_min > 0 and sent_ids:
-            try:
-                warn = await client.send_message(
-                    chat_id=uid,
-                    text="\n".join([
-                        f"⚠️ <b>{F.fb('AUTO-DELETE')}</b>",
-                        f"📌 {F.sc('this will be deleted in')} "
-                        f"<b>{auto_delete_min} {F.sc('minutes')}</b>",
-                        f"📌 {F.sc('save or forward now')}",
-                    ]),
-                    parse_mode=ParseMode.HTML,
-                )
-                if warn and warn.id:
-                    sent_ids.append(warn.id)
-            except Exception:
-                pass
-
-            _spawn(_auto_delete_batch(
-                client, uid, sent_ids, auto_delete_min * 60
-            ))
-
-        # Summary
-        try:
-            await client.send_message(
-                chat_id=uid,
-                text="\n".join([
-                    f"{F.EMO['check']} <b>{F.fb('DELIVERY COMPLETE')}</b>",
-                    F.DIV, "",
-                    f"🎬 <b>{F.sc(str(title)[:50])}</b>",
-                    f"📺 Season {int(season):02d} · {quality}",
-                    "",
-                    f"✅ {F.sc('sent')} · <code>{sent}</code>",
-                    f"❌ {F.sc('failed')} · <code>{failed}</code>",
-                    "",
-                    f"🕒 <code>{FM.datetime_()}</code>",
-                ]),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-
-        logger.info(f"[SG-DIRECT] ✅ done uid={uid}")
-
-    except Exception as e:
-        logger.exception(f"[SG-DIRECT] ❌ crash: {e}")
-
-
-async def _auto_delete_batch(client, chat_id, msg_ids, seconds):
-    try:
-        await asyncio.sleep(seconds)
-        for mid in msg_ids:
-            try:
-                await client.delete_messages(chat_id, mid)
-            except Exception:
-                pass
-        logger.info(f"[SG-AUTODEL] deleted {len(msg_ids)}")
-    except asyncio.CancelledError:
-        return
-    except Exception as e:
-        logger.debug(f"[SG-AUTODEL] {e}")
-
-
-# ============================================================
-# CAPTION + BUTTONS HELPERS
-# ============================================================
-
-class _SafeDict(dict):
-    def __missing__(self, key):
-        return ""
-
-
-def _safe_caption(template, ctx, fallback):
-    if not template:
-        return fallback
-    try:
-        return template.format_map(_SafeDict(ctx))
-    except Exception:
-        return fallback
-
-
-def _build_custom_kb(buttons):
-    if not buttons:
-        return None
-    rows = []
-    for b in buttons:
-        if not isinstance(b, dict) or not b.get("enabled", True):
-            continue
-        name = str(b.get("name") or "")[:60]
-        url = str(b.get("url") or "").strip()
-        if not name or not url:
-            continue
-        if url.startswith("@"):
-            url = f"https://t.me/{url[1:]}"
-        elif not (url.startswith("http://") or url.startswith("https://")
-                  or url.startswith("tg://")):
-            if "." in url and " " not in url:
-                url = f"https://{url}"
-            else:
-                continue
-        rows.append([InlineKeyboardButton(name, url=url)])
-    return InlineKeyboardMarkup(rows) if rows else None
 
 
 # ============================================================
@@ -1068,8 +778,7 @@ async def series_wizard_router(client, q: CallbackQuery):
         if action == "qual":
             quality = parts[2] if len(parts) > 2 else ""
             _wiz_set(uid, selected_quality=quality)
-            await q.answer("🚀 Sending to PM…")
-            # Fires direct PM delivery
+            await q.answer(f"🎯 {quality}")
             await _render_delivery(client, q.message, uid)
             return
 
@@ -1294,11 +1003,7 @@ async def _edit_status(target, text):
 
 
 def snapshot():
-    return {
-        "module": "groups.series.handler",
-        "wizard": len(_wizard),
-        "bg_tasks": len(_BG_TASKS),
-    }
+    return {"module": "groups.series.handler", "wizard": len(_wizard)}
 
 
 __all__ = ["series_group_entry", "series_wizard_router", "snapshot"]
