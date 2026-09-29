@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import secrets
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from pyrogram import Client, filters
@@ -111,6 +113,139 @@ async def _user_started_bot(uid: int) -> bool:
     except Exception as e:
         logger.debug(f"[SERIES-H] user_started check: {e}")
         return False
+
+
+# ============================================================
+# FIRST-TIME USER DELIVERY TOKENS
+# ============================================================
+# A short-lived MongoDB token connects the group Quality button
+# to the user's first /start in the bot PM.
+# No Telegram file is downloaded or re-uploaded.
+
+DELIVERY_TOKEN_TTL = 15 * 60
+DELIVERY_TOKEN_COLLECTION = "series_delivery_tokens"
+
+
+def _delivery_token() -> str:
+    return secrets.token_urlsafe(24).replace("-", "").replace("_", "")[:32]
+
+
+async def _create_delivery_token(
+    user_id: int,
+    chat_id: int,
+    title: str,
+    season: int,
+    quality: str,
+    language: str,
+    hits: list,
+) -> Optional[str]:
+    try:
+        from database import db_registry
+
+        db = db_registry.get_user_db()
+        if db is None:
+            logger.error("[SG-TOKEN] user DB unavailable")
+            return None
+
+        token = _delivery_token()
+        now = datetime.now(timezone.utc)
+
+        # Store only the fields required for PM delivery.
+        safe_hits = []
+        for h in hits or []:
+            if not isinstance(h, dict):
+                continue
+            safe_hits.append({
+                "file_id": str(h.get("file_id") or ""),
+                "file_size": int(h.get("file_size") or 0),
+                "file_name": str(h.get("file_name") or ""),
+                "episode": h.get("episode"),
+            })
+
+        if not safe_hits:
+            return None
+
+        await db[DELIVERY_TOKEN_COLLECTION].insert_one({
+            "token": token,
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "title": str(title)[:200],
+            "season": int(season or 0),
+            "quality": str(quality or "?")[:50],
+            "language": str(language or "")[:50],
+            "hits": safe_hits,
+            "created_at": now,
+            "expires_at": now.timestamp() + DELIVERY_TOKEN_TTL,
+        })
+
+        logger.info(
+            f"[SG-TOKEN] created uid={user_id} token={token[:8]}... "
+            f"files={len(safe_hits)}"
+        )
+        return token
+
+    except Exception as e:
+        logger.exception(f"[SG-TOKEN] create failed: {e}")
+        return None
+
+
+async def _consume_delivery_token(token: str, user_id: int):
+    try:
+        from database import db_registry
+
+        db = db_registry.get_user_db()
+        if db is None:
+            return None
+
+        doc = await db[DELIVERY_TOKEN_COLLECTION].find_one({
+            "token": str(token),
+            "user_id": int(user_id),
+        })
+
+        if not doc:
+            return None
+
+        # Always consume the token so it cannot be reused.
+        await db[DELIVERY_TOKEN_COLLECTION].delete_one({"_id": doc["_id"]})
+
+        if float(doc.get("expires_at") or 0) < time.time():
+            logger.info(
+                f"[SG-TOKEN] expired uid={user_id} token={str(token)[:8]}..."
+            )
+            return None
+
+        return doc
+
+    except Exception as e:
+        logger.exception(f"[SG-TOKEN] consume failed: {e}")
+        return None
+
+
+async def _cleanup_delivery_tokens():
+    try:
+        from database import db_registry
+
+        db = db_registry.get_user_db()
+        if db is None:
+            return
+
+        await db[DELIVERY_TOKEN_COLLECTION].delete_many({
+            "expires_at": {"$lt": time.time()}
+        })
+    except Exception:
+        pass
+
+
+async def _get_bot_username(client) -> str:
+    try:
+        me = await client.get_me()
+        return str(me.username or "")
+    except Exception:
+        try:
+            me = await client.identity()
+            return str(me.username or "")
+        except Exception:
+            return ""
 
 
 # ============================================================
@@ -730,7 +865,9 @@ async def _render_delivery(client, target, uid):
         return None
 
     # ── CASE B: Never started → show Start button ──
-    token = await DL.create_deliver_token(
+    await _cleanup_delivery_tokens()
+
+    token = await _create_delivery_token(
         user_id=uid,
         chat_id=chat_id,
         title=query,
@@ -740,16 +877,7 @@ async def _render_delivery(client, target, uid):
         hits=hits,
     )
 
-    bot_username = ""
-    try:
-        me = await client.identity()
-        bot_username = me.username or ""
-    except Exception:
-        try:
-            me = await client.get_me()
-            bot_username = me.username or ""
-        except Exception:
-            pass
+    bot_username = await _get_bot_username(client)
 
     if not token or not bot_username:
         _wiz_drop(uid)
@@ -1003,6 +1131,110 @@ def _build_custom_kb(buttons):
                 continue
         rows.append([InlineKeyboardButton(name, url=url)])
     return InlineKeyboardMarkup(rows) if rows else None
+
+
+# ============================================================
+# FIRST-TIME USER /START DELIVERY
+# ============================================================
+# This handler catches:
+#   https://t.me/BOT?start=deliver_TOKEN
+#
+# Telegram opens the bot PM, the user presses START, and this
+# handler consumes the token and sends the already-indexed files
+# directly from Telegram file_id values.
+
+@Client.on_message(
+    filters.private & filters.command("start"),
+    group=-100000,
+)
+async def series_delivery_start(client: Client, message: Message):
+    if not message.from_user:
+        return
+
+    command = getattr(message, "command", None) or []
+    if len(command) < 2:
+        return
+
+    payload = str(command[1] or "").strip()
+    if not payload.startswith("deliver_"):
+        return
+
+    token = payload[8:].strip()
+    if not token:
+        return
+
+    uid = int(message.from_user.id)
+
+    try:
+        # Stop the normal /start handlers from replacing the delivery flow.
+        try:
+            message.stop_propagation()
+        except Exception:
+            pass
+
+        await message.reply_text(
+            "🚀 <b>Getting your files ready...</b>\n\n"
+            "📦 Please wait while I send them to your PM.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        doc = await _consume_delivery_token(token, uid)
+
+        if not doc:
+            await message.reply_text(
+                "⏱️ <b>This delivery link has expired or was already used.</b>\n\n"
+                "Please go back to the group and press the Quality button again.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        title = str(doc.get("title") or "?")
+        season = int(doc.get("season") or 0)
+        quality = str(doc.get("quality") or "?")
+        language = str(doc.get("language") or "")
+        hits = doc.get("hits") or []
+
+        # Re-read the group configuration so captions/buttons/settings
+        # remain controlled by the current group configuration.
+        cfg = await S.get_config(int(doc.get("chat_id") or 0))
+        caption_tpl = cfg.get("caption_template") or ""
+        custom_buttons = cfg.get("result_buttons") or []
+        ad = cfg.get("auto_delete") or {}
+
+        auto_delete_min = 0
+        if ad.get("bot_messages", True):
+            auto_delete_min = int(ad.get("bot_timer", 0) or 0) // 60
+
+        custom_kb = _build_custom_kb(custom_buttons)
+
+        logger.info(
+            f"[SG-START] uid={uid} title={title!r} "
+            f"S{season:02d} q={quality} files={len(hits)}"
+        )
+
+        await _direct_pm_delivery(
+            client,
+            uid,
+            title,
+            season,
+            quality,
+            language,
+            hits,
+            caption_tpl,
+            custom_kb,
+            auto_delete_min,
+        )
+
+    except Exception as e:
+        logger.exception(f"[SG-START] delivery failed uid={uid}: {e}")
+        try:
+            await client.send_message(
+                chat_id=uid,
+                text="❌ <b>Delivery failed.</b> Please press Quality again.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1286,4 +1518,4 @@ def snapshot():
     }
 
 
-__all__ = ["series_group_entry", "series_wizard_router", "snapshot"]
+__all__ = ["series_group_entry", "series_wizard_router", "series_delivery_start", "snapshot"]
