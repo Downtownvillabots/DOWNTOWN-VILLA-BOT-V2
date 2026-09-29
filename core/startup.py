@@ -217,6 +217,14 @@ async def _start_all_loops(bot) -> None:
     except Exception as e:
         logger.debug(f"[BOOT] cache loop: {e}")
 
+        # ── GROUPS startup hook ──
+    try:
+        from plugins.groups import ensure_startup as groups_startup
+        groups_startup()
+        logger.info("[BOOT] ✅ groups v2 ready")
+    except Exception as e:
+        logger.warning(f"[BOOT] groups startup: {e}")
+
     # ── Locks cleanup ──
     try:
         from utils import locks as LK
