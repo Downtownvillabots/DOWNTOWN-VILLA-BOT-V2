@@ -708,14 +708,50 @@ async def _render_delivery(client, target, uid):
     chat_id = s["chat_id"]
     hits = s.get("final_hits") or s.get("filtered_hits") or s.get("hits") or []
 
-    if quality:
-        hq = SEARCH.filter_by_quality(hits, quality)
-        if hq:
-            hits = hq
+       # ── Season filter first ──
     if season is not None:
         hs = SEARCH.filter_by_season(hits, season)
         if hs:
             hits = hs
+
+    # ── Quality filter ──
+    if quality:
+        hq = SEARCH.filter_by_quality(hits, quality)
+        if hq:
+            hits = hq
+
+    # ── Episode behavior ──
+    episode = s.get("selected_episode")
+
+    if episode is not None:
+        # User picked a specific episode → deliver ONLY that one
+        he = SEARCH.filter_by_episode(hits, episode)
+        if he:
+            hits = he
+        # Dedupe to a single file for this episode (prefer smallest)
+        by_size = sorted(hits, key=lambda x: int(x.get("file_size") or 0))
+        hits = by_size[:1]
+    else:
+        # No episode → deliver the FULL season
+        # One file per episode (dedupe duplicates), sorted by episode
+        by_ep: Dict[int, Dict[str, Any]] = {}
+        for h in hits:
+            ep = h.get("episode")
+            if ep is None:
+                continue
+            try:
+                ep_int = int(ep)
+            except (TypeError, ValueError):
+                continue
+            existing = by_ep.get(ep_int)
+            if existing is None:
+                by_ep[ep_int] = h
+            else:
+                cur_sz = int(existing.get("file_size") or 0)
+                new_sz = int(h.get("file_size") or 0)
+                if new_sz and (cur_sz == 0 or new_sz < cur_sz):
+                    by_ep[ep_int] = h
+        hits = [by_ep[k] for k in sorted(by_ep.keys())]
 
     # Per-group sort
     delivery_cfg = await SFLOW.get_delivery_settings(chat_id)
