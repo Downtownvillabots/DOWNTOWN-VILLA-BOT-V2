@@ -1,10 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (v2 — FULL CUSTOM)
-# ============================================================
-#
-# Reads custom order + all per-group settings from DB.
-# Every wizard step is toggleable + reorderable + tunable.
-#
+# 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (v3 — FIXED)
 # ============================================================
 
 from __future__ import annotations
@@ -42,10 +37,6 @@ _last_seen: Dict[int, float] = {}
 _wizard: Dict[int, Dict[str, Any]] = {}
 
 
-# ============================================================
-# COOLDOWN
-# ============================================================
-
 def _cooldown_ok(uid: int) -> bool:
     now = time.time()
     if now - _last_seen.get(uid, 0) < COOLDOWN:
@@ -62,10 +53,6 @@ def _cleanup_cooldown() -> None:
         if now - _last_seen[k] > 300:
             _last_seen.pop(k, None)
 
-
-# ============================================================
-# WIZARD SESSIONS
-# ============================================================
 
 def _wiz_new(uid: int, chat_id: int, **data) -> None:
     _wizard[int(uid)] = {
@@ -87,7 +74,7 @@ def _wiz_get(uid: int) -> Optional[Dict[str, Any]]:
 
 
 def _wiz_set(uid: int, **data) -> None:
-    s = _wizard.get(int(uid))
+    s = _wizard.get(uid)
     if not s:
         return
     s.update(data)
@@ -166,11 +153,7 @@ async def series_group_entry(client: Client, message: Message):
         if status is not None:
             try:
                 await status.edit_text(
-                    "\n".join([
-                        f"{F.EMO['cross']} <b>{F.fb('ERROR')}</b>",
-                        F.DIV, "",
-                        f"📌 {F.sc('please try again')}",
-                    ]),
+                    f"{F.EMO['cross']} error — try again",
                     parse_mode=ParseMode.HTML,
                 )
             except Exception:
@@ -181,41 +164,25 @@ async def series_group_entry(client: Client, message: Message):
 # PIPELINE
 # ============================================================
 
-async def _run_pipeline(
-    client: Client,
-    message: Message,
-    status: Message,
-    query: str,
-    cfg: Dict[str, Any],
-    uid: int,
-    chat_id: int,
-) -> None:
-    # ── 1. DB search ──
+async def _run_pipeline(client, message, status, query, cfg, uid, chat_id):
     hits, complete = await SEARCH.quick_search(query, is_series=True)
 
     if hits:
-        # Premium fast-path
         if await _is_user_premium(uid):
             if await _try_premium_redirect(
                 client, message, status, query, hits, uid, chat_id,
             ):
                 return
-
         await _start_wizard(client, status, query, hits, cfg, uid, chat_id)
         return
 
     if not complete:
         await _edit_status(
             status,
-            "\n".join([
-                f"{F.EMO['warn']} <b>{F.fb('DBs UNREACHABLE')}</b>",
-                F.DIV, "",
-                f"📌 {F.sc('try again in a moment')}",
-            ]),
+            f"{F.EMO['warn']} DBs unreachable — try again",
         )
         return
 
-    # ── 2. Spell check (per-group) ──
     if await SFLOW.is_step_enabled(chat_id, "spell_check"):
         corrected = None
         try:
@@ -226,80 +193,46 @@ async def _run_pipeline(
             logger.debug(f"[SERIES-H] spell: {e}")
 
         if corrected and corrected.strip().lower() != query.strip().lower():
-            corrected_hits, _ = await SEARCH.quick_search(
-                corrected, is_series=True,
-            )
-            if corrected_hits:
+            ch, _ = await SEARCH.quick_search(corrected, is_series=True)
+            if ch:
                 await status.edit_text(
-                    "\n".join([
-                        f"🔤 <b>{F.fb('CORRECTED')}</b>",
-                        f"📌 <code>{F.sc(query[:40])}</code> → "
-                        f"<code>{F.sc(corrected[:40])}</code>",
-                    ]),
+                    f"🔤 corrected → <code>{F.sc(corrected[:40])}</code>",
                     parse_mode=ParseMode.HTML,
                 )
                 await _start_wizard(
-                    client, status, corrected, corrected_hits,
-                    cfg, uid, chat_id,
+                    client, status, corrected, ch, cfg, uid, chat_id,
                 )
                 return
 
-    # ── 3. Suggestions (per-group) ──
     if await SFLOW.is_step_enabled(chat_id, "suggestions"):
         try:
             items = await SUGG.get_suggestions_for_group(
                 chat_id, query, kind="series",
             )
-        except Exception as e:
-            logger.debug(f"[SERIES-H] suggestions: {e}")
+        except Exception:
             items = []
-
         if items:
             await _show_suggestions(
                 client, status, query, items, uid, chat_id,
             )
             return
 
-    # ── 4. Request prompt ──
     await _show_request_prompt(client, status, query)
 
 
 # ============================================================
-# WIZARD START (uses custom order)
+# WIZARD
 # ============================================================
 
-async def _start_wizard(
-    client: Client,
-    target: Message,
-    query: str,
-    hits: List[Dict[str, Any]],
-    cfg: Dict[str, Any],
-    uid: int,
-    chat_id: int,
-) -> None:
+async def _start_wizard(client, target, query, hits, cfg, uid, chat_id):
     _wiz_new(uid=uid, chat_id=chat_id, query=query, hits=hits)
-
-    # Get custom order
     wizard_steps = await SFLOW.get_wizard_steps(chat_id)
     if not wizard_steps:
-        # No wizard steps enabled → straight to delivery
         return await _render_delivery(client, target, uid)
-
-    # Start at first wizard step
-    first = wizard_steps[0]
-    return await _goto_step(client, target, uid, first)
+    return await _goto_step(client, target, uid, wizard_steps[0])
 
 
-# ============================================================
-# GATED TRANSITION (walks forward through custom order)
-# ============================================================
-
-async def _goto_step(
-    client: Client,
-    target: Message,
-    uid: int,
-    step_key: str,
-) -> None:
+async def _goto_step(client, target, uid, step_key):
     s = _wiz_get(uid)
     if not s:
         return
@@ -308,7 +241,6 @@ async def _goto_step(
     if step_key in ("close", "done", ""):
         return
 
-    # Enabled → render
     if await SFLOW.is_step_enabled(chat_id, step_key):
         if step_key == "language":
             return await _render_language(client, target, uid)
@@ -321,7 +253,6 @@ async def _goto_step(
         if step_key == "file_delivery":
             return await _render_delivery(client, target, uid)
 
-    # Disabled → walk forward through custom order
     order = await SFLOW.get_step_order(chat_id)
     try:
         idx = order.index(step_key)
@@ -337,7 +268,7 @@ async def _goto_step(
 
 
 # ============================================================
-# LANGUAGE STEP
+# LANGUAGE
 # ============================================================
 
 async def _render_language(client, target, uid):
@@ -348,20 +279,20 @@ async def _render_language(client, target, uid):
     query = s.get("query") or "?"
     chat_id = s["chat_id"]
 
-    local: List[str] = []
+    local = []
     for h in hits:
         for l in (h.get("audio_languages") or []):
             n = str(l).strip().title()
             if n and n not in local:
                 local.append(n)
 
-    tmdb_langs: List[str] = []
+    tmdb_langs = []
     try:
         tmdb_langs = await STMDB.get_series_languages(query)
-    except Exception as e:
-        logger.debug(f"[SERIES-H] tmdb langs: {e}")
+    except Exception:
+        pass
 
-    ordered: List[str] = []
+    ordered = []
     for l in local:
         if l not in ordered:
             ordered.append(l)
@@ -388,34 +319,28 @@ async def _render_language(client, target, uid):
         f"🎬 <b>{F.sc(str(query)[:50])}</b>",
         "",
         f"🟢 ʜᴀꜱ ꜰɪʟᴇꜱ   ⚪ ᴛᴍᴅʙ ᴏɴʟʏ",
-        "",
-        f"ᴛᴀᴘ ᴀ ʟᴀɴɢᴜᴀɢᴇ:",
     ])
 
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    rows = []
+    row = []
     for i, l in enumerate(ordered[:max_items]):
         icon = "🟢" if l in local else "⚪"
         row.append(InlineKeyboardButton(
-            f"{icon} {l}",
-            callback_data=f"sgw:lang:{i}",
-        ))
+            f"{icon} {l}", callback_data=f"sgw:lang:{i}"))
         if len(row) >= per_row:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-
     rows.append([InlineKeyboardButton(
         f"{F.EMO['cross']} {F.sc('cancel')}",
-        callback_data="sgw:close",
-    )])
+        callback_data="sgw:close")])
 
     await _edit_or_send(target, text, InlineKeyboardMarkup(rows))
 
 
 # ============================================================
-# SEASON STEP
+# SEASON
 # ============================================================
 
 async def _render_season(client, target, uid):
@@ -429,7 +354,7 @@ async def _render_season(client, target, uid):
 
     filtered = SEARCH.filter_by_language(hits, lang) if lang else hits
 
-    local_seasons: Dict[int, List[int]] = {}
+    local_seasons = {}
     for h in filtered:
         sn = h.get("season")
         ep = h.get("episode")
@@ -446,7 +371,7 @@ async def _render_season(client, target, uid):
             except (TypeError, ValueError):
                 pass
 
-    tmdb_seasons: List[Dict[str, Any]] = []
+    tmdb_seasons = []
     try:
         tmdb_seasons = await STMDB.get_series_seasons(query)
     except Exception:
@@ -472,7 +397,7 @@ async def _render_season(client, target, uid):
         _wiz_set(uid, selected_season=int(sn))
         return await _goto_step(client, target, uid, "episode")
 
-    def icon_for(sn: int, tmdb_eps: int) -> str:
+    def icon_for(sn, tmdb_eps):
         eps = local_seasons.get(sn, [])
         count = len([e for e in eps if e > 0])
         if count == 0:
@@ -494,8 +419,8 @@ async def _render_season(client, target, uid):
     per_row = await SFLOW.get_per_row(chat_id, "season")
     max_items = await SFLOW.get_max_items(chat_id, "season", 12)
 
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    rows = []
+    row = []
     tmdb_season_nums = {int(t.get("season") or 0) for t in tmdb_seasons}
 
     for t in tmdb_seasons[:max_items]:
@@ -528,19 +453,17 @@ async def _render_season(client, target, uid):
     rows.append([
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="sgw:back:language",
-        ),
+            callback_data="sgw:back:language"),
         InlineKeyboardButton(
             f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data="sgw:close",
-        ),
+            callback_data="sgw:close"),
     ])
 
     await _edit_or_send(target, text, InlineKeyboardMarkup(rows))
 
 
 # ============================================================
-# EPISODE STEP
+# EPISODE
 # ============================================================
 
 async def _render_episode(client, target, uid):
@@ -556,7 +479,7 @@ async def _render_episode(client, target, uid):
     filtered = s.get("filtered_hits") or s.get("hits") or []
     local_eps = SEARCH.unique_episodes(filtered, season=season) or []
 
-    tmdb_eps: List[int] = []
+    tmdb_eps = []
     try:
         tmdb_eps = await STMDB.get_season_episodes(query, season)
     except Exception:
@@ -566,10 +489,7 @@ async def _render_episode(client, target, uid):
     if not all_eps:
         return await _goto_step(client, target, uid, "quality")
 
-    _wiz_set(uid,
-             season_episodes=all_eps,
-             local_eps=local_eps,
-             step="episode")
+    _wiz_set(uid, season_episodes=all_eps, local_eps=local_eps, step="episode")
 
     auto_skip = await SFLOW.is_auto_skip(chat_id, "episode")
     if len(all_eps) == 1 and auto_skip:
@@ -589,14 +509,12 @@ async def _render_episode(client, target, uid):
     per_row = await SFLOW.get_per_row(chat_id, "episode")
     max_items = await SFLOW.get_max_items(chat_id, "episode", 30)
 
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
-
+    rows = []
+    row = []
     for ep in all_eps[:max_items]:
         icon = "🟢" if ep in local_eps else "⚪"
         row.append(InlineKeyboardButton(
-            f"{icon} E{ep:02d}",
-            callback_data=f"sgw:ep:{ep}"))
+            f"{icon} E{ep:02d}", callback_data=f"sgw:ep:{ep}"))
         if len(row) >= per_row:
             rows.append(row)
             row = []
@@ -606,19 +524,17 @@ async def _render_episode(client, target, uid):
     rows.append([
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="sgw:back:season",
-        ),
+            callback_data="sgw:back:season"),
         InlineKeyboardButton(
             f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data="sgw:close",
-        ),
+            callback_data="sgw:close"),
     ])
 
     await _edit_or_send(target, text, InlineKeyboardMarkup(rows))
 
 
 # ============================================================
-# QUALITY STEP
+# QUALITY
 # ============================================================
 
 async def _render_quality(client, target, uid):
@@ -645,10 +561,7 @@ async def _render_quality(client, target, uid):
         _wiz_set(uid, step="quality", final_hits=f)
         return await _goto_step(client, target, uid, "file_delivery")
 
-    _wiz_set(uid,
-             available_qualities=qualities,
-             final_hits=f,
-             step="quality")
+    _wiz_set(uid, available_qualities=qualities, final_hits=f, step="quality")
 
     auto_skip = await SFLOW.is_auto_skip(chat_id, "quality")
     if len(qualities) == 1 and auto_skip:
@@ -667,8 +580,8 @@ async def _render_quality(client, target, uid):
     per_row = await SFLOW.get_per_row(chat_id, "quality")
     max_items = await SFLOW.get_max_items(chat_id, "quality", 8)
 
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    rows = []
+    row = []
     for q in qualities[:max_items]:
         row.append(InlineKeyboardButton(
             f"🎯 {q}", callback_data=f"sgw:qual:{q}"))
@@ -681,19 +594,17 @@ async def _render_quality(client, target, uid):
     rows.append([
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="sgw:back:episode",
-        ),
+            callback_data="sgw:back:episode"),
         InlineKeyboardButton(
             f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data="sgw:close",
-        ),
+            callback_data="sgw:close"),
     ])
 
     await _edit_or_send(target, text, InlineKeyboardMarkup(rows))
 
 
 # ============================================================
-# DELIVERY STEP
+# DELIVERY — Creates token + shows URL button
 # ============================================================
 
 async def _render_delivery(client, target, uid):
@@ -708,33 +619,27 @@ async def _render_delivery(client, target, uid):
     chat_id = s["chat_id"]
     hits = s.get("final_hits") or s.get("filtered_hits") or s.get("hits") or []
 
-       # ── Season filter first ──
+    # Filter by season
     if season is not None:
         hs = SEARCH.filter_by_season(hits, season)
         if hs:
             hits = hs
 
-    # ── Quality filter ──
+    # Filter by quality
     if quality:
         hq = SEARCH.filter_by_quality(hits, quality)
         if hq:
             hits = hq
 
-    # ── Episode behavior ──
+    # Episode behavior
     episode = s.get("selected_episode")
-
     if episode is not None:
-        # User picked a specific episode → deliver ONLY that one
         he = SEARCH.filter_by_episode(hits, episode)
         if he:
             hits = he
-        # Dedupe to a single file for this episode (prefer smallest)
-        by_size = sorted(hits, key=lambda x: int(x.get("file_size") or 0))
-        hits = by_size[:1]
+        hits = sorted(hits, key=lambda x: int(x.get("file_size") or 0))[:1]
     else:
-        # No episode → deliver the FULL season
-        # One file per episode (dedupe duplicates), sorted by episode
-        by_ep: Dict[int, Dict[str, Any]] = {}
+        by_ep = {}
         for h in hits:
             ep = h.get("episode")
             if ep is None:
@@ -753,14 +658,15 @@ async def _render_delivery(client, target, uid):
                     by_ep[ep_int] = h
         hits = [by_ep[k] for k in sorted(by_ep.keys())]
 
-    # Per-group sort
     delivery_cfg = await SFLOW.get_delivery_settings(chat_id)
     hits = SEARCH.sort_hits(hits, mode=delivery_cfg["sort_order"])
 
     if not hits:
+        _wiz_drop(uid)
         await _show_request_prompt(client, target, query)
         return None
 
+    # Create token
     token = await DL.create_deliver_token(
         user_id=uid,
         chat_id=chat_id,
@@ -771,21 +677,29 @@ async def _render_delivery(client, target, uid):
         hits=hits,
     )
     if not token:
+        _wiz_drop(uid)
         await _edit_status(target, "❌ token error")
         return None
 
+    # Bot username
     bot_username = ""
     try:
         me = await client.identity()
         bot_username = me.username or ""
     except Exception:
-        pass
+        try:
+            me = await client.get_me()
+            bot_username = me.username or ""
+        except Exception:
+            pass
 
     if not bot_username:
+        _wiz_drop(uid)
         await _edit_status(target, "❌ bot username missing")
         return None
 
     deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
+    logger.info(f"[SERIES-H] token={token}")
 
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -798,148 +712,33 @@ async def _render_delivery(client, target, uid):
         "",
         f"📁 <b>{len(hits)}</b> ꜰɪʟᴇꜱ",
         "",
-        f"📌 ᴛᴀᴘ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ɪɴ ᴘᴍ",
+        f"📌 ᴛᴀᴘ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ʙᴇʟᴏᴡ",
+        f"📌 ꜰɪʟᴇꜱ ᴀʀʀɪᴠᴇ ɪɴ ᴘᴍ",
     ])
 
-    # Show "redirecting" message — no button, auto-redirect
+    # URL button — forwards payload to /start
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{F.EMO['rocket']} {F.sc('open bot pm')}",
+            url=deep_link,
+        )],
+        [InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('cancel')}",
+            callback_data="sgw:close",
+        )],
+    ])
+
     _wiz_drop(uid)
-    await _edit_or_send(target, text, None)
-
-    # Return deep_link so the callback can auto-open PM
-    return deep_link
-
-
-# ============================================================
-# SUGGESTIONS (per-group display)
-# ============================================================
-
-async def _show_suggestions(client, target, query, items, uid, chat_id):
-    stored = [SUGG.to_dict(x) for x in items if x]
-    stored = [s for s in stored if s.get("title")]
-    if not stored:
-        return await _show_request_prompt(client, target, query)
-
-    sid = await DELIVERY.create_session(
-        user_id=uid, chat_id=chat_id, query=query, hits=[],
-    )
-    if not sid:
-        return await _edit_status(target, "❌ session error")
-
-    try:
-        from media_search import sessions as _sess_mod
-        await _sess_mod.sessions.update(sid, candidates=stored)
-    except Exception:
-        pass
-
-    text = "\n".join([
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['search']} <b>{F.fb('DID YOU MEAN?')}</b>",
-        F.DIV, "",
-        f"🔍 <code>{F.sc(query[:50])}</code>",
-        "",
-        f"📌 {F.sc('tap a title below')}",
-    ])
-
-    # Per-group display settings
-    disp = await SFLOW.get_suggestion_display(chat_id)
-    show_rating = disp["show_rating"]
-    show_year = disp["show_year"]
-    show_icon = disp["show_icon"]
-
-    rows: List[List[InlineKeyboardButton]] = []
-    for i, s in enumerate(stored[:8]):
-        title = str(s.get("title") or "?")[:34]
-        year = s.get("year")
-        rating = s.get("rating") or 0
-        kind = str(s.get("kind") or "movie")
-
-        label = ""
-        if show_icon:
-            label += ("📺 " if kind == "series" else "🎬 ")
-        label += title
-        if show_year and year:
-            label += f" ({year})"
-        if show_rating and rating:
-            label += f" · ⭐{rating:.1f}"
-        if len(label) > 60:
-            label = label[:57] + "…"
-
-        rows.append([InlineKeyboardButton(
-            label, callback_data=f"sr:sug:{sid}:{i}")])
-
-    rows.append([InlineKeyboardButton(
-        f"🔍 {F.sc('search on google')}",
-        url=f"https://www.google.com/search?q={query}",
-    )])
-    rows.append([InlineKeyboardButton(
-        f"{F.EMO['cross']} {F.sc('close')}",
-        callback_data="sr:cancel",
-    )])
-
-    await _edit_or_send(target, text, InlineKeyboardMarkup(rows))
-
-
-# ============================================================
-# REQUEST PROMPT
-# ============================================================
-
-async def _show_request_prompt(client, target, query):
-    try:
-        uid = target.from_user.id if target.from_user else 0
-        u = target.from_user
-        username = u.username if u else ""
-        full_name = u.first_name if u else ""
-
-        token = await RF.create_deferred_request(
-            user_id=uid, username=username or "",
-            full_name=full_name or "", title=query,
-            year=None, kind="series", tmdb_id=None,
-        )
-        if not token:
-            return await _edit_status(
-                target, f"{F.EMO['cross']} {F.sc('no results')}")
-
-        bot_username = ""
-        try:
-            me = await client.identity()
-            bot_username = me.username or ""
-        except Exception:
-            pass
-        if not bot_username:
-            return await _edit_status(
-                target, f"{F.EMO['cross']} {F.sc('no results')}")
-
-        deep_link = f"https://t.me/{bot_username}?start=req_{token}"
-
-        text = "\n".join([
-            f"{F.EMO['warn']} <b>{F.fb('NOT IN OUR DATABASE')}</b>",
-            F.DIV, "",
-            f"📺 <b>{F.sc(query[:60])}</b>",
-            "",
-            f"📌 {F.sc('tap below to send a request')}",
-        ])
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"{F.EMO['rocket']} {F.sc('send request')}",
-                url=deep_link)],
-            [InlineKeyboardButton(
-                f"{F.EMO['cross']} {F.sc('close')}",
-                callback_data="sr:cancel")],
-        ])
-        await _edit_or_send(target, text, kb)
-    except Exception as e:
-        logger.exception(f"[SERIES-H] request: {e}")
+    await _edit_or_send(target, text, kb)
+    return None
 
 
 # ============================================================
 # CALLBACK ROUTER
 # ============================================================
 
-@Client.on_callback_query(
-    filters.regex(r"^sgw:"),
-    group=-9999,
-)
-async def series_wizard_router(client: Client, q: CallbackQuery):
+@Client.on_callback_query(filters.regex(r"^sgw:"), group=-9999)
+async def series_wizard_router(client, q: CallbackQuery):
     if not q.from_user:
         return await q.answer()
 
@@ -983,19 +782,8 @@ async def series_wizard_router(client: Client, q: CallbackQuery):
         if action == "qual":
             quality = parts[2] if len(parts) > 2 else ""
             _wiz_set(uid, selected_quality=quality)
-
-            # Build delivery + create token
-            deep_link = await _goto_step(
-                client, q.message, uid, "file_delivery",
-            )
-
-            # _goto_step returns what _render_delivery returns
-            # (a deep_link string or None)
-            if deep_link and isinstance(deep_link, str):
-                # Auto-open PM — no button needed
-                await q.answer(url=deep_link)
-            else:
-                await q.answer(f"🎯 {quality}")
+            await q.answer(f"🎯 {quality}")
+            await _render_delivery(client, q.message, uid)
             return
 
         if action == "back":
@@ -1013,10 +801,10 @@ async def series_wizard_router(client: Client, q: CallbackQuery):
 
 
 # ============================================================
-# PREMIUM REDIRECT
+# PREMIUM
 # ============================================================
 
-async def _is_user_premium(uid: int) -> bool:
+async def _is_user_premium(uid):
     try:
         from plugins.premium import state as PS
         return await PS.is_premium(uid)
@@ -1024,11 +812,9 @@ async def _is_user_premium(uid: int) -> bool:
         return False
 
 
-async def _try_premium_redirect(client, message, status, query, hits, uid, chat_id) -> bool:
+async def _try_premium_redirect(client, message, status, query, hits, uid, chat_id):
     try:
         import re as _re
-        from plugins.groups.shared import deep_link as DL
-
         title = hits[0].get("series_title") or hits[0].get("title") or query
         slug = _re.sub(r"[^a-z0-9]+", "_", str(title).lower()).strip("_")
 
@@ -1056,23 +842,14 @@ async def _try_premium_redirect(client, message, status, query, hits, uid, chat_
             f"{F.EMO['crown']} <b>{F.fb('PREMIUM MODE')}</b>",
             F.DIV, "",
             f"🎬 <b>{F.sc(str(title)[:50])}</b>",
-            f"📦 {len(hits)} ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ",
-            "",
-            F.DIV_S,
-            f"✅ ᴡᴀᴛᴄʜᴇᴅ ʟɪꜱᴛ",
-            f"✅ ɴᴇxᴛ ᴇᴘɪꜱᴏᴅᴇ",
-            f"✅ ᴡᴀᴛᴄʜ ᴏʀᴅᴇʀ",
             "",
             f"📌 ᴛᴀᴘ ᴛᴏ ᴏᴘᴇɴ ɪɴ ᴘᴍ",
         ])
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
                 f"{F.EMO['rocket']} {F.sc('open premium watch')}",
-                url=deep_link)],
-            [InlineKeyboardButton(
-                f"{F.EMO['cross']} {F.sc('cancel')}",
-                callback_data="sr:cancel")],
-        ])
+                url=deep_link),
+        ]])
         try:
             await status.edit_text(
                 text, reply_markup=kb,
@@ -1088,13 +865,131 @@ async def _try_premium_redirect(client, message, status, query, hits, uid, chat_
 
 
 # ============================================================
+# SUGGESTIONS
+# ============================================================
+
+async def _show_suggestions(client, target, query, items, uid, chat_id):
+    stored = [SUGG.to_dict(x) for x in items if x]
+    stored = [s for s in stored if s.get("title")]
+    if not stored:
+        return await _show_request_prompt(client, target, query)
+
+    sid = await DELIVERY.create_session(
+        user_id=uid, chat_id=chat_id, query=query, hits=[],
+    )
+    if not sid:
+        return await _edit_status(target, "❌ session error")
+
+    try:
+        from media_search import sessions as _sess_mod
+        await _sess_mod.sessions.update(sid, candidates=stored)
+    except Exception:
+        pass
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{F.EMO['search']} <b>{F.fb('DID YOU MEAN?')}</b>",
+        F.DIV, "",
+        f"🔍 <code>{F.sc(query[:50])}</code>",
+        "",
+        f"📌 {F.sc('tap a title below')}",
+    ])
+
+    disp = await SFLOW.get_suggestion_display(chat_id)
+    show_rating = disp["show_rating"]
+    show_year = disp["show_year"]
+    show_icon = disp["show_icon"]
+
+    rows = []
+    for i, s in enumerate(stored[:8]):
+        title = str(s.get("title") or "?")[:34]
+        year = s.get("year")
+        rating = s.get("rating") or 0
+        kind = str(s.get("kind") or "movie")
+
+        label = ""
+        if show_icon:
+            label += ("📺 " if kind == "series" else "🎬 ")
+        label += title
+        if show_year and year:
+            label += f" ({year})"
+        if show_rating and rating:
+            label += f" · ⭐{rating:.1f}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"sr:sug:{sid}:{i}")])
+
+    rows.append([InlineKeyboardButton(
+        f"🔍 {F.sc('search on google')}",
+        url=f"https://www.google.com/search?q={query}")])
+    rows.append([InlineKeyboardButton(
+        f"{F.EMO['cross']} {F.sc('close')}",
+        callback_data="sr:cancel")])
+
+    await _edit_or_send(target, text, InlineKeyboardMarkup(rows))
+
+
+# ============================================================
+# REQUEST
+# ============================================================
+
+async def _show_request_prompt(client, target, query):
+    try:
+        uid = target.from_user.id if target.from_user else 0
+        u = target.from_user
+        username = u.username if u else ""
+        full_name = u.first_name if u else ""
+
+        token = await RF.create_deferred_request(
+            user_id=uid, username=username or "",
+            full_name=full_name or "", title=query,
+            year=None, kind="series", tmdb_id=None,
+        )
+        if not token:
+            return await _edit_status(target, "❌ no results")
+
+        bot_username = ""
+        try:
+            me = await client.identity()
+            bot_username = me.username or ""
+        except Exception:
+            pass
+        if not bot_username:
+            return await _edit_status(target, "❌ no results")
+
+        deep_link = f"https://t.me/{bot_username}?start=req_{token}"
+
+        text = "\n".join([
+            f"{F.EMO['warn']} <b>{F.fb('NOT IN OUR DATABASE')}</b>",
+            F.DIV, "",
+            f"📺 <b>{F.sc(query[:60])}</b>",
+            "",
+            f"📌 {F.sc('tap below to send a request')}",
+        ])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{F.EMO['rocket']} {F.sc('send request')}",
+                url=deep_link)],
+            [InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('close')}",
+                callback_data="sr:cancel")],
+        ])
+        await _edit_or_send(target, text, kb)
+    except Exception as e:
+        logger.exception(f"[SERIES-H] request: {e}")
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
-async def _edit_or_send(target, text: str, kb) -> None:
+async def _edit_or_send(target, text, kb):
     try:
         await target.edit_text(
-            text[:4000], reply_markup=kb,
+            text[:4000],
+            reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -1103,10 +998,11 @@ async def _edit_or_send(target, text: str, kb) -> None:
             logger.debug(f"[SERIES-H] edit: {e}")
 
 
-async def _edit_status(target, text: str) -> None:
+async def _edit_status(target, text):
     try:
         await target.edit_text(
-            text[:4000], parse_mode=ParseMode.HTML,
+            text[:4000],
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except Exception:
@@ -1114,10 +1010,7 @@ async def _edit_status(target, text: str) -> None:
 
 
 def snapshot():
-    return {
-        "module": "groups.series.handler",
-        "wizard_sessions": len(_wizard),
-    }
+    return {"module": "groups.series.handler", "wizard": len(_wizard)}
 
 
 __all__ = ["series_group_entry", "series_wizard_router", "snapshot"]
