@@ -243,13 +243,20 @@ async def _run_series_pipeline(
     uid = message.from_user.id
     chat_id = message.chat.id
 
-    # ── 1. DB search (series-aware) ──
+       # ── 1. DB search (series-aware) ──
     hits, complete = await SEARCH.quick_search(query, is_series=True)
 
     if hits:
+        # ── Premium fast-path: if user is premium, redirect to PM ──
+        if await _is_user_premium(uid):
+            ok = await _try_premium_redirect(
+                client, message, status, query, hits, uid, chat_id,
+            )
+            if ok:
+                return
+
         await _start_wizard(client, status, query, hits, cfg, uid, chat_id)
         return
-
     if not complete:
         await _edit_status(
             status,
@@ -1130,6 +1137,110 @@ async def _edit_status(target: Message, text: str) -> None:
     except Exception as e:
         if "not modified" not in str(e).lower():
             logger.debug(f"[SERIES-H] status: {e}")
+
+
+# ============================================================
+# SECTION 15b — PREMIUM REDIRECT
+# ============================================================
+
+async def _is_user_premium(uid: int) -> bool:
+    """True if user has active premium."""
+    try:
+        from plugins.premium import state as PS
+        return await PS.is_premium(uid)
+    except Exception:
+        return False
+
+
+async def _try_premium_redirect(
+    client: Client,
+    message: Message,
+    status: Message,
+    query: str,
+    hits: List[Dict[str, Any]],
+    uid: int,
+    chat_id: int,
+) -> bool:
+    """
+    Create premium token + send deep-link.
+    Returns True on success, False → fall through to wizard.
+    """
+    try:
+        import re as _re
+        from plugins.groups.shared import deep_link as DL
+
+        title = (
+            hits[0].get("series_title")
+            or hits[0].get("title")
+            or query
+        )
+        slug = _re.sub(r"[^a-z0-9]+", "_", str(title).lower()).strip("_")
+
+        token = await DL.create_premium_token(
+            user_id=uid,
+            chat_id=chat_id,
+            title=str(title)[:200],
+            slug=slug[:100],
+            tmdb_id=None,
+            hits=hits,
+        )
+        if not token:
+            return False
+
+        # Bot username
+        bot_username = ""
+        try:
+            me = await client.identity()
+            bot_username = me.username or ""
+        except Exception:
+            pass
+        if not bot_username:
+            return False
+
+        deep_link = f"https://t.me/{bot_username}?start=prem_{token}"
+
+        text = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"{F.EMO['crown']} <b>{F.fb('PREMIUM MODE')}</b>",
+            F.DIV, "",
+            f"🎬 <b>{F.sc(str(title)[:50])}</b>",
+            f"📦 {len(hits)} ꜰɪʟᴇꜱ ꜰᴏᴜɴᴅ",
+            "",
+            F.DIV_S,
+            f"{F.EMO['spark']} ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀꜱ ɢᴇᴛ:",
+            f"✅ ᴡᴀᴛᴄʜᴇᴅ ʟɪꜱᴛ",
+            f"✅ ɴᴇxᴛ ᴇᴘɪꜱᴏᴅᴇ",
+            f"✅ ᴡᴀᴛᴄʜ ᴏʀᴅᴇʀ",
+            f"✅ ᴘʀᴏɢʀᴇꜱꜱ ᴛʀᴀᴄᴋɪɴɢ",
+            "",
+            f"📌 ᴛᴀᴘ ᴛᴏ ᴏᴘᴇɴ ɪɴ ᴘᴍ",
+        ])
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{F.EMO['rocket']} {F.sc('open premium watch')}",
+                url=deep_link,
+            )],
+            [InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('cancel')}",
+                callback_data="sr:cancel",
+            )],
+        ])
+
+        try:
+            await status.edit_text(
+                text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        return True
+
+    except Exception as e:
+        logger.exception(f"[SERIES-H] premium redirect: {e}")
+        return False
 
 
 # ============================================================
