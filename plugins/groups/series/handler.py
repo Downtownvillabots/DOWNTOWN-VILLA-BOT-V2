@@ -757,7 +757,7 @@ async def _render_delivery(client, target, uid):
     delivery_cfg = await SFLOW.get_delivery_settings(chat_id)
     hits = SEARCH.sort_hits(hits, mode=delivery_cfg["sort_order"])
 
-    not hits:
+    if not hits:
         await _show_request_prompt(client, target, query)
         return None
 
