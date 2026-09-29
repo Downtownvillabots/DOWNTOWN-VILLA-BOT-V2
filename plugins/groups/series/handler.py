@@ -1,8 +1,7 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (FINAL)
 # ============================================================
-# Quality pick → URL button → user taps → /start deliver_XXX → files
-# Works for both new and existing users (V1 style)
+# Quality tap → auto-opens PM with /start deliver_XXX → files
 # ============================================================
 
 from __future__ import annotations
@@ -604,13 +603,14 @@ async def _render_quality(client, target, uid):
 
 
 # ============================================================
-# DELIVERY — create token + show URL button
+# BUILD DELIVER LINK (used by quality tap)
 # ============================================================
 
-async def _render_delivery(client, target, uid):
+async def _build_deliver_link(client, uid) -> Optional[str]:
+    """Create deliver token + return the https://t.me/... deep-link."""
     s = _wiz_get(uid)
     if not s:
-        return
+        return None
 
     query = s.get("query") or "?"
     season = s.get("selected_season")
@@ -661,8 +661,6 @@ async def _render_delivery(client, target, uid):
         hits = sorted(by_ep.values(), key=_ep_num)
 
     if not hits:
-        _wiz_drop(uid)
-        await _show_request_prompt(client, target, query)
         return None
 
     token = await DL.create_deliver_token(
@@ -675,8 +673,6 @@ async def _render_delivery(client, target, uid):
         hits=hits,
     )
     if not token:
-        _wiz_drop(uid)
-        await _edit_status(target, "❌ token error")
         return None
 
     bot_username = ""
@@ -691,42 +687,13 @@ async def _render_delivery(client, target, uid):
             pass
 
     if not bot_username:
-        _wiz_drop(uid)
-        await _edit_status(target, "❌ bot username missing")
         return None
 
     deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
-    logger.info(f"[SERIES-H] token={token} link={deep_link}")
-
-    text = "\n".join([
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"{F.EMO['rocket']} <b>{F.fb('READY TO DELIVER')}</b>",
-        F.DIV, "",
-        f"🎬 <b>{F.sc(str(query)[:50])}</b>",
-        *([f"📺 <b>Season {int(season):02d}</b>"] if season else []),
-        *([f"🎯 <code>{quality}</code>"] if quality else []),
-        *([f"🔊 <code>{language}</code>"] if language else []),
-        "",
-        f"📁 <b>{len(hits)}</b> ꜰɪʟᴇꜱ",
-        "",
-        f"📌 ᴛᴀᴘ ᴛʜᴇ ʙᴜᴛᴛᴏɴ ʙᴇʟᴏᴡ",
-        f"📌 ꜰɪʟᴇꜱ ᴀʀʀɪᴠᴇ ɪɴ ᴘᴍ",
-    ])
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{F.EMO['rocket']} {F.sc('open bot pm')}",
-            url=deep_link,
-        )],
-        [InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data="sgw:close",
-        )],
-    ])
-
-    _wiz_drop(uid)
-    await _edit_or_send(target, text, kb)
-    return None
+    logger.info(
+        f"[SERIES-H] token={token} hits={len(hits)} link={deep_link}"
+    )
+    return deep_link
 
 
 # ============================================================
@@ -778,8 +745,35 @@ async def series_wizard_router(client, q: CallbackQuery):
         if action == "qual":
             quality = parts[2] if len(parts) > 2 else ""
             _wiz_set(uid, selected_quality=quality)
-            await q.answer(f"🎯 {quality}")
-            await _render_delivery(client, q.message, uid)
+
+            # Build link
+            deep_link = await _build_deliver_link(client, uid)
+
+            if not deep_link:
+                _wiz_drop(uid)
+                return await q.answer("❌ error — try again", show_alert=True)
+
+            # Update group message briefly
+            try:
+                await q.message.edit_text(
+                    "\n".join([
+                        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                        f"{F.EMO['rocket']} <b>{F.fb('OPENING PM...')}</b>",
+                        F.DIV, "",
+                        f"🎯 <code>{quality}</code>",
+                        "",
+                        f"📌 {F.sc('files will arrive in pm')}",
+                    ]),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+            _wiz_drop(uid)
+
+            # ⭐ Redirect user to PM (Telegram auto-sends /start deliver_XXX)
+            await q.answer(url=deep_link)
             return
 
         if action == "back":
