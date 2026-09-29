@@ -678,15 +678,93 @@ async def _render_delivery(client, target, uid):
                     by_ep[ep_int] = h
         hits = [by_ep[k] for k in sorted(by_ep.keys())]
 
-    delivery_cfg = await SFLOW.get_delivery_settings(chat_id)
-    hits = SEARCH.sort_hits(hits, mode=delivery_cfg["sort_order"])
-
+    # Sort by episode number (ascending) — overrides size sort
+    def _ep_num(h):
+        try:
+            return int(h.get("episode") or 0)
+        except (TypeError, ValueError):
+            return 0
+    hits = sorted(hits, key=_ep_num)
     if not hits:
         _wiz_drop(uid)
         await _show_request_prompt(client, target, query)
         return None
 
-    # Read group config
+       # ── Check if user has started the bot ──
+    user_started = False
+    try:
+        from database import db_registry
+        db = db_registry.get_user_db()
+        if db is not None:
+            doc = await db["users"].find_one(
+                {"user_id": uid}, {"_id": 1}
+            )
+            user_started = doc is not None
+    except Exception:
+        user_started = False
+
+    # ── If NOT started: show redirect button + create token ──
+    if not user_started:
+        logger.info(f"[SERIES-H] user {uid} never started bot → redirect button")
+
+        token = await DL.create_deliver_token(
+            user_id=uid,
+            chat_id=chat_id,
+            title=query,
+            season=int(season or 0),
+            quality=str(quality or "UNKNOWN"),
+            language=str(language),
+            hits=hits,
+        )
+        if not token:
+            _wiz_drop(uid)
+            await _edit_status(target, "❌ token error")
+            return None
+
+        bot_username = ""
+        try:
+            me = await client.identity()
+            bot_username = me.username or ""
+        except Exception:
+            pass
+
+        if not bot_username:
+            _wiz_drop(uid)
+            await _edit_status(target, "❌ bot username missing")
+            return None
+
+        deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
+
+        text = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"{F.EMO['rocket']} <b>{F.fb('START THE BOT FIRST')}</b>",
+            F.DIV, "",
+            f"🎬 <b>{F.sc(str(query)[:50])}</b>",
+            *([f"📺 <b>Season {int(season):02d}</b>"] if season else []),
+            *([f"🎯 <code>{quality}</code>"] if quality else []),
+            "",
+            f"📁 <b>{len(hits)}</b> ꜰɪʟᴇꜱ ʀᴇᴀᴅʏ",
+            "",
+            f"📌 {F.sc('you need to start the bot first')}",
+            f"📌 {F.sc('tap below then press START')}",
+        ])
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{F.EMO['rocket']} {F.sc('start bot')}",
+                url=deep_link,
+            )],
+            [InlineKeyboardButton(
+                f"{F.EMO['cross']} {F.sc('cancel')}",
+                callback_data="sgw:close",
+            )],
+        ])
+
+        _wiz_drop(uid)
+        await _edit_or_send(target, text, kb)
+        return None
+
+    # ── User HAS started → deliver directly ──
     cfg = await S.get_config(chat_id)
     caption_tpl = cfg.get("caption_template") or ""
     custom_buttons = cfg.get("result_buttons") or []
