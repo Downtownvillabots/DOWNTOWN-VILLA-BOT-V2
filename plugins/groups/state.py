@@ -1,15 +1,29 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — GROUPS STATE
+# 🏨 DOWNTOWN VILLA — GROUPS STATE (v2 — FULL CUSTOMIZATION)
 # ============================================================
 #
-# Per-group configuration layer.
+# Per-group configuration layer. EVERY feature is controllable
+# per group from Telegram. No code deploy needed.
 #
-# Storage:  USER DB → `groups` collection (one doc per chat_id)
-# Cache:    in-memory, 5 min TTL, keyed by chat_id
+# Storage:  USER DB → `groups` collection
+# Cache:    in-memory, 5 min TTL
 #
-# Every setting the panel exposes lives here as a default.
-# Custom per-group overrides are merged on top of defaults —
-# so adding a new field in code auto-populates existing groups.
+# Sections:
+#   basic       → enabled, content_mode, search_enabled, pm_search_enabled
+#   flow        → per-step enable + per_row + order + auto_skip
+#   search      → spell_check threshold, suggestions count, thresholds
+#   imdb        → provider toggles, fuzzy thresholds
+#   buttons     → result buttons, per_row, size, quality format
+#   caption     → template
+#   welcome     → welcome message + auto-delete
+#   auto_delete → bot/user/command timers
+#   filters     → banned words + links
+#   fsub        → force-sub channels
+#   verify      → shortener + timer
+#   security    → url/telegram link blocking, flood control
+#   requests    → enabled, channel, PM update
+#   metadata    → poster/rating/genre/year toggles
+#   stats       → counters
 #
 # ============================================================
 
@@ -31,24 +45,76 @@ DEFAULT_CFG: Dict[str, Any] = {
 
     # ── BASIC ──
     "enabled": True,
-    "content_mode": "both",          # movie | series | both
+    "content_mode": "both",              # movie | series | both
     "search_enabled": True,
     "pm_search_enabled": True,
 
-    # ── SEARCH FLOW (per-group override of flow_engine) ──
+    # ── FLOW ORDER (per group, list of step keys) ──
+    # If empty → use plugin defaults
+    "flow_order": {
+        "series": [],
+        "movie": [],
+    },
+
+    # ── FLOW PER-STEP CONFIG ──
     "flow": {
-        "base_search":    {"enabled": True, "per_row": 1},
-        "spell_check":    {"enabled": True, "threshold": 85},
-        "suggestions":    {"enabled": True, "per_row": 1, "max_items": 8},
-        "language":       {"enabled": True, "per_row": 2, "auto_skip": True},
-        "season":         {"enabled": True, "per_row": 2, "auto_skip": True},
-        "episode":        {"enabled": True, "per_row": 4, "per_page": 20},
-        "quality":        {"enabled": True, "per_row": 2, "auto_skip": True},
-        "file_delivery":  {"enabled": True, "auto_delete": True},
+        "base_search":   {"enabled": True, "per_row": 1},
+        "spell_check":   {"enabled": True, "threshold": 82, "max_corrections": 1},
+        "suggestions":   {"enabled": True, "per_row": 1, "max_items": 6,
+                          "min_score": 45, "provider": "both"},
+        "language":      {"enabled": True, "per_row": 2, "auto_skip": True,
+                          "max_items": 12},
+        "season":        {"enabled": True, "per_row": 2, "auto_skip": True,
+                          "max_items": 12},
+        "episode":       {"enabled": True, "per_row": 4, "auto_skip": True,
+                          "max_items": 20, "per_page": 20},
+        "quality":       {"enabled": True, "per_row": 2, "auto_skip": True,
+                          "max_items": 8},
+        "file_delivery": {"enabled": True, "per_row": 1, "max_items": 10,
+                          "sort_order": "small_to_big"},
+    },
+
+    # ── SEARCH TUNING ──
+    "search": {
+        # Spell check accuracy (0-100, higher = stricter)
+        "spell_threshold": 82,
+        # How many times to retry with corrections
+        "max_corrections": 1,
+        # Auto-correct confidence threshold (never below this)
+        "min_correction_score": 80,
+        # Search cache TTL (seconds)
+        "cache_ttl": 300,
+        # Case-insensitive matching
+        "case_insensitive": True,
+        # Max results from DB before paging
+        "search_per_page": 10,
+        "search_per_row": 1,
+    },
+
+    # ── IMDb / PROVIDERS ──
+    "imdb": {
+        # Enable IMDb suggestions
+        "enabled": True,
+        # Enable TMDB suggestions
+        "tmdb_enabled": True,
+        # Min fuzzy score to accept a suggestion (0-100)
+        "min_match_score": 45,
+        # How many providers to query
+        "max_providers": 2,
+        # Boost year match
+        "year_boost": 5,
+        # Show ratings in suggestion buttons
+        "show_rating": True,
+        # Show year in suggestion buttons
+        "show_year": True,
+        # Show type icon (🎬/📺)
+        "show_icon": True,
+        # Suggestion action: "search" | "request" | "both"
+        "on_pick": "both",
     },
 
     # ── CAPTION ──
-    "caption_template": None,        # None → use global default
+    "caption_template": None,            # None → global default
     "caption_variables": {
         "title": "{title}",
         "quality": "{quality}",
@@ -58,8 +124,12 @@ DEFAULT_CFG: Dict[str, Any] = {
     },
 
     # ── RESULT BUTTONS ──
-    "result_buttons": [],            # [{name, url, enabled, position}]
+    "result_buttons": [],
     "buttons_per_row": 2,
+    "button_size_format": "short",       # short | full
+    "button_show_quality": True,
+    "button_show_name": True,
+    "button_name_max_len": 34,
 
     # ── WELCOME ──
     "welcome_enabled": False,
@@ -131,7 +201,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "language": True,
     },
 
-    # ── STATS (rolling counters) ──
+    # ── STATS ──
     "stats": {
         "searches_today": 0,
         "results_found": 0,
@@ -140,7 +210,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "updated_at": None,
     },
 
-    # ── META (system) ──
+    # ── META ──
     "created_at": None,
     "updated_at": None,
     "title": None,
@@ -149,12 +219,12 @@ DEFAULT_CFG: Dict[str, Any] = {
 
 
 # ============================================================
-# SECTION 2 — IN-MEMORY CACHE
+# SECTION 2 — CACHE
 # ============================================================
 
 _CACHE: Dict[int, Dict[str, Any]] = {}
 _CACHE_TS: Dict[int, float] = {}
-_CACHE_TTL = 300.0                   # 5 min
+_CACHE_TTL = 300.0
 
 
 def _cache_get(chat_id: int) -> Optional[Dict[str, Any]]:
@@ -186,7 +256,6 @@ def invalidate_all() -> None:
 # ============================================================
 
 def _coll():
-    """Return the `groups` collection from USER DB."""
     try:
         from database import db_registry
         db = db_registry.get_user_db()
@@ -201,10 +270,6 @@ def _coll():
 # ============================================================
 
 def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Recursively merge `patch` on top of `base`.
-    Nested dicts merge deeply; everything else overwrites.
-    """
     out = dict(base)
     for k, v in (patch or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -219,12 +284,7 @@ def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 async def get_config(chat_id: int, use_cache: bool = True) -> Dict[str, Any]:
-    """
-    Return the merged config for a group.
-    Falls back to DEFAULT_CFG for unknown groups.
-    """
     cid = int(chat_id)
-
     if use_cache:
         cached = _cache_get(cid)
         if cached is not None:
@@ -260,15 +320,9 @@ async def get_config(chat_id: int, use_cache: bool = True) -> Dict[str, Any]:
 # ============================================================
 
 async def save_field(chat_id: int, field_path: str, value: Any) -> bool:
-    """
-    Save one field. Supports dot notation:
-        save_field(cid, "auto_delete.bot_timer", 600)
-        save_field(cid, "flow.language.enabled", False)
-    """
     coll = _coll()
     if coll is None:
         return False
-
     try:
         now = datetime.utcnow()
         await coll.update_one(
@@ -293,11 +347,9 @@ async def save_field(chat_id: int, field_path: str, value: Any) -> bool:
 
 
 async def save_fields(chat_id: int, fields: Dict[str, Any]) -> bool:
-    """Bulk-save a flat dict of fields."""
     coll = _coll()
     if coll is None:
         return False
-
     try:
         now = datetime.utcnow()
         payload = dict(fields)
@@ -321,7 +373,7 @@ async def save_fields(chat_id: int, fields: Dict[str, Any]) -> bool:
 
 
 # ============================================================
-# SECTION 7 — REGISTER / RESET / LIST
+# SECTION 7 — LIFECYCLE
 # ============================================================
 
 async def register_group(
@@ -329,18 +381,14 @@ async def register_group(
     title: str = "",
     username: str = "",
 ) -> bool:
-    """
-    Idempotent — creates the group doc if it doesn't exist,
-    updates title/username if it does.
-    """
     coll = _coll()
     if coll is None:
         return False
-
     try:
         now = datetime.utcnow()
         payload = {k: v for k, v in DEFAULT_CFG.items()
-                   if k not in ("created_at", "updated_at", "title", "username")}
+                   if k not in ("created_at", "updated_at",
+                                "title", "username")}
         await coll.update_one(
             {"chat_id": int(chat_id)},
             {
@@ -365,15 +413,12 @@ async def register_group(
 
 
 async def reset_config(chat_id: int) -> bool:
-    """Wipe custom config → restore defaults. Keeps title/username/created_at."""
     coll = _coll()
     if coll is None:
         return False
-
     try:
         doc = await coll.find_one({"chat_id": int(chat_id)}) or {}
         now = datetime.utcnow()
-
         fresh = {
             "chat_id": int(chat_id),
             "title": doc.get("title"),
@@ -385,7 +430,6 @@ async def reset_config(chat_id: int) -> bool:
             if k in ("created_at", "updated_at", "title", "username"):
                 continue
             fresh[k] = v
-
         await coll.replace_one(
             {"chat_id": int(chat_id)},
             fresh,
@@ -399,11 +443,9 @@ async def reset_config(chat_id: int) -> bool:
 
 
 async def delete_group(chat_id: int) -> bool:
-    """Permanently remove a group's config."""
     coll = _coll()
     if coll is None:
         return False
-
     try:
         r = await coll.delete_one({"chat_id": int(chat_id)})
         _cache_invalidate(int(chat_id))
@@ -414,23 +456,16 @@ async def delete_group(chat_id: int) -> bool:
 
 
 async def list_groups(limit: int = 50) -> List[Dict[str, Any]]:
-    """Return most recent group docs (title sorted)."""
     coll = _coll()
     if coll is None:
         return []
-
     try:
-        cursor = (
-            coll.find({})
-            .sort("title", 1)
-            .limit(int(limit))
-        )
+        cursor = coll.find({}).sort("title", 1).limit(int(limit))
         docs = await cursor.to_list(length=int(limit))
         for d in docs:
             d.pop("_id", None)
         return docs
-    except Exception as e:
-        logger.debug(f"[GROUPS] list: {e}")
+    except Exception:
         return []
 
 
@@ -445,15 +480,13 @@ async def count_groups() -> int:
 
 
 # ============================================================
-# SECTION 8 — STATS HELPERS
+# SECTION 8 — STATS
 # ============================================================
 
 async def bump_stat(chat_id: int, key: str, amount: int = 1) -> bool:
-    """Increment a counter inside `stats.<key>`."""
     coll = _coll()
     if coll is None:
         return False
-
     try:
         await coll.update_one(
             {"chat_id": int(chat_id)},
@@ -479,15 +512,10 @@ async def bump_stat(chat_id: int, key: str, amount: int = 1) -> bool:
 
 __all__ = [
     "DEFAULT_CFG",
-    # Read
     "get_config",
-    # Write
     "save_field", "save_fields",
-    # Lifecycle
     "register_group", "reset_config", "delete_group",
     "list_groups", "count_groups",
-    # Cache
     "invalidate_all",
-    # Stats
     "bump_stat",
 ]
