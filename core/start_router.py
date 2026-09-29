@@ -30,6 +30,7 @@ import logging
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -590,6 +591,68 @@ async def _handle_deliver(client, message, prefix, extra):
     except Exception as e:
         logger.exception(f"[START] deliver: {e}")
         return False
+
+
+# ============================================================
+# DELIVERY HELPERS
+# ============================================================
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return ""
+
+
+def _safe_caption(template: str, ctx: dict, fallback: str) -> str:
+    """Format caption safely — missing placeholders become empty."""
+    if not template:
+        return fallback
+    try:
+        return template.format_map(_SafeDict(ctx))
+    except Exception:
+        return fallback
+
+
+def _build_custom_kb(buttons):
+    """Build InlineKeyboardMarkup from group result_buttons."""
+    if not buttons:
+        return None
+    rows = []
+    for b in buttons:
+        if not isinstance(b, dict):
+            continue
+        if not b.get("enabled", True):
+            continue
+        name = str(b.get("name") or "")[:60]
+        url = str(b.get("url") or "").strip()
+        if not name or not url:
+            continue
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif not (url.startswith("http://")
+                  or url.startswith("https://")
+                  or url.startswith("tg://")):
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                continue
+        rows.append([InlineKeyboardButton(name, url=url)])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _auto_delete_batch(client, chat_id: int, msg_ids: List[int], seconds: int):
+    """Delete all messages after N seconds."""
+    try:
+        await asyncio.sleep(seconds)
+        for mid in msg_ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception:
+                pass
+        logger.info(f"[START] auto-deleted {len(msg_ids)} msgs for {chat_id}")
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.debug(f"[START] auto-delete: {e}")
 
 # ── REQ (deferred request from new user) ──
 
