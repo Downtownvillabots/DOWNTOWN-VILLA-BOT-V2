@@ -2,14 +2,16 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (v1 UX · v2 POWER)
 # ============================================================
-# ONE file. All v1 behaviour + all v2 features.
-#
 # Flow:
 #   group text → search → suggestions → language → season
-#             → [episode] → quality (direct PM URL) → PM delivery
+#             → [episode] → quality → PM delivery
+#
+# Quality screen behaviour:
+#   • User already started bot → quality deep-link buttons
+#   • User never started bot    → single "START BOT" button
 #
 # Callback prefix: sg:
-# Handler group: -9999 (runs before movie handler at -510)
+# Handler group: -9999
 # ============================================================
 
 from __future__ import annotations
@@ -231,6 +233,29 @@ def cleanup_cooldown() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3b — USER STARTED CHECK (v1-style delivery gate)
+# ═══════════════════════════════════════════════════════════════════════════
+async def user_started_bot(uid: int) -> bool:
+    """
+    True if the user has ever started the bot (a `users` doc exists).
+    Fails open — if we can't verify, we treat them as started so
+    they still get the direct deep-link quality buttons.
+    """
+    try:
+        from database import db_registry
+        db = db_registry.get_user_db()
+        if db is None:
+            return True
+        doc = await db["users"].find_one(
+            {"user_id": int(uid)}, {"_id": 1},
+        )
+        return doc is not None
+    except Exception as e:
+        logger.debug(f"[SERIES-H] user_started check: {e}")
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SECTION 4 — FLOW LAYOUT READERS
 # ═══════════════════════════════════════════════════════════════════════════
 async def get_per_row(chat_id: int, key: str, default: int = 2) -> int:
@@ -335,6 +360,24 @@ def view_qualities(title: str, season: int, count: int) -> str:
         DIV, "", f"🎯 <b>{sc('pick quality')}</b>",
         "", f"📁 <code>{count}</code> ꜰɪʟᴇꜱ ᴛᴏ ꜱᴇɴᴅ",
         f"📩 <i>ᴛᴀᴘ ᴀ ǫᴜᴀʟɪᴛʏ ᴛᴏ ɢᴇᴛ ꜰɪʟᴇꜱ ɪɴ ʙᴏᴛ ᴘᴍ</i>",
+    ])
+
+
+def view_start_bot_first(
+    title: str, season: int, quality: str, count: int,
+) -> str:
+    return "\n".join([
+        f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"{F.EMO['rocket']} <b>{fb('START THE BOT FIRST')}</b>",
+        DIV, "",
+        f"🎬 <b>{esc(title)}</b>",
+        f"📺 <b>Season {int(season):02d}</b>",
+        f"🎯 <code>{esc(quality)}</code>",
+        "", f"📁 <code>{count}</code> ᴇᴘɪꜱᴏᴅᴇꜱ ʀᴇᴀᴅʏ",
+        "",
+        f"📌 {sc('tap the button below')}",
+        f"📌 {sc('then press START in telegram')}",
+        f"📌 {sc('files will arrive in your pm')}",
     ])
 
 
@@ -470,7 +513,8 @@ def kb_episodes(
 
 
 def kb_qualities(
-    qual_items: List[Tuple[str, str]], per_row: int = 2, max_items: int = 12,
+    qual_items: List[Tuple[str, str]],
+    per_row: int = 2, max_items: int = 12,
 ) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
@@ -1416,7 +1460,6 @@ async def render_episode(
     filtered = c.get("filtered_hits") or s["data"].get("hits") or []
     season_hits = SEARCH.filter_by_season(filtered, season_i)
 
-    # GUARANTEE files_by_season is populated before any checks
     c["files_by_season"] = season_hits or filtered
     sess_set(uid, chosen=c)
 
@@ -1451,6 +1494,9 @@ async def render_episode(
     await render(client, chat_id, target.id, text, kb, None)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 17b — QUALITY (v1 UX with user-started gate)
+# ═══════════════════════════════════════════════════════════════════════════
 async def render_quality(
     client: Client, target: Message, uid: int,
 ) -> None:
@@ -1465,7 +1511,7 @@ async def render_quality(
     episode = c.get("selected_episode")
     language = c.get("selected_language") or ""
 
-    # ROBUST FILE RESOLUTION: Always ensure we have files
+    # ── Resolve file list ──
     files = c.get("files_by_season")
     if not files:
         filtered = c.get("filtered_hits") or s["data"].get("hits") or []
@@ -1491,10 +1537,9 @@ async def render_quality(
         except (TypeError, ValueError):
             pass
 
-    # Extract qualities
+    # ── Extract qualities ──
     quals = SEARCH.unique_qualities(files) if files else []
 
-    # FALLBACK: If SEARCH.unique_qualities returned empty, inspect files directly
     if not quals and files:
         raw_quals = set()
         for f in files:
@@ -1504,7 +1549,6 @@ async def render_quality(
         if raw_quals:
             quals = sorted(list(raw_quals))
         else:
-            # Files in DB have no explicit quality field - provide fallback
             quals = ["Original"]
 
     if not quals:
@@ -1514,7 +1558,6 @@ async def render_quality(
     c["files_for_quality"] = files
     sess_set(uid, chosen=c)
 
-    # Auto-skip single quality if enabled
     if len(quals) == 1 and await step_auto_skip(chat_id, "quality"):
         sess_set(uid, selected_quality=quals[0])
         return await advance(client, target, uid, "quality")
@@ -1565,46 +1608,117 @@ async def render_quality(
 
     season_i = int(season) if season is not None else 0
 
-    # ── Pre-generate Quality Deep-Link Buttons ──
-    qual_items: List[Tuple[str, str]] = []
-    for q in quals:
-        q_up = str(q).upper()
-        if q_up == "ORIGINAL":
-            matching = list(files)
-        else:
-            matching = [
-                f for f in files
-                if str(f.get("quality") or "").upper() == q_up
-            ]
-            if not matching:
+    # ── Check if user has started the bot ──
+    started = await user_started_bot(uid)
+    logger.info(f"[SERIES-H] quality: uid={uid} started={started}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CASE A — USER ALREADY STARTED BOT
+    #           Show each quality as a direct deep-link button → PM
+    # ═══════════════════════════════════════════════════════════════════════
+    if started:
+        qual_items: List[Tuple[str, str]] = []
+        for q in quals:
+            q_up = str(q).upper()
+            if q_up == "ORIGINAL":
+                matching = list(files)
+            else:
                 matching = [
                     f for f in files
-                    if not f.get("quality") or str(f.get("quality")).upper() == "UNKNOWN"
+                    if str(f.get("quality") or "").upper() == q_up
                 ]
-            if not matching:
-                matching = list(files)
+                if not matching:
+                    matching = [
+                        f for f in files
+                        if not f.get("quality")
+                        or str(f.get("quality")).upper() == "UNKNOWN"
+                    ]
+                if not matching:
+                    matching = list(files)
 
-        matching = _dedupe_episodes(matching)
+            matching = _dedupe_episodes(matching)
 
-        token = await DL.create_deliver_token(
-            user_id=uid, chat_id=chat_id,
-            title=title, season=season_i,
-            quality=str(q), language=str(language),
-            hits=matching,
+            token = await DL.create_deliver_token(
+                user_id=uid, chat_id=chat_id,
+                title=title, season=season_i,
+                quality=str(q), language=str(language),
+                hits=matching,
+            )
+            if token:
+                deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
+                qual_items.append((str(q), deep_link))
+
+        if not qual_items:
+            return await render(
+                client, chat_id, target.id,
+                "\n".join([
+                    f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
+                    f"❌ <b>{fb('NO FILES AVAILABLE')}</b>",
+                    DIV, "",
+                    f"📌 {sc('unable to package files for delivery')}",
+                ]),
+                InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "❌ CLOSE", callback_data="sg:close",
+                    ),
+                ]]),
+                None,
+            )
+
+        per_row = await get_per_row(chat_id, "quality", 2)
+        max_items = await get_max_items(chat_id, "quality", 12)
+
+        text = view_qualities(title, season_i, len(files))
+        kb = kb_qualities(qual_items, per_row, max_items)
+
+        await render(client, chat_id, target.id, text, kb, None)
+        logger.info(
+            f"[SERIES-H] quality screen (existing user) "
+            f"uid={uid} quals={[q for q, _ in qual_items]}"
         )
+        return
 
-        if token:
-            deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
-            qual_items.append((str(q), deep_link))
+    # ═══════════════════════════════════════════════════════════════════════
+    # CASE B — USER NEVER STARTED BOT
+    #           Show "START BOT FIRST" card with single button
+    # ═══════════════════════════════════════════════════════════════════════
+    default_quality = quals[0]  # highest-ranked
+    q_up = str(default_quality).upper()
 
-    if not qual_items:
+    if q_up == "ORIGINAL":
+        matching = list(files)
+    else:
+        matching = [
+            f for f in files
+            if str(f.get("quality") or "").upper() == q_up
+        ]
+        if not matching:
+            matching = [
+                f for f in files
+                if not f.get("quality")
+                or str(f.get("quality")).upper() == "UNKNOWN"
+            ]
+        if not matching:
+            matching = list(files)
+
+    matching = _dedupe_episodes(matching)
+
+    token = await DL.create_deliver_token(
+        user_id=uid, chat_id=chat_id,
+        title=title, season=season_i,
+        quality=str(default_quality),
+        language=str(language),
+        hits=matching,
+    )
+
+    if not token:
         return await render(
             client, chat_id, target.id,
             "\n".join([
                 f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"❌ <b>{fb('NO FILES AVAILABLE')}</b>",
+                f"❌ <b>{fb('ERROR')}</b>",
                 DIV, "",
-                f"📌 {sc('unable to package files for delivery')}",
+                f"📌 {sc('please try again')}",
             ]),
             InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
@@ -1612,17 +1726,30 @@ async def render_quality(
             None,
         )
 
-    per_row = await get_per_row(chat_id, "quality", 2)
-    max_items = await get_max_items(chat_id, "quality", 12)
+    deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
 
-    text = view_qualities(title, season_i, len(files))
-    kb = kb_qualities(qual_items, per_row, max_items)
+    text = view_start_bot_first(
+        title, season_i, str(default_quality), len(matching),
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{F.EMO['rocket']} {sc('START BOT & GET FILES')}",
+            url=deep_link,
+        )],
+        [InlineKeyboardButton(
+            "❌ CLOSE", callback_data="sg:close",
+        )],
+    ])
 
     await render(client, chat_id, target.id, text, kb, None)
+    logger.info(
+        f"[SERIES-H] start-bot card uid={uid} "
+        f"default_q={default_quality} files={len(matching)}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 18 — DELIVERY (fallback)
+# SECTION 18 — DELIVERY (fallback — only triggered if quality step disabled)
 # ═══════════════════════════════════════════════════════════════════════════
 async def deliver_to_pm(
     client: Client, target: Message, uid: int,
@@ -1652,8 +1779,11 @@ async def deliver_to_pm(
         if f_q == q_up:
             final.append(f)
     if not final:
-        final = [f for f in files if not f.get("quality")
-                 or str(f.get("quality")).upper() == "UNKNOWN"]
+        final = [
+            f for f in files
+            if not f.get("quality")
+            or str(f.get("quality")).upper() == "UNKNOWN"
+        ]
     if not final:
         final = list(files)
 
@@ -1841,7 +1971,8 @@ async def cb_pick(client: Client, q: CallbackQuery):
                         f"📌 {sc('admin will review your request')}",
                     ]),
                     InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
+                        InlineKeyboardButton("❌ CLOSE",
+                                              callback_data="sg:close"),
                     ]]),
                     None,
                 )
@@ -1859,7 +1990,8 @@ async def cb_pick(client: Client, q: CallbackQuery):
                     f"📌 {sc('not available right now')}",
                 ]),
                 InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
+                    InlineKeyboardButton("❌ CLOSE",
+                                          callback_data="sg:close"),
                 ]]),
                 None,
             )
@@ -1919,7 +2051,8 @@ async def cb_request(client: Client, q: CallbackQuery):
                     f"📌 {sc('admin will review soon')}",
                 ]),
                 InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
+                    InlineKeyboardButton("❌ CLOSE",
+                                          callback_data="sg:close"),
                 ]]),
                 None,
             )
@@ -1978,7 +2111,6 @@ async def cb_seas(client: Client, q: CallbackQuery):
         season = int(merged[idx]["season"])
         c["selected_season"] = season
 
-        # PRE-FILTER AND POPULATE files_by_season IMMEDIATELY
         filtered = c.get("filtered_hits") or s["data"].get("hits") or []
         try:
             c["files_by_season"] = SEARCH.filter_by_season(filtered, season)
@@ -2247,7 +2379,8 @@ async def cb_greq_search(client: Client, q: CallbackQuery):
                     f"📌 {sc('try again in a few minutes')}",
                 ]),
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
+                    InlineKeyboardButton("❌ CLOSE",
+                                          callback_data="sg:close"),
                 ]]),
                 parse_mode=ParseMode.HTML,
             )
@@ -2365,5 +2498,6 @@ __all__ = [
     "smart_db_search", "enrich_with_tmdb",
     "post_to_request_channel", "get_request", "update_request",
     "check_fsub", "kb_fsub",
+    "user_started_bot",
     "snapshot",
 ]
