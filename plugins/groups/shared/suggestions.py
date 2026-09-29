@@ -1,43 +1,32 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — GROUPS SHARED SUGGESTIONS
+# 🏨 DOWNTOWN VILLA — GROUPS SHARED SUGGESTIONS (v2)
 # ============================================================
 #
 # Spell correction + IMDb/TMDB suggestion engine.
-# Used when DB has no exact match.
+# Every accuracy setting is now PER-GROUP:
 #
-# Handles:
-#   • Repeated chars        → karrrnnan  → karnan
-#   • Missing chars         → karnne     → karnan
-#   • Transposed chars      → karnna     → karnan
-#   • Word splitting        → brking bad → breaking bad
-#   • Word merging          → breakingbad → breaking bad
-#   • Common OCR mistakes   → 0↔o, 1↔l, 5↔s
+#   • Spell check threshold (60-95)      → cfg.flow.spell_check.threshold
+#   • Max corrections (1-3)              → cfg.flow.spell_check.max_corrections
+#   • Suggestion min score (30-80)       → cfg.flow.suggestions.min_score
+#   • Provider (tmdb | imdb | both)      → cfg.flow.suggestions.provider
+#   • Show rating/year/icon              → cfg.flow.suggestions.show_*
 #
-# Providers (in order of trust):
-#   1. TMDB (movie + TV)     — primary
-#   2. OMDB (IMDb)           — if key present
-#   3. Local DB titles       — last resort (fuzzy over indexed titles)
+# Handles typos:
+#   karrrnnan  → Karnan       (repeat collapse)
+#   karnne     → Karnan       (missing letter)
+#   kar4nan    → Karnan       (OCR: 4→a)
+#   brking bad → Breaking Bad (word split)
+#   breakingbad→ Breaking Bad (word merge)
 #
 # Public API:
-#   clean_query(raw)                        → normalized string
-#   ai_spell_check(text, is_series)         → corrected title | None
-#   suggestions(query, year, kind, limit)   → list[dict]
-#   to_dict(suggestion)                     → JSON-safe dict
+#   clean_query(raw)                        → str
+#   get_suggestions_for_group(chat_id, query, kind, limit) → list[dict]
+#   ai_spell_check_for_group(chat_id, text, is_series) → str | None
 #
-# Suggestion dict shape:
-#   {
-#     "title":       "Karnan",
-#     "year":        "2021",
-#     "rating":      9.1,
-#     "votes":       12500,
-#     "kind":        "movie",      # or "series"
-#     "tmdb_id":     789456,
-#     "imdb_id":     "tt1234567",
-#     "poster":      "/abc.jpg",
-#     "overview":    "short plot...",
-#     "score":       92.5,
-#     "source":      "tmdb" | "imdb" | "db",
-#   }
+#   # Low-level (still available for direct use):
+#   suggestions(query, year, kind, limit, cfg)  → list[dict]
+#   ai_spell_check(text, is_series, cfg)        → str | None
+#   to_dict(s) / to_many(list)
 #
 # ============================================================
 
@@ -58,8 +47,7 @@ logger = logging.getLogger(__name__)
 _CACHE_TTL = 3600.0
 _cache: Dict[str, Tuple[float, Any]] = {}
 
-
-# Regex patterns
+# ── Regex ──
 _RE_EXT = re.compile(
     r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mpg|mpeg)$",
     re.IGNORECASE,
@@ -68,7 +56,6 @@ _RE_BRACKETS = re.compile(r"[\[\{\(][^\]\}\)]*[\]\}\)]")
 _RE_NON_WORD = re.compile(r"[^\w\s]+")
 _RE_SPACES = re.compile(r"\s+")
 
-# Junk tokens to strip
 _RE_JUNK = re.compile(
     r"\b(?:"
     r"www\.[a-z0-9.-]+|t\.me/[a-z0-9_]+|telegram\.me/[a-z0-9_]+|"
@@ -88,24 +75,32 @@ _RE_JUNK = re.compile(
     re.IGNORECASE,
 )
 
-
-# Common substitutions to normalize BEFORE fuzzy compare
+# OCR map
 _OCR_MAP = str.maketrans({
-    "0": "o",
-    "1": "l",
-    "3": "e",
-    "4": "a",
-    "5": "s",
-    "7": "t",
-    "8": "b",
-    "9": "g",
-    "$": "s",
-    "@": "a",
+    "0": "o", "1": "l", "3": "e", "4": "a", "5": "s",
+    "7": "t", "8": "b", "9": "g", "$": "s", "@": "a",
 })
 
 
 # ============================================================
-# SECTION 2 — CACHING
+# SECTION 2 — DEFAULT CFG (used when caller doesn't pass one)
+# ============================================================
+
+_DEFAULT_CFG: Dict[str, Any] = {
+    "spell_threshold": 82,
+    "max_corrections": 1,
+    "min_corrections_score": 80,
+    "suggestion_min_score": 45,
+    "suggestion_provider": "both",
+    "suggestion_count": 6,
+    "show_rating": True,
+    "show_year": True,
+    "show_icon": True,
+}
+
+
+# ============================================================
+# SECTION 3 — CACHE
 # ============================================================
 
 def _cache_get(key: str) -> Optional[Any]:
@@ -123,54 +118,32 @@ def _cache_set(key: str, value: Any) -> None:
 
 
 # ============================================================
-# SECTION 3 — QUERY CLEANING
+# SECTION 4 — QUERY CLEANING
 # ============================================================
 
 def clean_query(raw: str) -> str:
-    """
-    Strip extension, brackets, junk tokens, punctuation.
-    Returns a lowercase, space-collapsed string.
-    """
     if not raw:
         return ""
     try:
         t = str(raw).strip()
-
-        # Remove extension
         t = _RE_EXT.sub("", t)
-
-        # Remove bracketed groups
         t = _RE_BRACKETS.sub(" ", t)
-
-        # Remove junk tokens
         t = _RE_JUNK.sub(" ", t)
-
-        # Replace separators with spaces
         t = t.replace(".", " ").replace("_", " ").replace("-", " ")
-
-        # Strip non-word (keep spaces)
         t = _RE_NON_WORD.sub(" ", t)
-
-        # Collapse whitespace
         t = _RE_SPACES.sub(" ", t).strip().lower()
-
         return t
     except Exception:
         return str(raw).strip().lower()
 
 
 def _collapse_repeats(s: str) -> str:
-    """
-    Collapse 3+ same letters to 1, keep 2-letter pairs (e.g. "oo" in "book").
-    karrrnnan → karnan
-    """
     if not s:
         return ""
     return re.sub(r"(.)\1{2,}", r"\1", s)
 
 
 def _apply_ocr_map(s: str) -> str:
-    """0→o, 1→l, etc."""
     if not s:
         return ""
     return s.translate(_OCR_MAP)
@@ -183,41 +156,27 @@ def _tokens(s: str) -> List[str]:
 
 
 # ============================================================
-# SECTION 4 — FUZZY SCORING
+# SECTION 5 — FUZZY SCORING
 # ============================================================
 
 def _score_pair(query: str, candidate: str) -> float:
-    """
-    Return 0-100 score. Tries multiple rapidfuzz scorers,
-    picks the highest.
-    """
     if not query or not candidate:
         return 0.0
-
     q = query.lower().strip()
     c = candidate.lower().strip()
-
     if not q or not c:
         return 0.0
-
-    # Exact match
     if q == c:
         return 100.0
 
     try:
         from rapidfuzz import fuzz
-    except Exception:
-        # Fallback: simple ratio
-        return _simple_ratio(q, c) * 100
-
-    # Multiple scorers — best wins
-    try:
         scores = [
-            fuzz.ratio(q, c),           # strict
-            fuzz.partial_ratio(q, c),   # substring
-            fuzz.token_sort_ratio(q, c),# word order independent
-            fuzz.token_set_ratio(q, c), # word set
-            fuzz.WRatio(q, c),          # weighted
+            fuzz.ratio(q, c),
+            fuzz.partial_ratio(q, c),
+            fuzz.token_sort_ratio(q, c),
+            fuzz.token_set_ratio(q, c),
+            fuzz.WRatio(q, c),
         ]
         return float(max(scores))
     except Exception:
@@ -225,13 +184,11 @@ def _score_pair(query: str, candidate: str) -> float:
 
 
 def _simple_ratio(a: str, b: str) -> float:
-    """Fallback ratio when rapidfuzz is missing."""
     if not a or not b:
         return 0.0
     la, lb = len(a), len(b)
     if la == 0 or lb == 0:
         return 0.0
-    # Simple LCS length
     dp = [[0] * (lb + 1) for _ in range(la + 1)]
     for i in range(la):
         for j in range(lb):
@@ -244,12 +201,6 @@ def _simple_ratio(a: str, b: str) -> float:
 
 
 def _fuzzy_score_variants(query: str, candidate: str) -> float:
-    """
-    Score with multiple query variants to catch:
-      - repeated chars (karrrnnan)
-      - OCR noise
-      - no-space joining (breakingbad)
-    """
     if not query or not candidate:
         return 0.0
 
@@ -273,11 +224,10 @@ def _fuzzy_score_variants(query: str, candidate: str) -> float:
 
 
 # ============================================================
-# SECTION 5 — PROVIDERS
+# SECTION 6 — PROVIDERS
 # ============================================================
 
 async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
-    """Fetch movie + TV results from TMDB."""
     out: List[Dict[str, Any]] = []
     try:
         from providers import tmdb_provider as TP
@@ -296,7 +246,6 @@ async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
     for r in list(movies or []):
         out.append({
             "title": r.get("title") or "",
-            "original_title": r.get("original_title") or "",
             "year": str(r.get("year") or ""),
             "rating": float(r.get("rating") or 0),
             "votes": int(r.get("votes") or 0),
@@ -307,11 +256,9 @@ async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
             "imdb_id": None,
             "source": "tmdb",
         })
-
     for r in list(tv or []):
         out.append({
             "title": r.get("title") or "",
-            "original_title": r.get("original_title") or "",
             "year": str(r.get("year") or ""),
             "rating": float(r.get("rating") or 0),
             "votes": int(r.get("votes") or 0),
@@ -322,72 +269,60 @@ async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
             "imdb_id": None,
             "source": "tmdb",
         })
-
     return out
 
 
-async def _omdb_search(query: str) -> List[Dict[str, Any]]:
-    """Fetch from OMDb (IMDb) if module + API key exist."""
+async def _imdb_search(query: str) -> List[Dict[str, Any]]:
+    """
+    IMDb search via IMDBKit/cinemagoer (from requirements.txt).
+    Only imports if provider modules are installed.
+    """
+    # Try providers.imdb_provider first
     try:
-        from providers import omdb_provider as OP  # type: ignore
-    except Exception:
-        return []
-
-    try:
-        results = await OP.search(query)  # type: ignore
-    except Exception as e:
-        logger.debug(f"[SUGG] omdb: {e}")
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for r in (results or []):
-        title = r.get("title") or r.get("Title")
-        if not title:
-            continue
-        rating_raw = str(r.get("rating") or r.get("imdbRating") or "0")
+        from providers import imdb_provider as IP  # type: ignore
         try:
-            rating = float(rating_raw.replace("N/A", "0") or 0)
-        except (TypeError, ValueError):
-            rating = 0.0
+            results = await IP.search(query)  # type: ignore
+        except Exception:
+            results = []
+        out = []
+        for r in (results or []):
+            t = r.get("title") or r.get("Title")
+            if not t:
+                continue
+            try:
+                rating = float(str(r.get("rating") or r.get("imdbRating") or 0)
+                               .replace("N/A", "0") or 0)
+            except (TypeError, ValueError):
+                rating = 0.0
+            year_raw = str(r.get("year") or r.get("Year") or "")
+            year = re.sub(r"\D", "", year_raw)[:4]
+            out.append({
+                "title": t,
+                "year": year,
+                "rating": rating,
+                "votes": int(r.get("votes") or 0),
+                "kind": r.get("kind") or "movie",
+                "poster": r.get("poster") or r.get("Poster"),
+                "overview": (r.get("overview") or r.get("Plot") or "")[:200],
+                "tmdb_id": None,
+                "imdb_id": r.get("imdb_id") or r.get("imdbID"),
+                "source": "imdb",
+            })
+        return out
+    except ImportError:
+        return []
+    except Exception as e:
+        logger.debug(f"[SUGG] imdb: {e}")
+        return []
 
-        year_raw = str(r.get("year") or r.get("Year") or "")
-        year = re.sub(r"\D", "", year_raw)[:4]
 
-        out.append({
-            "title": title,
-            "original_title": title,
-            "year": year,
-            "rating": rating,
-            "votes": 0,
-            "kind": "movie",
-            "poster": r.get("poster") or r.get("Poster"),
-            "overview": (r.get("overview") or r.get("Plot") or "")[:200],
-            "tmdb_id": None,
-            "imdb_id": r.get("imdb_id") or r.get("imdbID"),
-            "source": "imdb",
-        })
-    return out
-
-
-# ============================================================
-# SECTION 6 — LOCAL DB FUZZY FALLBACK
-# ============================================================
-
-_db_titles_cache: List[Tuple[str, str]] = []
-_db_cache_at: float = 0.0
-_DB_CACHE_TTL = 300.0
-
-
-async def _load_db_titles() -> List[Tuple[str, str]]:
-    global _db_titles_cache, _db_cache_at
-    now = time.time()
-    if _db_titles_cache and (now - _db_cache_at) < _DB_CACHE_TTL:
-        return _db_titles_cache
-
+async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List[Dict[str, Any]]:
+    if not query:
+        return []
     try:
         from database import db_registry
     except Exception:
-        return _db_titles_cache
+        return []
 
     titles: Set[Tuple[str, str]] = set()
     for entry in db_registry.media_entries():
@@ -396,30 +331,16 @@ async def _load_db_titles() -> List[Tuple[str, str]]:
         try:
             cursor = entry.db["media_files"].find(
                 {"title": {"$exists": True, "$ne": ""}},
-                {"title": 1, "year": 1, "type": 1, "_id": 0},
+                {"title": 1, "year": 1, "_id": 0},
             ).limit(2000)
             async for doc in cursor:
                 t = doc.get("title")
                 y = doc.get("year")
                 if t:
-                    titles.add((
-                        str(t).strip(),
-                        str(y) if y else "",
-                    ))
+                    titles.add((str(t).strip(), str(y) if y else ""))
         except Exception:
             continue
 
-    _db_titles_cache = list(titles)
-    _db_cache_at = now
-    logger.debug(f"[SUGG] loaded {len(_db_titles_cache)} DB titles")
-    return _db_titles_cache
-
-
-async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List[Dict[str, Any]]:
-    if not query:
-        return []
-
-    titles = await _load_db_titles()
     if not titles:
         return []
 
@@ -427,7 +348,6 @@ async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List
     if not q_clean or len(q_clean) < 3:
         return []
 
-    # Dedupe by clean title
     lookup: Dict[str, Tuple[str, str]] = {}
     for t, y in titles:
         c = clean_query(t)
@@ -436,22 +356,21 @@ async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List
 
     scored: List[Tuple[float, str, str]] = []
     for c_clean, (orig, year) in lookup.items():
-        score = _fuzzy_score_variants(q_clean, c_clean)
-        if score >= min_score:
-            scored.append((score, orig, year))
+        s = _fuzzy_score_variants(q_clean, c_clean)
+        if s >= min_score:
+            scored.append((s, orig, year))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     out: List[Dict[str, Any]] = []
     seen: Set[str] = set()
-    for score, title, year in scored[:limit]:
+    for s, title, year in scored[:limit]:
         key = title.lower()
         if key in seen:
             continue
         seen.add(key)
         out.append({
             "title": title,
-            "original_title": title,
             "year": year,
             "rating": 0.0,
             "votes": 0,
@@ -460,14 +379,14 @@ async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List
             "overview": "",
             "tmdb_id": None,
             "imdb_id": None,
-            "score": round(score, 1),
+            "score": round(s, 1),
             "source": "db",
         })
     return out
 
 
 # ============================================================
-# SECTION 7 — SCORING + DEDUP + RANK
+# SECTION 7 — SCORE + DEDUPE + RANK
 # ============================================================
 
 def _dedupe_and_score(
@@ -476,39 +395,24 @@ def _dedupe_and_score(
     min_score: float = 45.0,
     limit: int = 6,
 ) -> List[Dict[str, Any]]:
-    """Score every candidate against query, dedupe, sort, cap."""
     if not items:
         return []
-
     q_clean = _collapse_repeats(clean_query(query))
 
-    # Group by (title, year) — keep highest-scored
     grouped: Dict[str, Dict[str, Any]] = {}
-
     for it in items:
         title = it.get("title") or ""
         if not title:
             continue
-
         t_clean = clean_query(title)
         if not t_clean:
             continue
-
-        # Score
         score = _fuzzy_score_variants(q_clean, t_clean)
-
-        # Bonus: exact year match
-        # (no query year here — handled upstream)
-
         key = f"{t_clean}|{it.get('year') or ''}"
         existing = grouped.get(key)
         if existing is None or score > existing.get("score", 0):
-            grouped[key] = {
-                **it,
-                "score": round(score, 1),
-            }
+            grouped[key] = {**it, "score": round(score, 1)}
 
-    # Sort by (score, rating, votes)
     ranked = sorted(
         grouped.values(),
         key=lambda x: (
@@ -518,15 +422,11 @@ def _dedupe_and_score(
         ),
         reverse=True,
     )
-
-    # Filter by min score
-    filtered = [x for x in ranked if x.get("score", 0) >= min_score]
-
-    return filtered[:limit]
+    return [x for x in ranked if x.get("score", 0) >= min_score][:limit]
 
 
 # ============================================================
-# SECTION 8 — PUBLIC: SUGGESTIONS
+# SECTION 8 — PUBLIC: SUGGESTIONS (with per-group cfg)
 # ============================================================
 
 async def suggestions(
@@ -534,14 +434,25 @@ async def suggestions(
     year: Optional[int] = None,
     kind: str = "any",
     limit: int = 6,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Main entry — multi-provider fuzzy suggestion engine.
+    Main entry — accepts per-group cfg.
+    cfg keys used:
+      min_score          (default 45)
+      provider           (tmdb|imdb|both, default both)
     """
     if not query or len(query.strip()) < 2:
         return []
 
-    key = f"sg:{query.lower()}|{year or ''}|{kind}|{limit}"
+    cfg = cfg or _DEFAULT_CFG
+    min_score = int(cfg.get("suggestion_min_score", 45))
+    min_score = max(20, min(90, min_score))
+    provider = str(cfg.get("suggestion_provider", "both")).lower()
+    if provider not in ("tmdb", "imdb", "both"):
+        provider = "both"
+
+    key = f"sg:{query.lower()}|{year or ''}|{kind}|{limit}|{min_score}|{provider}"
     cached = _cache_get(key)
     if cached is not None:
         return list(cached)
@@ -550,66 +461,60 @@ async def suggestions(
     if not cleaned:
         return []
 
-    # Aggregation buffer
     buffer: List[Dict[str, Any]] = []
 
-    # ── 1. TMDB with full query ──
-    tmdb_full = await _tmdb_search(query)
-    buffer.extend(tmdb_full)
+    # ── Provider: TMDB ──
+    if provider in ("tmdb", "both"):
+        buffer.extend(await _tmdb_search(query))
 
-    # ── 2. TMDB with collapsed repeats ──
-    collapsed = _collapse_repeats(cleaned)
-    if collapsed and collapsed != cleaned:
-        tmdb_coll = await _tmdb_search(collapsed)
-        buffer.extend(tmdb_coll)
+        collapsed = _collapse_repeats(cleaned)
+        if collapsed and collapsed != cleaned:
+            buffer.extend(await _tmdb_search(collapsed))
 
-    # ── 3. TMDB with progressive shortening ──
-    tokens = _tokens(cleaned)
-    if len(tokens) > 1:
-        for n in range(len(tokens) - 1, 0, -1):
-            short = " ".join(tokens[:n])
-            if len(short) < 3:
-                break
-            sub = await _tmdb_search(short)
-            if sub:
-                buffer.extend(sub)
+        tokens = _tokens(cleaned)
+        if len(tokens) > 1:
+            for n in range(len(tokens) - 1, 0, -1):
+                short = " ".join(tokens[:n])
+                if len(short) < 3:
+                    break
+                sub = await _tmdb_search(short)
+                if sub:
+                    buffer.extend(sub)
 
-    # ── 4. TMDB with each token (only if buffer thin) ──
-    if len(buffer) < 4:
-        for tok in tokens:
-            if len(tok) < 4:
-                continue
-            sub = await _tmdb_search(tok)
-            buffer.extend(sub[:3])
-            if len(buffer) >= 8:
-                break
+        if len(buffer) < 4:
+            for tok in tokens:
+                if len(tok) < 4:
+                    continue
+                sub = await _tmdb_search(tok)
+                buffer.extend(sub[:3])
+                if len(buffer) >= 8:
+                    break
 
-    # ── 5. OMDb with full query ──
-    if len(buffer) < 4:
-        omdb = await _omdb_search(query)
-        buffer.extend(omdb)
-        if not omdb and len(tokens) >= 2:
+    # ── Provider: IMDb ──
+    if provider in ("imdb", "both") and len(buffer) < 8:
+        buffer.extend(await _imdb_search(query))
+        tokens = _tokens(cleaned)
+        if len(tokens) >= 2:
             short = " ".join(tokens[:2])
-            buffer.extend(await _omdb_search(short))
+            buffer.extend(await _imdb_search(short))
 
-    # ── 6. Score + dedupe ──
+    # ── Score + rank ──
     ranked = _dedupe_and_score(
-        query, buffer, min_score=45.0, limit=limit * 2,
+        query, buffer, min_score=float(min_score), limit=limit * 2,
     )
 
-    # ── 7. DB fuzzy fallback (only if nothing scored well) ──
+    # ── DB fuzzy fallback if thin ──
     if not ranked or ranked[0].get("score", 0) < 60:
         db_hits = await _db_fuzzy(query, limit=limit)
-        # Merge: DB entries only fill gaps
-        seen_keys = {f"{clean_query(x['title'])}|{x.get('year') or ''}"
-                     for x in ranked}
+        seen = {f"{clean_query(x['title'])}|{x.get('year') or ''}"
+                for x in ranked}
         for d in db_hits:
             k = f"{clean_query(d['title'])}|{d.get('year') or ''}"
-            if k not in seen_keys:
+            if k not in seen:
                 ranked.append(d)
-                seen_keys.add(k)
+                seen.add(k)
 
-    # ── 8. Sort again after merge ──
+    # ── Final sort + kind filter ──
     ranked.sort(
         key=lambda x: (
             x.get("score", 0),
@@ -619,25 +524,28 @@ async def suggestions(
         reverse=True,
     )
 
-    # ── 9. Filter by kind ──
     if kind == "movie":
         ranked = [r for r in ranked if r.get("kind") == "movie"] or ranked
     elif kind == "series":
         ranked = [r for r in ranked if r.get("kind") == "series"] or ranked
 
-    # ── 10. Boost year match ──
+    # ── Year boost ──
     if year:
-        y = int(year)
-        for r in ranked:
-            try:
-                if int(str(r.get("year") or 0)) == y:
-                    r["score"] = min(100.0, r.get("score", 0) + 5.0)
-            except (TypeError, ValueError):
-                pass
-        ranked.sort(
-            key=lambda x: (x.get("score", 0), x.get("rating", 0)),
-            reverse=True,
-        )
+        try:
+            y = int(year)
+            boost = int(cfg.get("year_boost", 5))
+            for r in ranked:
+                try:
+                    if int(str(r.get("year") or 0)) == y:
+                        r["score"] = min(100.0, r.get("score", 0) + boost)
+                except (TypeError, ValueError):
+                    pass
+            ranked.sort(
+                key=lambda x: (x.get("score", 0), x.get("rating", 0)),
+                reverse=True,
+            )
+        except (TypeError, ValueError):
+            pass
 
     result = ranked[:limit]
     _cache_set(key, result)
@@ -645,26 +553,31 @@ async def suggestions(
 
 
 # ============================================================
-# SECTION 9 — PUBLIC: SPELL CHECK
+# SECTION 9 — PUBLIC: SPELL CHECK (with per-group cfg)
 # ============================================================
 
 async def ai_spell_check(
     text: str,
     is_series: bool = False,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """
-    Returns corrected title if a confident match exists, else None.
-    Confident = top suggestion score ≥ 82 AND different from input.
+    Return corrected title if confident, else None.
+    Uses cfg.spell_threshold (default 82).
     """
     if not text:
         return None
+
+    cfg = cfg or _DEFAULT_CFG
+    threshold = int(cfg.get("spell_threshold", 82))
+    threshold = max(60, min(95, threshold))
 
     base = clean_query(text)
     if not base or len(base) < 3:
         return None
 
     kind = "series" if is_series else "any"
-    results = await suggestions(text, kind=kind, limit=3)
+    results = await suggestions(text, kind=kind, limit=3, cfg=cfg)
     if not results:
         return None
 
@@ -674,29 +587,83 @@ async def ai_spell_check(
 
     if not corrected_title:
         return None
-
-    # Same as input → not a correction
     if clean_query(corrected_title) == base:
         return None
-
-    # Confident enough?
-    if score < 82.0:
+    if score < threshold:
         return None
 
-    # Preserve year in corrected title
     year = top.get("year")
     if year:
         return f"{corrected_title} {year}"
-
     return corrected_title
 
 
 # ============================================================
-# SECTION 10 — OUTPUT NORMALIZER
+# SECTION 10 — HIGH-LEVEL: READ CFG FROM DB
+# ============================================================
+
+async def _load_group_cfg(chat_id: int) -> Dict[str, Any]:
+    """Read suggestion-related settings from the group's config."""
+    try:
+        from plugins.groups import state as GS
+
+        cfg = await GS.get_config(chat_id)
+        flow = cfg.get("flow") or {}
+        spell = flow.get("spell_check") or {}
+        sugg = flow.get("suggestions") or {}
+
+        return {
+            "spell_threshold": int(spell.get("threshold", 82)),
+            "max_corrections": int(spell.get("max_corrections", 1)),
+            "min_corrections_score": 80,
+            "suggestion_min_score": int(sugg.get("min_score", 45)),
+            "suggestion_provider": str(sugg.get("provider", "both")),
+            "suggestion_count": int(sugg.get("max_items", 6)),
+            "show_rating": bool(sugg.get("show_rating", True)),
+            "show_year": bool(sugg.get("show_year", True)),
+            "show_icon": bool(sugg.get("show_icon", True)),
+            "year_boost": 5,
+        }
+    except Exception as e:
+        logger.debug(f"[SUGG] load cfg: {e}")
+        return dict(_DEFAULT_CFG)
+
+
+async def get_suggestions_for_group(
+    chat_id: int,
+    query: str,
+    year: Optional[int] = None,
+    kind: str = "any",
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Read group config + return suggestions."""
+    cfg = await _load_group_cfg(chat_id)
+    use_limit = int(limit or cfg.get("suggestion_count", 6))
+    return await suggestions(
+        query, year=year, kind=kind, limit=use_limit, cfg=cfg,
+    )
+
+
+async def ai_spell_check_for_group(
+    chat_id: int,
+    text: str,
+    is_series: bool = False,
+) -> Optional[str]:
+    """Read group config + run spell check."""
+    cfg = await _load_group_cfg(chat_id)
+    return await ai_spell_check(text, is_series=is_series, cfg=cfg)
+
+
+async def get_max_corrections_for_group(chat_id: int) -> int:
+    cfg = await _load_group_cfg(chat_id)
+    return max(1, min(3, int(cfg.get("max_corrections", 1))))
+
+
+# ============================================================
+# SECTION 11 — OUTPUT NORMALIZER
 # ============================================================
 
 def to_dict(s: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize a suggestion dict for JSON storage."""
     if not s:
         return {}
     return {
@@ -719,13 +686,22 @@ def to_many(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# SECTION 11 — PUBLIC EXPORTS
+# SECTION 12 — PUBLIC EXPORTS
 # ============================================================
 
 __all__ = [
+    # Cleaning
     "clean_query",
-    "ai_spell_check",
+    # High-level (reads DB config)
+    "get_suggestions_for_group",
+    "ai_spell_check_for_group",
+    "get_max_corrections_for_group",
+    # Low-level (with explicit cfg)
     "suggestions",
+    "ai_spell_check",
+    # Output
     "to_dict",
     "to_many",
+    # Defaults
+    "_DEFAULT_CFG",
 ]
