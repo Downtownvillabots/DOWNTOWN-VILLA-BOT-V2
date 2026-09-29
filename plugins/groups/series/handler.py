@@ -757,8 +757,9 @@ async def _render_delivery(client, target, uid):
     delivery_cfg = await SFLOW.get_delivery_settings(chat_id)
     hits = SEARCH.sort_hits(hits, mode=delivery_cfg["sort_order"])
 
-    if not hits:
-        return await _show_request_prompt(client, target, query)
+    not hits:
+        await _show_request_prompt(client, target, query)
+        return None
 
     token = await DL.create_deliver_token(
         user_id=uid,
@@ -770,7 +771,8 @@ async def _render_delivery(client, target, uid):
         hits=hits,
     )
     if not token:
-        return await _edit_status(target, "❌ token error")
+        await _edit_status(target, "❌ token error")
+        return None
 
     bot_username = ""
     try:
@@ -780,7 +782,8 @@ async def _render_delivery(client, target, uid):
         pass
 
     if not bot_username:
-        return await _edit_status(target, "❌ bot username missing")
+        await _edit_status(target, "❌ bot username missing")
+        return None
 
     deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
 
@@ -798,19 +801,12 @@ async def _render_delivery(client, target, uid):
         f"📌 ᴛᴀᴘ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ɪɴ ᴘᴍ",
     ])
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{F.EMO['rocket']} {F.sc('open bot pm')}",
-            url=deep_link,
-        )],
-        [InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data="sgw:close",
-        )],
-    ])
-
+    # Show "redirecting" message — no button, auto-redirect
     _wiz_drop(uid)
-    await _edit_or_send(target, text, kb)
+    await _edit_or_send(target, text, None)
+
+    # Return deep_link so the callback can auto-open PM
+    return deep_link
 
 
 # ============================================================
@@ -987,8 +983,20 @@ async def series_wizard_router(client: Client, q: CallbackQuery):
         if action == "qual":
             quality = parts[2] if len(parts) > 2 else ""
             _wiz_set(uid, selected_quality=quality)
-            await q.answer(f"🎯 {quality}")
-            return await _goto_step(client, q.message, uid, "file_delivery")
+
+            # Build delivery + create token
+            deep_link = await _goto_step(
+                client, q.message, uid, "file_delivery",
+            )
+
+            # _goto_step returns what _render_delivery returns
+            # (a deep_link string or None)
+            if deep_link and isinstance(deep_link, str):
+                # Auto-open PM — no button needed
+                await q.answer(url=deep_link)
+            else:
+                await q.answer(f"🎯 {quality}")
+            return
 
         if action == "back":
             target_step = parts[2] if len(parts) > 2 else "language"
