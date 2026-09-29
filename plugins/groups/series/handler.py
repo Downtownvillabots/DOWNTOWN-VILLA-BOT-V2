@@ -413,7 +413,7 @@ async def _render_language(
     auto_skip = await SFLOW.is_auto_skip(chat_id, "language")
     if len(ordered) == 1 and auto_skip:
         _wiz_set(uid, selected_language=ordered[0])
-        return await _render_season(client, target, uid)
+        return await _goto_step(client, target, uid, "season")
 
     # Render
     per_row = await SFLOW.get_per_row(chat_id, "language")
@@ -497,8 +497,8 @@ async def _render_season(
 
     # If neither source has seasons → not a series
     if not tmdb_seasons and not local_seasons:
-        # No season info — skip to quality
-        return await _render_quality(client, target, uid)
+        # No season info — skip forward
+        return await _goto_step(client, target, uid, "quality")
 
     _wiz_set(uid,
              filtered_hits=filtered,
@@ -516,7 +516,7 @@ async def _render_season(
         else:
             sn = next(iter(sorted(local_seasons)))
         _wiz_set(uid, selected_season=int(sn))
-        return await _render_episode(client, target, uid)
+        return await _goto_step(client, target, uid, "episode")
 
     # Icons per season
     def icon_for(sn: int, tmdb_eps: int) -> str:
@@ -604,7 +604,7 @@ async def _render_episode(
     query = s.get("query") or "?"
     season = s.get("selected_season")
     if season is None:
-        return await _render_quality(client, target, uid)
+        return await _goto_step(client, target, uid, "quality")
 
     chat_id = s["chat_id"]
     filtered = s.get("filtered_hits") or s.get("hits") or []
@@ -623,8 +623,8 @@ async def _render_episode(
 
     all_eps = sorted(set(tmdb_eps) | set(local_eps))
     if not all_eps:
-        # No episode info → skip to quality
-        return await _render_quality(client, target, uid)
+        # No episode info → skip forward
+        return await _goto_step(client, target, uid, "quality")
 
     _wiz_set(uid,
              season_episodes=all_eps,
@@ -635,7 +635,7 @@ async def _render_episode(
     auto_skip = await SFLOW.is_auto_skip(chat_id, "episode")
     if len(all_eps) == 1 and auto_skip:
         _wiz_set(uid, selected_episode=all_eps[0])
-        return await _render_quality(client, target, uid)
+        return await _goto_step(client, target, uid, "quality")
 
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -709,7 +709,7 @@ async def _render_quality(
     if not qualities:
         # No quality info → straight to delivery
         _wiz_set(uid, step="quality", final_hits=f)
-        return await _render_delivery(client, target, uid)
+        return await _goto_step(client, target, uid, "file_delivery")
 
     _wiz_set(uid,
              available_qualities=qualities,
@@ -720,7 +720,6 @@ async def _render_quality(
     if len(qualities) == 1 and auto_skip:
         _wiz_set(uid, selected_quality=qualities[0])
         return await _render_delivery(client, target, uid)
-
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"🎯 <b>{F.fb('PICK QUALITY')}</b>",
@@ -1052,7 +1051,7 @@ async def series_wizard_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌")
             _wiz_set(uid, selected_language=ordered[idx])
             await q.answer(f"🌍 {ordered[idx]}")
-            return await _render_season(client, q.message, uid)
+            return await _goto_step(client, q.message, uid, "season")
 
         # ── SEASON PICK ──
         if action == "seas":
@@ -1060,10 +1059,9 @@ async def series_wizard_router(client: Client, q: CallbackQuery):
                 sn = int(parts[2])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            _wiz_set(uid, selected_season=sn)
-            await q.answer(f"📺 S{sn:02d}")
-            return await _render_episode(client, q.message, uid)
-
+            _wiz_set(uid, selected_episode=ep)
+            await q.answer(f"🎞️ E{ep:02d}")
+            return await _goto_step(client, q.message, uid, "quality")
         # ── EPISODE PICK ──
         if action == "ep":
             try:
@@ -1081,22 +1079,11 @@ async def series_wizard_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌")
             _wiz_set(uid, selected_quality=quality)
             await q.answer(f"🎯 {quality}")
-            return await _render_delivery(client, q.message, uid)
-
+            return await _goto_step(client, q.message, uid, "file_delivery")
         # ── BACK ──
-        if action == "back":
+            if action == "back":
             target_step = parts[2] if len(parts) > 2 else "language"
-            if target_step == "language":
-                return await _render_language(client, q.message, uid)
-            if target_step == "season":
-                return await _render_season(client, q.message, uid)
-            if target_step == "episode":
-                return await _render_episode(client, q.message, uid)
-            if target_step == "quality":
-                return await _render_quality(client, q.message, uid)
-            return await q.answer()
-
-        return await q.answer("❓")
+            return await _goto_step(client, q.message, uid, target_step)
 
     except Exception as e:
         logger.exception(f"[SERIES-H] wizard callback: {e}")
