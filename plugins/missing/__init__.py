@@ -1,7 +1,6 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — MISSING FINDER AUTO-DISCOVERY
 # ============================================================
-
 from __future__ import annotations
 import importlib, logging, pkgutil
 from pathlib import Path
@@ -18,7 +17,7 @@ def discover() -> None:
     pkg_dir = Path(__file__).parent
     for mod in pkgutil.iter_modules([str(pkg_dir)]):
         if mod.name.startswith("_"): continue
-        full = f"{__package__}.{mod.name}"       # ← FIXED: __name__ → __package__
+        full = f"{__package__}.{mod.name}"
         try:
             importlib.import_module(full)
             _loaded.append(mod.name)
