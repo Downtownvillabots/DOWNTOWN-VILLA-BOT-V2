@@ -1,16 +1,20 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (FINAL)
+# 🏨 DOWNTOWN VILLA — SERIES GROUP HANDLER (FINAL v2)
 # ============================================================
-# Quality tap → auto-opens PM with /start deliver_XXX → files
+# Quality tap:
+#   • User started bot     → files deliver auto to PM
+#   • User never started   → "Start Bot" button → tap → files
 # ============================================================
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from pyrogram import Client, filters
+from pyrogram.errors import FloodWait, UserIsBlocked
 from pyrogram.enums import ParseMode
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -37,6 +41,14 @@ WIZARD_TTL = 900.0
 
 _last_seen: Dict[int, float] = {}
 _wizard: Dict[int, Dict[str, Any]] = {}
+_BG_TASKS: Set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
 
 
 def _cooldown_ok(uid: int) -> bool:
@@ -85,6 +97,20 @@ def _wiz_set(uid: int, **data) -> None:
 
 def _wiz_drop(uid: int) -> None:
     _wizard.pop(int(uid), None)
+
+
+async def _user_started_bot(uid: int) -> bool:
+    """Check if user has a record in `users` collection."""
+    try:
+        from database import db_registry
+        db = db_registry.get_user_db()
+        if db is None:
+            return False
+        doc = await db["users"].find_one({"user_id": int(uid)}, {"_id": 1})
+        return doc is not None
+    except Exception as e:
+        logger.debug(f"[SERIES-H] user_started check: {e}")
+        return False
 
 
 # ============================================================
@@ -603,14 +629,13 @@ async def _render_quality(client, target, uid):
 
 
 # ============================================================
-# BUILD DELIVER LINK (used by quality tap)
+# DELIVERY
 # ============================================================
 
-async def _build_deliver_link(client, uid) -> Optional[str]:
-    """Create deliver token + return the https://t.me/... deep-link."""
+async def _render_delivery(client, target, uid):
     s = _wiz_get(uid)
     if not s:
-        return None
+        return
 
     query = s.get("query") or "?"
     season = s.get("selected_season")
@@ -661,8 +686,50 @@ async def _build_deliver_link(client, uid) -> Optional[str]:
         hits = sorted(by_ep.values(), key=_ep_num)
 
     if not hits:
+        _wiz_drop(uid)
+        await _show_request_prompt(client, target, query)
         return None
 
+    # ── Read group config ──
+    cfg = await S.get_config(chat_id)
+    caption_tpl = cfg.get("caption_template") or ""
+    custom_buttons = cfg.get("result_buttons") or []
+    ad = cfg.get("auto_delete") or {}
+    auto_delete_min = 0
+    if ad.get("bot_messages", True):
+        auto_delete_min = int(ad.get("bot_timer", 0) or 0) // 60
+
+    custom_kb = _build_custom_kb(custom_buttons)
+
+    # ── Check if user started bot ──
+    user_started = await _user_started_bot(uid)
+
+    logger.info(f"[SERIES-H] uid={uid} started={user_started} hits={len(hits)}")
+
+    if user_started:
+        # ── CASE A: Direct delivery ──
+        group_text = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"{F.EMO['rocket']} <b>{F.fb('SENDING TO PM')}</b>",
+            F.DIV, "",
+            f"🎬 <b>{F.sc(str(query)[:50])}</b>",
+            *([f"📺 Season {int(season):02d}"] if season else []),
+            *([f"🎯 <code>{quality}</code>"] if quality else []),
+            "",
+            f"📁 <code>{len(hits)}</code> ꜰɪʟᴇꜱ",
+            "",
+            f"📌 {F.sc('check your pm in a moment')}",
+        ])
+        _wiz_drop(uid)
+        await _edit_or_send(target, group_text, None)
+
+        _spawn(_direct_pm_delivery(
+            client, uid, query, season or 0, quality or "?", language,
+            hits, caption_tpl, custom_kb, auto_delete_min,
+        ))
+        return None
+
+    # ── CASE B: Never started → show Start button ──
     token = await DL.create_deliver_token(
         user_id=uid,
         chat_id=chat_id,
@@ -672,8 +739,6 @@ async def _build_deliver_link(client, uid) -> Optional[str]:
         language=str(language),
         hits=hits,
     )
-    if not token:
-        return None
 
     bot_username = ""
     try:
@@ -686,14 +751,258 @@ async def _build_deliver_link(client, uid) -> Optional[str]:
         except Exception:
             pass
 
-    if not bot_username:
+    if not token or not bot_username:
+        _wiz_drop(uid)
+        await _edit_status(target, "❌ error — try again")
         return None
 
     deep_link = f"https://t.me/{bot_username}?start=deliver_{token}"
-    logger.info(
-        f"[SERIES-H] token={token} hits={len(hits)} link={deep_link}"
-    )
-    return deep_link
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{F.EMO['rocket']} <b>{F.fb('START THE BOT FIRST')}</b>",
+        F.DIV, "",
+        f"🎬 <b>{F.sc(str(query)[:50])}</b>",
+        *([f"📺 <b>Season {int(season):02d}</b>"] if season else []),
+        *([f"🎯 <code>{quality}</code>"] if quality else []),
+        "",
+        f"📁 <b>{len(hits)}</b> ꜰɪʟᴇꜱ ʀᴇᴀᴅʏ",
+        "",
+        f"📌 {F.sc('tap the button below')}",
+        f"📌 {F.sc('then press START')}",
+        f"📌 {F.sc('files will arrive in pm')}",
+    ])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{F.EMO['rocket']} {F.sc('start bot & get files')}",
+            url=deep_link,
+        )],
+        [InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('cancel')}",
+            callback_data="sgw:close",
+        )],
+    ])
+
+    _wiz_drop(uid)
+    await _edit_or_send(target, text, kb)
+    return None
+
+
+# ============================================================
+# DIRECT PM DELIVERY
+# ============================================================
+
+async def _direct_pm_delivery(
+    client, uid, title, season, quality, language,
+    hits, caption_tpl, custom_kb, auto_delete_min,
+):
+    try:
+        logger.info(
+            f"[SG-DIRECT] ▶️ uid={uid} title={title!r} "
+            f"S{season:02d} q={quality} hits={len(hits)}"
+        )
+
+        intro = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"{F.EMO['rocket']} <b>{F.fb('DELIVERING')}</b>",
+            F.DIV, "",
+            f"🎬 <b>{F.sc(str(title)[:60])}</b>",
+            f"📺 <b>Season {int(season):02d}</b>",
+            f"🎯 <code>{quality}</code>",
+            *([f"🔊 <code>{language}</code>"] if language else []),
+            "",
+            f"📁 <code>{len(hits)}</code> episodes",
+        ])
+
+        try:
+            await client.send_message(
+                chat_id=uid, text=intro, parse_mode=ParseMode.HTML,
+            )
+            logger.info(f"[SG-DIRECT] ✅ intro sent")
+        except UserIsBlocked:
+            logger.warning(f"[SG-DIRECT] ❌ blocked")
+            return
+        except Exception as e:
+            logger.error(f"[SG-DIRECT] ❌ intro: {type(e).__name__}: {e}")
+            return
+
+        sent_ids = []
+        sent = 0
+        failed = 0
+
+        for i, h in enumerate(hits):
+            try:
+                ep = h.get("episode") or 0
+                size_str = FM.size(int(h.get("file_size") or 0))
+                file_id = str(h.get("file_id") or "")
+
+                logger.info(
+                    f"[SG-DIRECT] [{i+1}/{len(hits)}] ep={ep} "
+                    f"fid={'Y' if file_id else 'N'}"
+                )
+
+                if not file_id:
+                    failed += 1
+                    continue
+
+                ctx = {
+                    "title": title, "series": title,
+                    "season": season, "episode": ep,
+                    "quality": quality, "language": language,
+                    "lang": language, "size": size_str,
+                    "file_size": size_str,
+                    "file_name": h.get("file_name") or "",
+                    "year": "—", "rating": "—", "bot_username": "",
+                }
+                fallback = (
+                    f"🎬 <b>{F.sc(str(title)[:60])}</b>\n"
+                    f"📺 S{int(season):02d}E{int(ep):02d} · <code>{quality}</code>"
+                )
+                caption = _safe_caption(caption_tpl, ctx, fallback)
+
+                sent_msg = None
+                try:
+                    sent_msg = await client.send_cached_media(
+                        chat_id=uid,
+                        file_id=file_id,
+                        caption=caption,
+                        reply_markup=custom_kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except FloodWait as e:
+                    w = int(getattr(e, "value", 30) or 30)
+                    logger.warning(f"[SG-DIRECT] flood {w}s")
+                    await asyncio.sleep(w + 2)
+                    try:
+                        sent_msg = await client.send_cached_media(
+                            chat_id=uid, file_id=file_id,
+                            caption=caption, reply_markup=custom_kb,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception as e2:
+                        logger.warning(f"[SG-DIRECT] retry: {e2}")
+                except Exception as e:
+                    logger.warning(
+                        f"[SG-DIRECT] send fail: {type(e).__name__}: {e}"
+                    )
+
+                if sent_msg and getattr(sent_msg, "id", None):
+                    sent_ids.append(sent_msg.id)
+                    sent += 1
+                    logger.info(f"[SG-DIRECT] ✅ ep={ep}")
+                else:
+                    failed += 1
+                    logger.warning(f"[SG-DIRECT] ❌ ep={ep}")
+
+                await asyncio.sleep(0.6)
+
+            except Exception as e:
+                failed += 1
+                logger.exception(f"[SG-DIRECT] ep crash: {e}")
+
+        logger.info(f"[SG-DIRECT] ═══ sent={sent} failed={failed} ═══")
+
+        if auto_delete_min > 0 and sent_ids:
+            try:
+                warn = await client.send_message(
+                    chat_id=uid,
+                    text="\n".join([
+                        f"⚠️ <b>{F.fb('AUTO-DELETE')}</b>",
+                        f"📌 {F.sc('this will be deleted in')} "
+                        f"<b>{auto_delete_min} {F.sc('minutes')}</b>",
+                        f"📌 {F.sc('save or forward now')}",
+                    ]),
+                    parse_mode=ParseMode.HTML,
+                )
+                if warn and warn.id:
+                    sent_ids.append(warn.id)
+            except Exception:
+                pass
+
+            _spawn(_auto_delete_batch(
+                client, uid, sent_ids, auto_delete_min * 60
+            ))
+
+        try:
+            await client.send_message(
+                chat_id=uid,
+                text="\n".join([
+                    f"{F.EMO['check']} <b>{F.fb('DELIVERY COMPLETE')}</b>",
+                    F.DIV, "",
+                    f"🎬 <b>{F.sc(str(title)[:50])}</b>",
+                    f"📺 Season {int(season):02d} · {quality}",
+                    "",
+                    f"✅ {F.sc('sent')} · <code>{sent}</code>",
+                    f"❌ {F.sc('failed')} · <code>{failed}</code>",
+                    "",
+                    f"🕒 <code>{FM.datetime_()}</code>",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        logger.info(f"[SG-DIRECT] ✅ done")
+
+    except Exception as e:
+        logger.exception(f"[SG-DIRECT] ❌ crash: {e}")
+
+
+async def _auto_delete_batch(client, chat_id, msg_ids, seconds):
+    try:
+        await asyncio.sleep(seconds)
+        for mid in msg_ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception:
+                pass
+        logger.info(f"[SG-AUTODEL] deleted {len(msg_ids)}")
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.debug(f"[SG-AUTODEL] {e}")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return ""
+
+
+def _safe_caption(template, ctx, fallback):
+    if not template:
+        return fallback
+    try:
+        return template.format_map(_SafeDict(ctx))
+    except Exception:
+        return fallback
+
+
+def _build_custom_kb(buttons):
+    if not buttons:
+        return None
+    rows = []
+    for b in buttons:
+        if not isinstance(b, dict) or not b.get("enabled", True):
+            continue
+        name = str(b.get("name") or "")[:60]
+        url = str(b.get("url") or "").strip()
+        if not name or not url:
+            continue
+        if url.startswith("@"):
+            url = f"https://t.me/{url[1:]}"
+        elif not (url.startswith("http://") or url.startswith("https://")
+                  or url.startswith("tg://")):
+            if "." in url and " " not in url:
+                url = f"https://{url}"
+            else:
+                continue
+        rows.append([InlineKeyboardButton(name, url=url)])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 
 # ============================================================
@@ -745,35 +1054,8 @@ async def series_wizard_router(client, q: CallbackQuery):
         if action == "qual":
             quality = parts[2] if len(parts) > 2 else ""
             _wiz_set(uid, selected_quality=quality)
-
-            # Build link
-            deep_link = await _build_deliver_link(client, uid)
-
-            if not deep_link:
-                _wiz_drop(uid)
-                return await q.answer("❌ error — try again", show_alert=True)
-
-            # Update group message briefly
-            try:
-                await q.message.edit_text(
-                    "\n".join([
-                        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                        f"{F.EMO['rocket']} <b>{F.fb('OPENING PM...')}</b>",
-                        F.DIV, "",
-                        f"🎯 <code>{quality}</code>",
-                        "",
-                        f"📌 {F.sc('files will arrive in pm')}",
-                    ]),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-
-            _wiz_drop(uid)
-
-            # ⭐ Redirect user to PM (Telegram auto-sends /start deliver_XXX)
-            await q.answer(url=deep_link)
+            await q.answer("🚀")
+            await _render_delivery(client, q.message, uid)
             return
 
         if action == "back":
@@ -997,7 +1279,11 @@ async def _edit_status(target, text):
 
 
 def snapshot():
-    return {"module": "groups.series.handler", "wizard": len(_wizard)}
+    return {
+        "module": "groups.series.handler",
+        "wizard": len(_wizard),
+        "bg_tasks": len(_BG_TASKS),
+    }
 
 
 __all__ = ["series_group_entry", "series_wizard_router", "snapshot"]
