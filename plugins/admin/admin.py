@@ -174,6 +174,10 @@ def _build_page_builder(page: str, chat_id: int = 0) -> Optional[Callable]:
     if page == "sparkline":
         from plugins.admin import sparkline as SP
         return SP.build
+    if page == "flow":
+        from plugins.admin import flow as FLW
+        return FLW.build   
+        
     return None
 
 
