@@ -54,6 +54,39 @@ COLLECTION = "group_tokens"
 TTL_SECONDS = 3600
 MAX_HITS_PER_DELIVER = 200
 
+# ============================================================
+# SECTION 1b — IN-MEMORY FALLBACK
+# ============================================================
+#
+# Keeps every token in RAM too. If DB lookup fails for any
+# reason (network blip, race, replication lag), the token is
+# still resolvable within the same bot process.
+#
+# Cap: 5000 tokens. When exceeded, oldest 1000 are dropped.
+
+_MEM_CACHE: dict = {}
+_MEM_CAP = 5000
+_MEM_DROP = 1000
+
+
+def _mem_put(token: str, doc: dict) -> None:
+    _MEM_CACHE[str(token)] = dict(doc)
+    if len(_MEM_CACHE) > _MEM_CAP:
+        for k in list(_MEM_CACHE.keys())[:_MEM_DROP]:
+            _MEM_CACHE.pop(k, None)
+
+
+def _mem_get(token: str):
+    return _MEM_CACHE.get(str(token))
+
+
+def _mem_drop(token: str) -> None:
+    _MEM_CACHE.pop(str(token), None)
+
+
+def mem_stats() -> dict:
+    return {"cached": len(_MEM_CACHE), "cap": _MEM_CAP}
+
 
 # ============================================================
 # SECTION 2 — DB ACCESS
@@ -138,7 +171,13 @@ async def create_file_token(
             "used": False,
         })
 
-        logger.debug(f"[DL] file token created: {token}")
+        _mem_put(token, {
+            "token": token, "kind": "file",
+            "user_id": int(user_id), "chat_id": int(chat_id),
+            "query": str(query)[:200], "hit": clean_hit,
+            "used": False,
+        })
+        logger.info(f"[DL] ✅ file token stored: {token}")
         return token
 
     except Exception as e:
@@ -222,8 +261,17 @@ async def create_deliver_token(
             "used": False,
         })
 
-        logger.debug(
-            f"[DL] deliver token created: {token} "
+        _mem_put(token, {
+            "token": token, "kind": "deliver",
+            "user_id": int(user_id), "chat_id": int(chat_id),
+            "title": str(title)[:200], "season": int(season or 0),
+            "quality": str(quality or "UNKNOWN")[:20],
+            "language": str(language or "")[:40],
+            "hits": clean_hits, "total": len(clean_hits),
+            "used": False,
+        })
+        logger.info(
+            f"[DL] ✅ deliver token stored: {token} "
             f"({len(clean_hits)} eps · S{season:02d} · {quality})"
         )
         return token
@@ -304,10 +352,15 @@ async def create_premium_token(
             "used": False,
         })
 
-        logger.debug(
-            f"[DL] premium token created: {token} "
-            f"({len(clean_hits)} hits · '{title[:30]}')"
-        )
+        _mem_put(token, {
+            "token": token, "kind": "premium",
+            "user_id": int(user_id), "chat_id": int(chat_id),
+            "title": str(title)[:200], "slug": str(slug)[:100],
+            "tmdb_id": int(tmdb_id) if tmdb_id else None,
+            "hits": clean_hits, "total": len(clean_hits),
+            "used": False,
+        })
+        logger.info(f"[DL] ✅ premium token stored: {token}")
         return token
 
     except Exception as e:
@@ -336,11 +389,22 @@ async def get_premium_batch(token: str) -> Optional[Dict[str, Any]]:
 
 async def get_token(token: str) -> Optional[Dict[str, Any]]:
     """
-    Lookup a token. Returns None if not found or expired.
-    Does NOT mark as used (see mark_used).
+    Lookup a token. Checks memory first, then DB.
+    Returns None if not found or expired.
     """
+    if not token:
+        return None
+
+    # ── Memory first (instant) ──
+    mem = _mem_get(token)
+    if mem:
+        logger.info(f"[DL] get_token MEM HIT: {token}")
+        return mem
+
+    # ── DB fallback ──
     c = _coll()
-    if c is None or not token:
+    if c is None:
+        logger.warning(f"[DL] get_token: no DB, MEM MISS for {token}")
         return None
 
     try:
@@ -366,6 +430,9 @@ async def get_token(token: str) -> Optional[Dict[str, Any]]:
                 return None
 
         doc.pop("_id", None)
+        # Warm memory cache
+        _mem_put(str(token), doc)
+        logger.info(f"[DL] get_token DB HIT: {token}")
         return doc
 
     except Exception as e:
@@ -404,6 +471,7 @@ async def get_deliver_batch(token: str) -> Optional[Dict[str, Any]]:
 
 async def mark_used(token: str) -> None:
     """Soft-mark token as used (does not delete)."""
+    _mem_drop(token)
     c = _coll()
     if c is None or not token:
         return
@@ -525,6 +593,7 @@ __all__ = [
     "ensure_indexes",
     "make_deep_link",
     "snapshot",
+    "mem_stats", 
     "COLLECTION",
     "TTL_SECONDS",
 ]
