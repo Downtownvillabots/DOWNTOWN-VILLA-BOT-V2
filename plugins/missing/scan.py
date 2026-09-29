@@ -7,6 +7,8 @@ from calendar import monthrange
 from datetime import timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from database import db_registry
+
 logger = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -174,63 +176,49 @@ async def fetch_series_range(gte: str, lte: str, lang: str,
     return out, raw
 
 
-# ── LOCAL DB ──
-def _get_db():
-    try:
-        from database import db_manager
-        for name in ("get_user_db", "get_system_db", "get_media_db"):
-            fn = getattr(db_manager, name, None)
-            if callable(fn):
-                try:
-                    d = fn()
-                    if d is not None: return d
-                except Exception:
-                    pass
-        try:
-            return db_manager._db
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
-        from database import db_registry
-        return db_registry.get_system_db()
-    except Exception:
-        return None
-
-
-def _files_coll():
-    d = _get_db()
-    if d is None: return None
-    for name in ("media_files", "files", "media"):
-        try:
-            c = d[name]
-            if c is not None: return c
-        except Exception: pass
-    return None
-
-
+# ── LOCAL DB SEARCH (multi-shard) ──
 async def find_local(title: str, year: str = "") -> List[Dict]:
-    c = _files_coll()
-    if c is None: return []
-    try:
-        base = re.sub(r"[^\w\s]", " ", title or "").strip()
-        base = " ".join(base.split()[:3])
-        if not base: return []
-        pat = re.compile(re.escape(base), re.IGNORECASE)
-
-        clauses = [{"title": pat}, {"file_name": pat}, {"series_title": pat}]
-        query: Dict[str, Any] = {"$or": clauses}
-        if year:
-            y_int = int(year) if str(year).isdigit() else year
-            query = {"$and": [
-                {"$or": clauses},
-                {"$or": [{"year": str(year)}, {"year": y_int}]},
-            ]}
-        return await c.find(query).limit(3).to_list(length=3)
-    except Exception as e:
-        logger.debug(f"[MISS-SCAN] find local: {e}")
+    """
+    Search media_files across ALL online media shards.
+    Returns matches from the FIRST shard that has any hits.
+    """
+    base = re.sub(r"[^\w\s]", " ", title or "").strip()
+    base = " ".join(base.split()[:3])
+    if not base:
         return []
+    pat = re.compile(re.escape(base), re.IGNORECASE)
+
+    clauses: List[Dict[str, Any]] = [
+        {"title": pat}, {"file_name": pat}, {"series_title": pat},
+    ]
+    query: Dict[str, Any] = {"$or": clauses}
+    if year:
+        y_int = int(year) if str(year).isdigit() else year
+        query = {"$and": [
+            {"$or": clauses},
+            {"$or": [{"year": str(year)}, {"year": y_int}]},
+        ]}
+
+    # Iterate every media shard
+    try:
+        entries = db_registry.media_entries()
+    except Exception as e:
+        logger.debug(f"[MISS-SCAN] media_entries: {e}")
+        return []
+
+    for entry in entries:
+        if not entry.is_ready():
+            continue
+        try:
+            coll = entry.db["media_files"]
+            docs = await coll.find(query).limit(3).to_list(length=3)
+            if docs:
+                return docs
+        except Exception as e:
+            logger.debug(f"[MISS-SCAN] shard {entry.index}: {e}")
+            continue
+
+    return []
 
 
 async def find_missing(items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
