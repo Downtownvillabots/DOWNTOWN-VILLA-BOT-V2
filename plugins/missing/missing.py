@@ -1,479 +1,171 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — /missing COMMAND
+# 🏨 DOWNTOWN VILLA — MISSING FILES FINDER (V1 + V2 MERGED)
 # ============================================================
-#
-# Full panel + customizable flow:
-#   Type → Industry → Year → Month → Week → Scan
-#
-# Admin settings:
-#   • Edit templates (header / item / footer)
-#   • Edit buttons
-#   • Set defaults (industry, pages, per_part)
-#   • Save / load presets
-#   • View history
-# ============================================================
-
 from __future__ import annotations
-import asyncio, logging, time
-from datetime import datetime
+import asyncio, logging, os, re, secrets, time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import FloodWait
+from pyrogram.errors import MessageNotModified, FloodWait
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
-from core import config
-from plugins.missing import state as S
+try:
+    from core.config import ADMINS as _ADMINS
+    ADMINS = list(_ADMINS or [])
+except Exception:
+    ADMINS = []
+
+from plugins.missing import fonts as F
 from plugins.missing import scan as SC
+from plugins.missing import state as S
 from plugins.missing import templates as T
-from utils import fonts as F
-from utils import format as FM
 
 logger = logging.getLogger(__name__)
 
-PFX = "ms"
+# ── CONFIG ──
+PFX = "miss"
+SESSION_TTL = 900
+IST = timezone(timedelta(hours=5, minutes=30))
 MOVIES_PER_PART = 25
 
 
+# ── HELPERS ──
 def _is_admin(uid) -> bool:
     try:
-        return int(uid) in [int(a) for a in config.ADMINS]
+        return int(uid) in [int(a) for a in ADMINS if str(a).lstrip("-").isdigit()]
     except Exception:
         return False
 
 
-# ── SESSION ──
-_sessions: Dict[int, Dict[str, Any]] = {}
-TTL = 900.0
+def _esc(t) -> str:
+    if t is None: return ""
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _ss_get(uid: int) -> Optional[Dict[str, Any]]:
-    s = _sessions.get(int(uid))
+def _fmt_int(n) -> str:
+    try: return f"{int(n):,}"
+    except (TypeError, ValueError): return "0"
+
+
+# ── SESSIONS ──
+_SESSIONS: Dict[int, Dict[str, Any]] = {}
+
+
+def _new_session(uid: int, action: str, **data) -> str:
+    tok = secrets.token_urlsafe(8)[:10]
+    _SESSIONS[int(uid)] = {"token": tok, "action": action, "data": data,
+                           "expires": time.time() + SESSION_TTL}
+    return tok
+
+
+def _get_session(uid: int) -> Optional[Dict[str, Any]]:
+    s = _SESSIONS.get(int(uid))
     if not s: return None
-    if time.time() > s["exp"]:
-        _sessions.pop(int(uid), None)
+    if time.time() > s["expires"]:
+        _SESSIONS.pop(int(uid), None)
         return None
     return s
 
 
-def _ss_new(uid: int, **data):
-    _sessions[int(uid)] = {"exp": time.time() + TTL, **data}
+def _clear_session(uid: int) -> None:
+    _SESSIONS.pop(int(uid), None)
 
 
-def _ss_set(uid: int, **data):
-    s = _sessions.get(int(uid))
-    if s:
-        s.update(data)
-        s["exp"] = time.time() + TTL
+def _cleanup_sessions() -> None:
+    now = time.time()
+    for uid in list(_SESSIONS.keys()):
+        if _SESSIONS[uid]["expires"] < now:
+            _SESSIONS.pop(uid, None)
 
 
-def _ss_drop(uid: int):
-    _sessions.pop(int(uid), None)
-
-
-# ── MAIN ──
-async def _build_main() -> Tuple[str, InlineKeyboardMarkup]:
-    cfg = await S.get_cfg()
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"🔍 <b>{F.fb('MISSING FINDER')}</b>",
-        F.DIV, "",
-        f"📌 {F.sc('compare tmdb vs local db')}",
-        f"📌 {F.sc('find every missing movie')}",
-        f"📌 {F.sc('copy-friendly output')}",
-        "",
-        F.DIV_S,
-        f"⚙️ {F.sc('default industry')} · "
-        f"<b>{cfg.get('default_industry', 'hollywood')}</b>",
-        f"📊 {F.sc('results per part')} · "
-        f"<b>{cfg.get('movies_per_part', 25)}</b>",
-    ]
-
-    rows = [
-        [InlineKeyboardButton(
-            f"🎬 {F.sc('missing movies')}",
-            callback_data=f"{PFX}:type:movie",
-        )],
-        [InlineKeyboardButton(
-            f"📺 {F.sc('missing series')}",
-            callback_data=f"{PFX}:type:series",
-        )],
-        [
-            InlineKeyboardButton(
-                f"📚 {F.sc('presets')}",
-                callback_data=f"{PFX}:presets",
-            ),
-            InlineKeyboardButton(
-                f"🧾 {F.sc('history')}",
-                callback_data=f"{PFX}:history",
-            ),
-        ],
-    ]
-
-    if _is_admin(0):  # will be replaced with real check
-        pass
-
-    # Settings button — safe to always show since _build_main
-    # is only invoked from cmd_missing (admin-gated).
-    rows.append([
-        InlineKeyboardButton(
-            f"⚙️ {F.sc('settings')}",
-            callback_data=f"{PFX}:settings",
-        ),
-    ])
-    rows.append([InlineKeyboardButton(
-        f"{F.EMO['cross']} {F.sc('close')}",
-        callback_data=f"{PFX}:close",
-    )])
-
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
-
-
-@Client.on_message(
-    filters.command(["missing", "gapscan", "lackfiles"]) & filters.private,
-    group=-8400,
-)
-async def cmd_missing(client: Client, message: Message):
-    if not message.from_user or not _is_admin(message.from_user.id):
-        return await message.reply_text(
-            f"{F.EMO['cross']} <b>{F.fb('ADMIN ONLY')}</b>",
-            parse_mode=ParseMode.HTML,
-        )
-
-    if not config.TMDB_API_KEY:
-        return await message.reply_text(
-            f"{F.EMO['warn']} <b>TMDB_API_KEY missing</b>",
-            parse_mode=ParseMode.HTML,
-        )
-
+# ── SAFE EDIT ──
+async def _safe_edit(target, text: str, kb=None) -> bool:
     try:
-        from plugins.missing import state as S
-        pass
-    except Exception:
-        pass
-
-    text, kb = await _build_main()
-    _ss_drop(message.from_user.id)
-    await message.reply_text(
-        text, reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+        msg = getattr(target, "message", target)
+        await msg.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True)
+        return True
+    except MessageNotModified:
+        return True
+    except Exception as e:
+        logger.debug(f"[MISS] edit: {e}")
+        return False
 
 
-# ── TYPE → INDUSTRY ──
-async def _show_industries(kind: str) -> Tuple[str, InlineKeyboardMarkup]:
-    label = "MOVIES" if kind == "movie" else "SERIES"
-    lines = [
+# ═══════════════════════════════════════════════════════════════════════════
+# VIEW BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════
+async def _view_start() -> str:
+    cfg = await S.get_cfg()
+    ind = cfg.get("default_industry", "hollywood")
+    return "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"🔍 <b>{F.fb(f'MISSING {label}')}</b>",
+        f"🔍 <b>{F.fb('MISSING FILES FINDER')}</b>",
+        F.DIV, "",
+        f"📌 {F.sc('compare tmdb with your local db')}",
+        f"📌 {F.sc('find every missing title')}",
+        f"📌 {F.sc('no filters · no cache')}",
+        "",
+        F.DIV_S, "",
+        f"⚙️ {F.sc('default industry')} · <b>{F.sc(ind)}</b>",
+        f"📊 {F.sc('per part')} · <b>{cfg.get('movies_per_part', 25)}</b>",
+    ])
+
+
+def _view_industry(kind: str) -> str:
+    lbl = "MOVIES" if kind == "movie" else "SERIES"
+    return "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔍 <b>{F.fb('MISSING ' + lbl)}</b>",
         F.DIV, "",
         f"🌍 {F.sc('pick an industry')}",
-    ]
-
-    rows = []
-    row = []
-    for code, lbl, _ in SC.INDUSTRIES:
-        row.append(InlineKeyboardButton(
-            lbl, callback_data=f"{PFX}:ind:{kind}:{code}",
-        ))
-        if len(row) == 2:
-            rows.append(row); row = []
-    if row: rows.append(row)
-
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"{PFX}:home",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data=f"{PFX}:close",
-        ),
+        f"📌 {F.sc('all = every language')}",
     ])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-# ── YEAR INPUT ──
-async def _show_year_prompt(kind: str, code: str, label: str) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = [
+def _view_year_input(kind: str, ind_label: str) -> str:
+    lbl = "MOVIES" if kind == "movie" else "SERIES"
+    return "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"📅 <b>{F.fb('ENTER YEAR')}</b>",
         F.DIV, "",
-        f"🎬 {F.sc('type')} · <code>{kind.upper()}</code>",
-        f"🌍 {F.sc('industry')} · <b>{F.sc(label)}</b>",
-        "",
-        f"📝 {F.sc('send the year as text')}",
-        f"📌 {F.sc('example')} · <code>2024</code>",
-    ]
-    rows = [[
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('cancel')}",
-            callback_data=f"{PFX}:home",
-        ),
-    ]]
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
-
-
-# ── MONTHS ──
-async def _show_months(kind: str, code: str, label: str, year: int) -> Tuple[str, InlineKeyboardMarkup]:
-    lines = [
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"📅 <b>{F.fb('PICK MONTH')}</b>",
-        F.DIV, "",
-        f"🎬 {F.sc('type')} · <code>{kind.upper()}</code>",
-        f"🌍 {F.sc('industry')} · <b>{F.sc(label)}</b>",
-        f"📅 {F.sc('year')} · <code>{year}</code>",
-    ]
-    rows = []
-    row = []
-    for i, m in enumerate(SC.MONTHS, 1):
-        row.append(InlineKeyboardButton(
-            f"📅 {m}", callback_data=f"{PFX}:mo:{kind}:{code}:{year}:{i}",
-        ))
-        if len(row) == 3:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"{PFX}:ind:{kind}:{code}",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data=f"{PFX}:close",
-        ),
+        f"🎬 {F.sc('type')} · <code>{lbl}</code>",
+        f"🌍 {F.sc('industry')} · <b>{_esc(ind_label)}</b>",
+        "", F.DIV_S, "",
+        f"📝 {F.sc('send the year as next message')}",
+        f"📌 {F.sc('range')} · <code>1950 – 2027</code>",
     ])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-# ── WEEKS ──
-async def _show_weeks(kind: str, code: str, label: str, year: int, month: int) -> Tuple[str, InlineKeyboardMarkup]:
-    weeks = SC.weeks_of_month(year, month)
-    lines = [
+def _view_months(kind: str, ind_label: str, year: int) -> str:
+    return "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-        f"📅 <b>{F.fb(f'{SC.MONTHS_FULL[month-1]} {year}')}</b>",
+        f"📅 <b>{F.fb('YEAR')}</b> · <code>{year}</code>",
         F.DIV, "",
+        f"🎬 {F.sc('type')} · <code>{kind.upper()}</code>",
+        f"🌍 {F.sc('industry')} · <b>{_esc(ind_label)}</b>",
+        "", F.DIV_S, "",
+        f"📌 {F.sc('pick a month to scan')}",
+    ])
+
+
+def _view_weeks(kind: str, ind_label: str, year: int, month: int) -> str:
+    return "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📅 <b>{SC.MONTHS_FULL[month-1].upper()} {year}</b>",
+        F.DIV, "",
+        f"🎬 {F.sc('type')} · <code>{kind.upper()}</code>",
+        f"🌍 {F.sc('industry')} · <b>{_esc(ind_label)}</b>",
+        "", F.DIV_S, "",
         f"📌 {F.sc('pick a week or full month')}",
-    ]
-    rows = []
-    for wk, st, en in weeks:
-        rows.append([InlineKeyboardButton(
-            f"📆 W{wk} · {st:02d}-{en:02d} {SC.MONTHS[month-1]}",
-            callback_data=f"{PFX}:wk:{kind}:{code}:{year}:{month}:{wk}",
-        )])
-    rows.append([InlineKeyboardButton(
-        f"📅 {F.sc('FULL MONTH')}",
-        callback_data=f"{PFX}:wk:{kind}:{code}:{year}:{month}:0",
-    )])
-    rows.append([
-        InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"{PFX}:mo:{kind}:{code}:{year}:{month}",
-        ),
-        InlineKeyboardButton(
-            f"{F.EMO['cross']} {F.sc('close')}",
-            callback_data=f"{PFX}:close",
-        ),
     ])
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-# ── RUN SCAN ──
-async def _run_scan(
-    client: Client, q: CallbackQuery,
-    kind: str, code: str, label: str, year: int, month: int, week_num: int,
-):
-    lang = SC.INDUSTRY_MAP.get(code, ("?", "en"))[1]
-    weeks = SC.weeks_of_month(year, month)
-    week = None
-    if week_num > 0:
-        for w in weeks:
-            if w[0] == week_num:
-                week = w; break
-
-    gte, lte = SC.date_range(year, month, week)
-    period = (
-        f"FULL {SC.MONTHS_FULL[month-1].upper()} {year}"
-        if week is None
-        else f"W{week[0]} · {week[1]:02d}-{week[2]:02d} {SC.MONTHS_FULL[month-1]} {year}"
-    )
-    period_short = (
-        f"{SC.MONTHS[month-1]} {year}"
-        if week is None
-        else f"{SC.MONTHS[month-1]} {year} · W{week[0]}"
-    )
-
-    try:
-        await q.message.edit_text(
-            "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"🔍 <b>{F.fb('SCANNING')}</b>",
-                F.DIV, "",
-                f"📅 <code>{period_short}</code>",
-                f"🌍 <b>{F.sc(label)}</b>",
-                "",
-                f"⏳ {F.sc('fetching from tmdb')}…",
-            ]),
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-    await q.answer()
-
-    # Fetch
-    if kind == "movie":
-        items, raw = await SC.fetch_movies_range(gte, lte, lang)
-    else:
-        items, raw = await SC.fetch_series_range(gte, lte, lang)
-
-    items = SC.dedupe_by_tmdb(items)
-    fetched = len(items)
-
-    # Scan
-    missing, in_db = await SC.find_missing(items)
-    missing.sort(key=lambda x: x.get("popularity", 0), reverse=True)
-
-    # Log scan
-    await S.log_scan({
-        "kind": kind, "industry": code, "label": label,
-        "year": year, "month": month, "week": week_num,
-        "period": period_short,
-        "fetched": fetched, "in_db": in_db, "missing": len(missing),
-        "owner": q.from_user.id,
-    })
-
-    # Send results
-    await _send_results(
-        client, q.message.chat.id,
-        kind=kind, label=label, period=period_short,
-        fetched=fetched, in_db=in_db, missing_count=len(missing),
-        missing=missing,
-        code=code, year=year, month=month,
-    )
-
-
-async def _send_results(
-    client, chat_id: int,
-    kind: str, label: str, period: str,
-    fetched: int, in_db: int, missing_count: int,
-    missing: List[Dict], code: str, year: int, month: int,
-):
-    t = await T.get_template("template") or T.TEMPLATES["default"]
-    ctx = {
-        "TYPE": "MOVIES" if kind == "movie" else "SERIES",
-        "PERIOD": period,
-        "INDUSTRY": label,
-        "FETCHED": FM.num(fetched),
-        "IN_DB": FM.num(in_db),
-        "MISSING": FM.num(missing_count),
-        "TIME": FM.datetime_(),
-    }
-
-    header = T.render_header(t, ctx)
-    footer = T.render_footer(t, ctx)
-
-    # No missing
-    if missing_count == 0:
-        try:
-            await client.send_message(
-                chat_id=chat_id,
-                text=header + "\n🎉 <b>Your DB is complete for this range!</b>",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            pass
-        return
-
-    # Send header
-    try:
-        await client.send_message(
-            chat_id=chat_id,
-            text=header,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
-
-    # Chunks
-    total_parts = (len(missing) + MOVIES_PER_PART - 1) // MOVIES_PER_PART
-
-    for p in range(total_parts):
-        chunk = missing[p * MOVIES_PER_PART:(p + 1) * MOVIES_PER_PART]
-        lines = [
-            f"🏨 <b>{F.fb('DOWNTOWN VILLA')}</b>",
-            f"🔍 <b>{F.fb('MISSING ' + ('MOVIES' if kind == 'movie' else 'SERIES'))}</b>",
-            f"📅 <code>{period}</code> · 🌍 <b>{F.sc(label)}</b>",
-            f"📄 {F.sc('part')} · <code>{p+1}/{total_parts}</code>",
-            F.DIV, "",
-        ]
-
-        base = p * MOVIES_PER_PART + 1
-        for i, m in enumerate(chunk):
-            n = base + i
-            title = m.get("title") or "?"
-            year_v = m.get("year") or ""
-            rating = m.get("rating", 0)
-            pop = m.get("popularity", 0)
-            lang_c = (m.get("lang") or "").upper()
-
-            name = f"{title} {year_v}" if year_v else title
-            stars = f"⭐{rating}" if rating else ""
-            pop_str = f"🎯{pop}" if pop else ""
-
-            item_ctx = {
-                "N": n,
-                "NAME": name,
-                "STARS": stars,
-                "POP": pop_str,
-                "LANG": lang_c,
-            }
-            lines.append(T.render_item(t, item_ctx))
-
-        if p == total_parts - 1:
-            lines.append(footer)
-
-        kb = T.build_button_kb(await T.get_buttons())
-        if p < total_parts - 1 and kb is None:
-            kb = None
-
-        try:
-            await client.send_message(
-                chat_id=chat_id,
-                text="\n".join(lines)[:4000],
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            await asyncio.sleep(0.4)
-        except FloodWait as e:
-            wait = int(getattr(e, "value", 30) or 30)
-            logger.warning(
-                f"[MISS] flood wait {wait}s — retrying part {p+1}"
-            )
-            await asyncio.sleep(wait + 2)
-            try:
-                await client.send_message(
-                    chat_id=chat_id,
-                    text="\n".join(lines)[:4000],
-                    reply_markup=kb,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                await asyncio.sleep(0.4)
-            except Exception as e2:
-                logger.warning(f"[MISS] retry failed part {p+1}: {e2}")
-        except Exception as e:
-            logger.debug(f"[MISS] part {p}: {e}")
-
-
-# ── HISTORY ──
-async def _show_history() -> Tuple[str, InlineKeyboardMarkup]:
+async def _view_history() -> str:
     runs = await S.recent_scans(15)
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -485,459 +177,857 @@ async def _show_history() -> Tuple[str, InlineKeyboardMarkup]:
     else:
         for r in runs:
             lines.append(
-                f"• <b>{F.sc(str(r.get('label','?'))[:24])}</b> · "
-                f"<code>{r.get('period','?')}</code>"
-            )
+                f"• <b>{_esc(str(r.get('label','?'))[:24])}</b> · "
+                f"<code>{_esc(str(r.get('period','?')))}</code>")
             lines.append(
-                f"   ✅ {FM.num(r.get('in_db',0))} · "
-                f"❌ {FM.num(r.get('missing',0))} · "
-                f"📥 {FM.num(r.get('fetched',0))}"
-            )
+                f"   ✅ {_fmt_int(r.get('in_db',0))} · "
+                f"❌ {_fmt_int(r.get('missing',0))} · "
+                f"📥 {_fmt_int(r.get('fetched',0))}")
             lines.append("")
-    rows = [
-        [InlineKeyboardButton(
-            f"🗑️ {F.sc('clear history')}",
-            callback_data=f"{PFX}:hist_clear",
-        )],
-        [
-            InlineKeyboardButton(
-                f"{F.EMO['refresh']} {F.sc('refresh')}",
-                callback_data=f"{PFX}:history",
-            ),
-            InlineKeyboardButton(
-                f"{F.EMO['back']} {F.sc('back')}",
-                callback_data=f"{PFX}:home",
-            ),
-        ],
-    ]
-    return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
+    return "\n".join(lines)[:4000]
 
 
-# ── SETTINGS ──
-async def _show_settings() -> Tuple[str, InlineKeyboardMarkup]:
+async def _view_settings() -> str:
     cfg = await S.get_cfg()
-    lines = [
+    def dot(v): return "🟢" if v else "🔴"
+    return "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"⚙️ <b>{F.fb('MISSING SETTINGS')}</b>",
         F.DIV, "",
         f"🎬 {F.sc('default industry')} · "
-        f"<b>{cfg.get('default_industry','hollywood')}</b>",
+        f"<b>{_esc(cfg.get('default_industry','hollywood'))}</b>",
         f"📊 {F.sc('results per part')} · "
-        f"<b>{cfg.get('movies_per_part',25)}</b>",
-        f"⭐ {F.sc('show rating')} · "
-        f"{'🟢' if cfg.get('show_rating') else '🔴'}",
-        f"🎯 {F.sc('show popularity')} · "
-        f"{'🟢' if cfg.get('show_popularity') else '🔴'}",
-        f"🌐 {F.sc('show lang code')} · "
-        f"{'🟢' if cfg.get('show_lang_code') else '🔴'}",
-        f"📋 {F.sc('copy friendly')} · "
-        f"{'🟢' if cfg.get('copy_friendly') else '🔴'}",
-        f"📅 {F.sc('include year')} · "
-        f"{'🟢' if cfg.get('include_year') else '🔴'}",
+        f"<b>{cfg.get('movies_per_part', 25)}</b>",
+        f"⭐ {F.sc('show rating')} · {dot(cfg.get('show_rating'))}",
+        f"🎯 {F.sc('show popularity')} · {dot(cfg.get('show_popularity'))}",
+        f"🌐 {F.sc('show lang code')} · {dot(cfg.get('show_lang_code'))}",
+        f"📅 {F.sc('include year')} · {dot(cfg.get('include_year', True))}",
+    ])
+
+
+async def _view_buttons() -> str:
+    btns = await S.get_buttons()
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔘 <b>{F.fb('BUTTONS')}</b>",
+        F.DIV, "",
+        f"📊 <b>{len(btns)}</b> / 8",
+        "",
     ]
-    rows = [
+    for i, b in enumerate(btns, 1):
+        lines.append(f"<b>{i:02d}.</b> {_esc(str(b.get('name','?'))[:30])}")
+        lines.append(f"   <code>{_esc(str(b.get('url','?'))[:50])}</code>")
+    return "\n".join(lines)[:4000]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# KEYBOARDS
+# ═══════════════════════════════════════════════════════════════════════════
+def kb_type():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 MOVIES", callback_data=f"{PFX}:type:movie"),
+         InlineKeyboardButton("📺 SERIES", callback_data=f"{PFX}:type:series")],
+        [InlineKeyboardButton("🧾 HISTORY",  callback_data=f"{PFX}:history"),
+         InlineKeyboardButton("⚙️ SETTINGS", callback_data=f"{PFX}:settings")],
+        [InlineKeyboardButton("❌ CLOSE", callback_data=f"{PFX}:close")],
+    ])
+
+
+def kb_industry(kind: str):
+    rows, row = [], []
+    for code, label, _ in SC.INDUSTRIES:
+        row.append(InlineKeyboardButton(
+            label, callback_data=f"{PFX}:ind:{kind}:{code}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([
+        InlineKeyboardButton("◀️ BACK",  callback_data=f"{PFX}:back_type"),
+        InlineKeyboardButton("❌ CLOSE", callback_data=f"{PFX}:close"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_months(kind: str, code: str, year: int):
+    rows, row = [], []
+    for i, m in enumerate(SC.MONTHS, 1):
+        row.append(InlineKeyboardButton(
+            f"📅 {m}", callback_data=f"{PFX}:mo:{kind}:{code}:{year}:{i}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([
+        InlineKeyboardButton("◀️ BACK",
+                             callback_data=f"{PFX}:back_ind:{kind}"),
+        InlineKeyboardButton("❌ CLOSE", callback_data=f"{PFX}:close"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_weeks(kind: str, code: str, year: int, month: int):
+    weeks = SC.weeks_of_month(year, month)
+    rows = []
+    for wk, s, e in weeks:
+        rows.append([InlineKeyboardButton(
+            f"📆 W{wk} · {s:02d}-{e:02d} {SC.MONTHS[month-1]}",
+            callback_data=f"{PFX}:wk:{kind}:{code}:{year}:{month}:{wk}")])
+    rows.append([InlineKeyboardButton(
+        f"📅 FULL MONTH ({SC.MONTHS_FULL[month-1]})",
+        callback_data=f"{PFX}:wk:{kind}:{code}:{year}:{month}:0")])
+    rows.append([
+        InlineKeyboardButton("◀️ BACK",
+                             callback_data=f"{PFX}:back_months:{kind}:{code}:{year}"),
+        InlineKeyboardButton("❌ CLOSE", callback_data=f"{PFX}:close"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_after_results(kind: str, code: str, year: int, month: int):
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"📝 {F.sc('edit template')}",
-            callback_data=f"{PFX}:tpl_edit",
-        )],
+            "🔄 RESCAN",
+            callback_data=f"{PFX}:mo:{kind}:{code}:{year}:{month}")],
         [InlineKeyboardButton(
-            f"🔘 {F.sc('edit buttons')}",
-            callback_data=f"{PFX}:btn_edit",
-        )],
-        [
-            InlineKeyboardButton(
-                f"📊 {F.sc('set per part')}",
-                callback_data=f"{PFX}:set_per_part",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"⭐ {F.sc('rating')} · {'🟢' if cfg.get('show_rating') else '🔴'}",
-                callback_data=f"{PFX}:tog_rating",
-            ),
-            InlineKeyboardButton(
-                f"🎯 {F.sc('pop')} · {'🟢' if cfg.get('show_popularity') else '🔴'}",
-                callback_data=f"{PFX}:tog_pop",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"🌐 {F.sc('lang')} · {'🟢' if cfg.get('show_lang_code') else '🔴'}",
-                callback_data=f"{PFX}:tog_lang",
-            ),
-            InlineKeyboardButton(
-                f"📋 {F.sc('copy')} · {'🟢' if cfg.get('copy_friendly') else '🔴'}",
-                callback_data=f"{PFX}:tog_copy",
-            ),
-        ],
+            "📅 NEW WEEK",
+            callback_data=f"{PFX}:back_months:{kind}:{code}:{year}")],
+        [InlineKeyboardButton("❌ CLOSE", callback_data=f"{PFX}:close")],
+    ])
+
+
+def kb_back(target: str = f"{PFX}:back_type"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ BACK", callback_data=target)],
+        [InlineKeyboardButton("❌ CLOSE", callback_data=f"{PFX}:close")],
+    ])
+
+
+async def _kb_settings():
+    cfg = await S.get_cfg()
+    def dot(v): return "🟢" if v else "🔴"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 EDIT TEMPLATE",
+                              callback_data=f"{PFX}:tpl_edit")],
+        [InlineKeyboardButton("🔘 EDIT BUTTONS",
+                              callback_data=f"{PFX}:btn_edit")],
         [InlineKeyboardButton(
-            f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"{PFX}:home",
-        )],
-    ]
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+            f"⭐ RATING · {dot(cfg.get('show_rating'))}",
+            callback_data=f"{PFX}:tog:rating"),
+         InlineKeyboardButton(
+            f"🎯 POP · {dot(cfg.get('show_popularity'))}",
+            callback_data=f"{PFX}:tog:pop")],
+        [InlineKeyboardButton(
+            f"🌐 LANG · {dot(cfg.get('show_lang_code'))}",
+            callback_data=f"{PFX}:tog:lang"),
+         InlineKeyboardButton(
+            f"📅 YEAR · {dot(cfg.get('include_year', True))}",
+            callback_data=f"{PFX}:tog:year")],
+        [InlineKeyboardButton("◀️ BACK", callback_data=f"{PFX}:home")],
+    ])
 
 
-# ── CALLBACK ROUTER ──
-@Client.on_callback_query(filters.regex(rf"^{PFX}:"), group=-8400)
-async def missing_router(client: Client, q: CallbackQuery):
-    if not q.from_user or not _is_admin(q.from_user.id):
-        return await q.answer("⛔", show_alert=True)
+def _kb_history():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ CLEAR HISTORY",
+                              callback_data=f"{PFX}:hist_clear")],
+        [InlineKeyboardButton("🔄 REFRESH", callback_data=f"{PFX}:history"),
+         InlineKeyboardButton("◀️ BACK",   callback_data=f"{PFX}:home")],
+    ])
 
-    parts = str(q.data).split(":")
-    action = parts[1] if len(parts) > 1 else ""
 
+async def _kb_buttons():
+    btns = await S.get_buttons()
+    rows = []
+    for i, b in enumerate(btns[:8], 1):
+        rows.append([InlineKeyboardButton(
+            f"🗑️ {i}. {str(b.get('name','?'))[:25]}",
+            callback_data=f"{PFX}:btn_rm:{i-1}")])
+    rows.append([InlineKeyboardButton("➕ ADD BUTTON",
+                                      callback_data=f"{PFX}:btn_add")])
+    if btns:
+        rows.append([InlineKeyboardButton("🗑️ CLEAR ALL",
+                                          callback_data=f"{PFX}:btn_clear")])
+    rows.append([InlineKeyboardButton("◀️ BACK",
+                                      callback_data=f"{PFX}:settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PUBLIC ENTRY (called from admin.py and from /missing)
+# ═══════════════════════════════════════════════════════════════════════════
+async def open_panel_for_admin(client: Client, message: Message) -> bool:
+    """Called by admin.py when user taps 🔎 MISSING button."""
     try:
-        if action == "close":
-            try: await q.message.delete()
+        if not message.from_user or not _is_admin(message.from_user.id):
+            return False
+        if not os.getenv("TMDB_API_KEY", "").strip():
+            try:
+                await message.reply_text(
+                    "⚠️ <b>TMDB_API_KEY ɴᴏᴛ ꜱᴇᴛ</b>",
+                    parse_mode=ParseMode.HTML)
             except Exception: pass
-            return await q.answer("Closed")
-
-        if action == "home":
-            text, kb = await _build_main()
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "type":
-            kind = parts[2]
-            text, kb = await _show_industries(kind)
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "ind":
-            kind = parts[2]; code = parts[3]
-            label, _ = SC.INDUSTRY_MAP.get(code, ("?", "en"))
-            _ss_new(q.from_user.id, kind=kind, code=code, label=label)
-            text, kb = await _show_year_prompt(kind, code, label)
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "mo":
-            kind = parts[2]; code = parts[3]
-            year = int(parts[4]); month = int(parts[5])
-            label, _ = SC.INDUSTRY_MAP.get(code, ("?", "en"))
-            text, kb = await _show_weeks(kind, code, label, year, month)
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "wk":
-            kind = parts[2]; code = parts[3]
-            year = int(parts[4]); month = int(parts[5])
-            wk = int(parts[6])
-            label, _ = SC.INDUSTRY_MAP.get(code, ("?", "en"))
-            await _run_scan(client, q, kind, code, label, year, month, wk)
-            return
-
-        if action == "history":
-            text, kb = await _show_history()
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "hist_clear":
-            n = await S.clear_history()
-            await q.answer(f"🗑️ Cleared {n}")
-            text, kb = await _show_history()
-            await _safe_edit(q, text, kb)
-            return
-
-        if action == "settings":
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "tog_rating":
-            cfg = await S.get_cfg()
-            await S.save_cfg(show_rating=not cfg.get("show_rating", True))
-            await q.answer("Toggled")
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return
-
-        if action == "tog_pop":
-            cfg = await S.get_cfg()
-            await S.save_cfg(show_popularity=not cfg.get("show_popularity", True))
-            await q.answer("Toggled")
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return
-
-        if action == "tog_lang":
-            cfg = await S.get_cfg()
-            await S.save_cfg(show_lang_code=not cfg.get("show_lang_code", True))
-            await q.answer("Toggled")
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return
-
-        if action == "tog_copy":
-            cfg = await S.get_cfg()
-            await S.save_cfg(copy_friendly=not cfg.get("copy_friendly", True))
-            await q.answer("Toggled")
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return
-
-        if action == "tpl_edit":
-            _ss_new(q.from_user.id, step="tpl_edit")
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"📝 <b>{F.fb('EDIT TEMPLATE')}</b>",
-                F.DIV, "",
-                f"📌 {F.sc('choose what to edit')}",
-            ])
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    f"📋 {F.sc('header')}",
-                    callback_data=f"{PFX}:tpl_header",
-                )],
-                [InlineKeyboardButton(
-                    f"🔤 {F.sc('item line')}",
-                    callback_data=f"{PFX}:tpl_item",
-                )],
-                [InlineKeyboardButton(
-                    f"📄 {F.sc('footer')}",
-                    callback_data=f"{PFX}:tpl_footer",
-                )],
-                [InlineKeyboardButton(
-                    f"♻️ {F.sc('reset all')}",
-                    callback_data=f"{PFX}:tpl_reset",
-                )],
-                [InlineKeyboardButton(
-                    f"{F.EMO['back']} {F.sc('back')}",
-                    callback_data=f"{PFX}:settings",
-                )],
-            ])
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action in ("tpl_header", "tpl_item", "tpl_footer"):
-            _ss_new(q.from_user.id, step=action)
-            field = action.split("_")[1]
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"📝 <b>{F.fb(f'EDIT {field.upper()}')}</b>",
-                F.DIV, "",
-                f"📌 {F.sc('send the new template as text')}",
-                "",
-                f"📌 {F.sc('placeholders')}:",
-                f"<code>{{TYPE}} {{PERIOD}} {{INDUSTRY}}</code>",
-                f"<code>{{FETCHED}} {{IN_DB}} {{MISSING}} {{TIME}}</code>",
-                f"📌 {F.sc('item only')}: "
-                f"<code>{{N}} {{NAME}} {{STARS}} {{POP}} {{LANG}}</code>",
-            ])
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"{F.EMO['cross']} {F.sc('cancel')}",
-                    callback_data=f"{PFX}:settings",
-                ),
-            ]])
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "tpl_reset":
-            await T.set_template("template", T.TEMPLATES["default"])
-            await q.answer("♻️ Reset")
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return
-
-        if action == "btn_edit":
-            btns = await T.get_buttons()
-            lines = [
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"🔘 <b>{F.fb('BUTTONS')}</b>",
-                F.DIV, "",
-                f"📊 <b>{len(btns)}</b> buttons",
-                "",
-            ]
-            for i, b in enumerate(btns, 1):
-                lines.append(
-                    f"<b>{i:02d}.</b> {F.sc(str(b.get('name','?'))[:30])}"
-                )
-                lines.append(f"   <code>{str(b.get('url','?'))[:50]}</code>")
-
-            rows = []
-            for i, b in enumerate(btns[:8], 1):
-                rows.append([InlineKeyboardButton(
-                    f"🗑️ {i}. {str(b.get('name','?'))[:25]}",
-                    callback_data=f"{PFX}:btn_rm:{i-1}",
-                )])
-            rows.append([InlineKeyboardButton(
-                f"➕ {F.sc('add button')}",
-                callback_data=f"{PFX}:btn_add",
-            )])
-            if btns:
-                rows.append([InlineKeyboardButton(
-                    f"🗑️ {F.sc('clear all')}",
-                    callback_data=f"{PFX}:btn_clear",
-                )])
-            rows.append([InlineKeyboardButton(
-                f"{F.EMO['back']} {F.sc('back')}",
-                callback_data=f"{PFX}:settings",
-            )])
-            await _safe_edit(q, "\n".join(lines)[:4000],
-                           InlineKeyboardMarkup(rows))
-            return await q.answer()
-
-        if action == "btn_add":
-            _ss_new(q.from_user.id, step="btn_add")
-            text = "\n".join([
-                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-                f"➕ <b>{F.fb('ADD BUTTON')}</b>",
-                F.DIV, "",
-                f"📌 {F.sc('send')} <code>Name | URL</code>",
-            ])
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"{F.EMO['cross']} {F.sc('cancel')}",
-                    callback_data=f"{PFX}:settings",
-                ),
-            ]])
-            await _safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "btn_rm":
-            idx = int(parts[2])
-            btns = await T.get_buttons()
-            if 0 <= idx < len(btns):
-                btns.pop(idx)
-                await T.set_buttons(btns)
-            await q.answer("🗑️")
-            # refresh
-            q2 = q
-            return await missing_router(client, q2) if False else await q.answer()
-
-        if action == "btn_clear":
-            await T.set_buttons([])
-            await q.answer("🗑️ Cleared")
-            text, kb = await _show_settings()
-            await _safe_edit(q, text, kb)
-            return
-
-        return await q.answer("❓")
-
+            return False
+        _clear_session(message.from_user.id)
+        await message.reply_text(
+            await _view_start(), reply_markup=kb_type(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
+        return True
     except Exception as e:
-        logger.exception(f"[MISS] router: {e}")
-        try: await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        logger.exception(f"[MISS] admin open: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# /missing COMMAND
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_message(
+    filters.command(["missing", "gapscan", "lackfiles"]) & filters.private,
+    group=-460,
+)
+async def cmd_missing(client: Client, message: Message):
+    try:
+        if not message.from_user or not _is_admin(message.from_user.id):
+            return await message.reply_text("⛔ ᴀᴅᴍɪɴꜱ ᴏɴʟʏ.")
+        if not os.getenv("TMDB_API_KEY", "").strip():
+            return await message.reply_text(
+                "⚠️ <b>TMDB_API_KEY ɴᴏᴛ ꜱᴇᴛ</b>",
+                parse_mode=ParseMode.HTML)
+        _clear_session(message.from_user.id)
+        await message.reply_text(
+            await _view_start(), reply_markup=kb_type(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
+    except Exception as e:
+        logger.exception(f"[MISS] cmd: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CALLBACKS
+# ═══════════════════════════════════════════════════════════════════════════
+@Client.on_callback_query(filters.regex(rf"^{PFX}:close$"), group=-460)
+async def cb_close(client, q):
+    try:
+        _clear_session(q.from_user.id)
+        try: await q.message.delete()
+        except Exception: pass
+        await q.answer("ᴄʟᴏꜱᴇᴅ")
+    except Exception:
+        try: await q.answer("ᴄʟᴏꜱᴇᴅ")
         except Exception: pass
 
 
-# ── TEXT INPUT ──
+@Client.on_callback_query(filters.regex(rf"^{PFX}:home$"), group=-460)
+async def cb_home(client, q):
+    try:
+        _clear_session(q.from_user.id)
+        await _safe_edit(q, await _view_start(), kb_type())
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] home: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:back_type$"), group=-460)
+async def cb_back_type(client, q):
+    try:
+        _clear_session(q.from_user.id)
+        await _safe_edit(q, await _view_start(), kb_type())
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] back_type: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:type:(movie|series)$"), group=-460)
+async def cb_type(client, q):
+    try:
+        kind = q.matches[0].group(1)
+        _new_session(q.from_user.id, "kind", kind=kind)
+        await _safe_edit(q, _view_industry(kind), kb_industry(kind))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] type: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:back_ind:(movie|series)$"), group=-460)
+async def cb_back_ind(client, q):
+    try:
+        kind = q.matches[0].group(1)
+        _new_session(q.from_user.id, "kind", kind=kind)
+        await _safe_edit(q, _view_industry(kind), kb_industry(kind))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] back_ind: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:ind:(movie|series):(\w+)$"), group=-460)
+async def cb_industry(client, q):
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        if code not in SC.INDUSTRY_MAP:
+            return await q.answer("⚠️ ᴜɴᴋɴᴏᴡɴ ɪɴᴅᴜꜱᴛʀʏ", show_alert=True)
+        label, lang = SC.INDUSTRY_MAP[code]
+        _new_session(q.from_user.id, "year_input",
+                     kind=kind, ind=code, ind_label=label, ind_lang=lang)
+        await _safe_edit(q, _view_year_input(kind, label),
+                         kb_back(f"{PFX}:back_ind:{kind}"))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] industry: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:back_months:(movie|series):(\w+):(\d{{4}})$"),
+    group=-460)
+async def cb_back_months(client, q):
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        year = int(q.matches[0].group(3))
+        label, _ = SC.INDUSTRY_MAP.get(code, ("?", "en"))
+        _new_session(q.from_user.id, "month_pick",
+                     kind=kind, ind=code, ind_label=label, year=year)
+        await _safe_edit(q, _view_months(kind, label, year),
+                         kb_months(kind, code, year))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] back_months: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:mo:(movie|series):(\w+):(\d{{4}}):(\d{{1,2}})$"),
+    group=-460)
+async def cb_month(client, q):
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        year = int(q.matches[0].group(3))
+        month = int(q.matches[0].group(4))
+        if not (1 <= month <= 12):
+            return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ᴍᴏɴᴛʜ", show_alert=True)
+        label, _ = SC.INDUSTRY_MAP.get(code, ("?", "en"))
+        _new_session(q.from_user.id, "week_pick",
+                     kind=kind, ind=code, ind_label=label,
+                     year=year, month=month)
+        await _safe_edit(q, _view_weeks(kind, label, year, month),
+                         kb_weeks(kind, code, year, month))
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] month: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:wk:(movie|series):(\w+):(\d{{4}}):(\d{{1,2}}):(\d{{1,2}})$"),
+    group=-460)
+async def cb_week(client, q):
+    try:
+        kind = q.matches[0].group(1)
+        code = q.matches[0].group(2)
+        year = int(q.matches[0].group(3))
+        month = int(q.matches[0].group(4))
+        wk = int(q.matches[0].group(5))
+        label, lang = SC.INDUSTRY_MAP.get(code, ("?", "en"))
+        week_tuple = None
+        if wk > 0:
+            for w in SC.weeks_of_month(year, month):
+                if w[0] == wk:
+                    week_tuple = w; break
+            if week_tuple is None:
+                return await q.answer("⚠️ ɪɴᴠᴀʟɪᴅ ᴡᴇᴇᴋ", show_alert=True)
+        _clear_session(q.from_user.id)
+        await q.answer("🔍 ꜱᴄᴀɴɴɪɴɢ...")
+        await _run_scan(client, q, kind, code, label, lang,
+                        year, month, week_tuple)
+    except Exception as e:
+        logger.exception(f"[MISS] week: {e}")
+        try: await q.answer("⚠️ ᴇʀʀᴏʀ", show_alert=True)
+        except Exception: pass
+
+
+# ── HISTORY ──
+@Client.on_callback_query(filters.regex(rf"^{PFX}:history$"), group=-460)
+async def cb_history(client, q):
+    try:
+        await _safe_edit(q, await _view_history(), _kb_history())
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] history: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:hist_clear$"), group=-460)
+async def cb_hist_clear(client, q):
+    try:
+        n = await S.clear_history()
+        await q.answer(f"🗑️ Cleared {n}")
+        await _safe_edit(q, await _view_history(), _kb_history())
+    except Exception as e:
+        logger.exception(f"[MISS] hist_clear: {e}")
+
+
+# ── SETTINGS ──
+@Client.on_callback_query(filters.regex(rf"^{PFX}:settings$"), group=-460)
+async def cb_settings(client, q):
+    try:
+        await _safe_edit(q, await _view_settings(), await _kb_settings())
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] settings: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:tog:(\w+)$"), group=-460)
+async def cb_toggle(client, q):
+    try:
+        key = q.matches[0].group(1)
+        m = {"rating": "show_rating", "pop": "show_popularity",
+             "lang": "show_lang_code", "year": "include_year"}
+        if key not in m:
+            return await q.answer("❓")
+        cfg = await S.get_cfg()
+        field = m[key]
+        await S.save_cfg(**{field: not cfg.get(field, True)})
+        await q.answer("✓")
+        await _safe_edit(q, await _view_settings(), await _kb_settings())
+    except Exception as e:
+        logger.exception(f"[MISS] toggle: {e}")
+
+
+# ── TEMPLATE EDITOR ──
+@Client.on_callback_query(filters.regex(rf"^{PFX}:tpl_edit$"), group=-460)
+async def cb_tpl_edit(client, q):
+    try:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 HEADER",
+                                  callback_data=f"{PFX}:tpl:header")],
+            [InlineKeyboardButton("🔤 ITEM LINE",
+                                  callback_data=f"{PFX}:tpl:item")],
+            [InlineKeyboardButton("📄 FOOTER",
+                                  callback_data=f"{PFX}:tpl:footer")],
+            [InlineKeyboardButton("♻️ RESET ALL",
+                                  callback_data=f"{PFX}:tpl_reset")],
+            [InlineKeyboardButton("◀️ BACK",
+                                  callback_data=f"{PFX}:settings")],
+        ])
+        txt = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb('EDIT TEMPLATE')}</b>",
+            F.DIV, "",
+            f"📌 {F.sc('choose what to edit')}",
+        ])
+        await _safe_edit(q, txt, kb)
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] tpl_edit: {e}")
+
+
+@Client.on_callback_query(
+    filters.regex(rf"^{PFX}:tpl:(header|item|footer)$"), group=-460)
+async def cb_tpl_field(client, q):
+    try:
+        field = q.matches[0].group(1)
+        _new_session(q.from_user.id, f"tpl_{field}", field=field)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ CANCEL",
+                                 callback_data=f"{PFX}:settings")]])
+        txt = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb(f'EDIT {field.upper()}')}</b>",
+            F.DIV, "",
+            f"📌 {F.sc('send the new template as text')}",
+            "",
+            f"<b>{F.sc('placeholders')}:</b>",
+            f"<code>{{TYPE}} {{PERIOD}} {{INDUSTRY}}</code>",
+            f"<code>{{FETCHED}} {{IN_DB}} {{MISSING}} {{TIME}}</code>",
+            f"<b>{F.sc('item only')}:</b>",
+            f"<code>{{N}} {{NAME}} {{STARS}} {{POP}} {{LANG}}</code>",
+        ])
+        await _safe_edit(q, txt, kb)
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] tpl_field: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:tpl_reset$"), group=-460)
+async def cb_tpl_reset(client, q):
+    try:
+        await T.set_template("template", T.TEMPLATES["default"])
+        await q.answer("♻️ Reset")
+        await _safe_edit(q, await _view_settings(), await _kb_settings())
+    except Exception as e:
+        logger.exception(f"[MISS] tpl_reset: {e}")
+
+
+# ── BUTTON EDITOR ──
+@Client.on_callback_query(filters.regex(rf"^{PFX}:btn_edit$"), group=-460)
+async def cb_btn_edit(client, q):
+    try:
+        await _safe_edit(q, await _view_buttons(), await _kb_buttons())
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] btn_edit: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:btn_rm:(\d+)$"), group=-460)
+async def cb_btn_rm(client, q):
+    try:
+        idx = int(q.matches[0].group(1))
+        btns = await S.get_buttons()
+        if 0 <= idx < len(btns):
+            btns.pop(idx)
+            await S.set_buttons(btns)
+        await q.answer("🗑️")
+        await _safe_edit(q, await _view_buttons(), await _kb_buttons())
+    except Exception as e:
+        logger.exception(f"[MISS] btn_rm: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:btn_clear$"), group=-460)
+async def cb_btn_clear(client, q):
+    try:
+        await S.set_buttons([])
+        await q.answer("🗑️ Cleared")
+        await _safe_edit(q, await _view_buttons(), await _kb_buttons())
+    except Exception as e:
+        logger.exception(f"[MISS] btn_clear: {e}")
+
+
+@Client.on_callback_query(filters.regex(rf"^{PFX}:btn_add$"), group=-460)
+async def cb_btn_add(client, q):
+    try:
+        _new_session(q.from_user.id, "btn_add")
+        txt = "\n".join([
+            f"{F.EMO['brand']} <b>{F.fb('ADD BUTTON')}</b>",
+            F.DIV, "",
+            f"📌 {F.sc('send')} <code>Name | URL</code>",
+        ])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ CANCEL",
+                                 callback_data=f"{PFX}:settings")]])
+        await _safe_edit(q, txt, kb)
+        await q.answer()
+    except Exception as e:
+        logger.exception(f"[MISS] btn_add: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEXT INPUT
+# ═══════════════════════════════════════════════════════════════════════════
 @Client.on_message(
     filters.private & filters.text & ~filters.regex(r"^/"),
-    group=-8395,
+    group=-459,
 )
-async def missing_text_input(client: Client, message: Message):
-    if not message.from_user or not _is_admin(message.from_user.id):
-        return
-    s = _ss_get(message.from_user.id)
-    if not s: return
+async def missing_text_input(client, message: Message):
+    if not message.from_user: return
+    s = _get_session(message.from_user.id)
+    if not s or not _is_admin(message.from_user.id): return
 
-    step = s.get("step")
+    try: message.stop_propagation()
+    except Exception: pass
+
+    action = s.get("action")
+    data = s.get("data") or {}
     text = (message.text or "").strip()
     if not text: return
 
-    # Year input (after industry)
-    if "kind" in s and "code" in s and "label" in s and not s.get("step"):
+    # ── Year ──
+    if action == "year_input":
         try:
             year = int(text)
-            if year < 1950 or year > 2030:
-                raise ValueError
-        except ValueError:
+            if year < 1950 or year > 2027: raise ValueError
+        except (TypeError, ValueError):
             return await message.reply_text(
-                f"{F.EMO['cross']} {F.sc('invalid year')}",
-                parse_mode=ParseMode.HTML,
-            )
-        text_out, kb = await _show_months(
-            s["kind"], s["code"], s["label"], year,
-        )
-        _ss_set(message.from_user.id, year=year)
+                "❌ ɪɴᴠᴀʟɪᴅ ʏᴇᴀʀ.\n\n"
+                "📌 ꜱᴇɴᴅ ᴀ ɴᴜᴍʙᴇʀ ʙᴇᴛᴡᴇᴇɴ "
+                "<code>1950</code> ᴀɴᴅ <code>2027</code>.",
+                parse_mode=ParseMode.HTML)
+        kind = data.get("kind", "movie")
+        code = data.get("ind", "hollywood")
+        label = data.get("ind_label", "Hollywood")
+        _new_session(message.from_user.id, "month_pick",
+                     kind=kind, ind=code, ind_label=label, year=year)
         await message.reply_text(
-            text_out, reply_markup=kb,
+            _view_months(kind, label, year),
+            reply_markup=kb_months(kind, code, year),
             parse_mode=ParseMode.HTML,
-        )
-        try: message.stop_propagation()
-        except Exception: pass
+            disable_web_page_preview=True)
         return
 
-    # Template edits
-    if step == "tpl_header":
+    # ── Template edits ──
+    if action in ("tpl_header", "tpl_item", "tpl_footer"):
+        field = data.get("field") or action.split("_")[1]
         t = await T.get_template("template") or dict(T.TEMPLATES["default"])
-        t["header"] = text
+        key = {"header": "header", "item": "item_line", "footer": "footer"}[field]
+        t[key] = text
         await T.set_template("template", t)
-        _ss_drop(message.from_user.id)
+        _clear_session(message.from_user.id)
         await message.reply_text(
-            f"{F.EMO['check']} <b>Header updated</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        try: message.stop_propagation()
-        except Exception: pass
+            f"✅ <b>{field.upper()} updated</b>",
+            parse_mode=ParseMode.HTML)
         return
 
-    if step == "tpl_item":
-        t = await T.get_template("template") or dict(T.TEMPLATES["default"])
-        t["item_line"] = text
-        await T.set_template("template", t)
-        _ss_drop(message.from_user.id)
-        await message.reply_text(
-            f"{F.EMO['check']} <b>Item line updated</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        try: message.stop_propagation()
-        except Exception: pass
-        return
-
-    if step == "tpl_footer":
-        t = await T.get_template("template") or dict(T.TEMPLATES["default"])
-        t["footer"] = text
-        await T.set_template("template", t)
-        _ss_drop(message.from_user.id)
-        await message.reply_text(
-            f"{F.EMO['check']} <b>Footer updated</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        try: message.stop_propagation()
-        except Exception: pass
-        return
-
-    if step == "btn_add":
+    # ── Button add ──
+    if action == "btn_add":
         if "|" not in text:
             return await message.reply_text(
-                f"{F.EMO['cross']} <code>Name | URL</code>",
-                parse_mode=ParseMode.HTML,
-            )
+                "❌ <code>Name | URL</code>",
+                parse_mode=ParseMode.HTML)
         name, url = [p.strip() for p in text.split("|", 1)]
-        btns = await T.get_buttons()
+        btns = await S.get_buttons()
         if len(btns) >= 8:
-            _ss_drop(message.from_user.id)
+            _clear_session(message.from_user.id)
             return await message.reply_text("⚠️ Max 8 buttons")
         btns.append({"name": name[:60], "url": url})
-        await T.set_buttons(btns)
-        _ss_drop(message.from_user.id)
+        await S.set_buttons(btns)
+        _clear_session(message.from_user.id)
         await message.reply_text(
-            f"{F.EMO['check']} <b>Added</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        try: message.stop_propagation()
-        except Exception: pass
+            "✅ <b>Added</b>",
+            parse_mode=ParseMode.HTML)
         return
 
 
-# ── HELPERS ──
-async def _safe_edit(q, text, kb):
+# ═══════════════════════════════════════════════════════════════════════════
+# SCANNER
+# ═══════════════════════════════════════════════════════════════════════════
+async def _run_scan(client, q, kind, code, label, lang,
+                    year, month, week):
+    gte, lte = SC.date_range(year, month, week)
+    if week is None:
+        period = f"FULL {SC.MONTHS_FULL[month-1].upper()} {year}"
+        period_short = f"{SC.MONTHS[month-1]} {year}"
+    else:
+        wk, s, e = week
+        period = f"W{wk} · {s:02d}-{e:02d} {SC.MONTHS_FULL[month-1]} {year}"
+        period_short = f"{SC.MONTHS[month-1]} {year} · W{wk}"
+
+    # Progress
     try:
-        await q.message.edit_text(
-            text, reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        progress = await q.message.edit_text(
+            "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"🔍 <b>{F.fb('SCANNING')}</b>",
+                F.DIV, "",
+                f"📅 <code>{_esc(period_short)}</code>",
+                f"🎬 <code>{kind.upper()}</code> · 🌍 <b>{_esc(label)}</b>",
+                "", F.DIV_S, "",
+                f"⏳ {F.sc('fetching from tmdb')}...",
+            ]),
+            parse_mode=ParseMode.HTML)
+    except MessageNotModified:
+        progress = q.message
+    except Exception:
+        progress = q.message
+
+    chat_id = q.message.chat.id
+    progress_id = progress.id
+
+    # Fetch
+    try:
+        if kind == "movie":
+            items, raw = await SC.fetch_movies_range(gte, lte, lang)
+        else:
+            items, raw = await SC.fetch_series_range(gte, lte, lang)
     except Exception as e:
-        if "not modified" not in str(e).lower():
-            logger.debug(f"[MISS] edit: {e}")
+        logger.exception(f"[MISS] fetch: {e}")
+        items, raw = [], 0
+
+    items = SC.dedupe_by_tmdb(items)
+    fetched = len(items)
+
+    # Empty
+    if not items:
+        try:
+            await client.edit_message_text(
+                chat_id=chat_id, message_id=progress_id,
+                text="\n".join([
+                    f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                    f"❌ <b>{F.fb('NO RESULTS')}</b>",
+                    F.DIV, "",
+                    f"📅 <code>{_esc(period_short)}</code>",
+                    f"🎬 <code>{kind.upper()}</code> · 🌍 <b>{_esc(label)}</b>",
+                    "",
+                    f"📥 {F.sc('tmdb raw')} · <code>{_fmt_int(raw)}</code>",
+                    "", F.DIV_S, "",
+                    f"📌 {F.sc('nothing found on tmdb for this range')}",
+                    "", f"💡 <b>{F.sc('try')}</b>:",
+                    f"• ᴜꜱᴇ <b>FULL MONTH</b> ɪɴꜱᴛᴇᴀᴅ ᴏꜰ ᴀ ᴡᴇᴇᴋ",
+                    f"• ᴛʀʏ ᴀ <b>ᴘᴀꜱᴛ ʏᴇᴀʀ</b>",
+                    f"• ᴛʀʏ <b>🌍 ALL</b> ɪɴᴅᴜꜱᴛʀʏ",
+                ]),
+                reply_markup=kb_after_results(kind, code, year, month),
+                parse_mode=ParseMode.HTML)
+        except Exception: pass
+        return
+
+    missing, present = await SC.find_missing(items)
+    in_db = len(present)
+    missing_count = len(missing)
+    missing.sort(key=lambda x: x.get("popularity", 0), reverse=True)
+
+    # Log
+    try:
+        await S.log_scan({
+            "kind": kind, "industry": code, "label": label,
+            "year": year, "month": month,
+            "week": week[0] if week else 0,
+            "period": period_short,
+            "fetched": fetched, "in_db": in_db, "missing": missing_count,
+            "owner": q.from_user.id,
+        })
+    except Exception: pass
+
+    # Delete progress
+    try:
+        await client.delete_messages(chat_id, progress_id)
+    except Exception: pass
+
+    # Send results
+    await _send_results(
+        client, chat_id, kind, label, period_short,
+        fetched, in_db, missing_count, missing,
+        kind_code=code, year=year, month=month)
 
 
-def snapshot() -> Dict[str, Any]:
-    return {"module": "missing"}
+# ═══════════════════════════════════════════════════════════════════════════
+# SEND RESULTS
+# ═══════════════════════════════════════════════════════════════════════════
+async def _send_results(client, chat_id, kind, label, period,
+                        fetched, in_db, missing_count, missing,
+                        kind_code="hollywood", year=2000, month=1):
+    cfg = await S.get_cfg()
+    per_part = int(cfg.get("movies_per_part", MOVIES_PER_PART))
+    show_rating = cfg.get("show_rating", True)
+    show_pop   = cfg.get("show_popularity", True)
+    show_lang  = cfg.get("show_lang_code", True)
+    show_year  = cfg.get("include_year", True)
+
+    type_label = "MOVIES" if kind == "movie" else "SERIES"
+
+    tpl = await T.get_template("template") or dict(T.TEMPLATES["default"])
+    ctx = {
+        "TYPE": type_label,
+        "PERIOD": period,
+        "INDUSTRY": label,
+        "FETCHED": _fmt_int(fetched),
+        "IN_DB": _fmt_int(in_db),
+        "MISSING": _fmt_int(missing_count),
+        "TIME": datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
+    }
+
+    header = T.render_header(tpl, ctx)
+    footer = T.render_footer(tpl, ctx)
+
+    # No missing
+    if missing_count == 0:
+        try:
+            await client.send_message(
+                chat_id=chat_id,
+                text=header + f"\n🎉 <b>{F.sc('your db is complete!')}</b>",
+                reply_markup=kb_after_results(kind, kind_code, year, month),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+        except Exception as e:
+            logger.debug(f"[MISS] header: {e}")
+        return
+
+    # Header
+    try:
+        await client.send_message(
+            chat_id=chat_id, text=header,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
+    except Exception as e:
+        logger.debug(f"[MISS] header send: {e}")
+
+    # Chunks
+    total_parts = (len(missing) + per_part - 1) // per_part
+    custom_kb = T.build_button_kb(await S.get_buttons())
+
+    for p in range(total_parts):
+        chunk = missing[p * per_part:(p + 1) * per_part]
+        lines = [
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"🔍 <b>{F.fb('MISSING ' + type_label)}</b>",
+            f"📅 <code>{_esc(period)}</code> · 🌍 <b>{_esc(label)}</b>",
+            f"📄 {F.sc('part')} · <code>{p+1}/{total_parts}</code>",
+            F.DIV, "",
+        ]
+        base = p * per_part + 1
+        for i, m in enumerate(chunk):
+            n = base + i
+            title = m.get("title") or "?"
+            yr = m.get("year") or ""
+            name = f"{title} {yr}".strip() if show_year else title
+
+            item_ctx = {
+                "N": n,
+                "NAME": _esc(name),
+                "STARS": f"⭐{m.get('rating')}" if (show_rating and m.get("rating")) else "",
+                "POP": f"🎯{m.get('popularity')}" if (show_pop and m.get("popularity")) else "",
+                "LANG": (m.get("lang") or "").upper() if show_lang else "",
+            }
+            lines.append(T.render_item(tpl, item_ctx).rstrip())
+
+        if p == total_parts - 1:
+            lines.append(footer)
+
+        kb = custom_kb if p == total_parts - 1 else None
+        if kb is None and p == total_parts - 1:
+            kb = kb_after_results(kind, kind_code, year, month)
+
+        body = "\n".join(lines)[:4000]
+
+        try:
+            await client.send_message(
+                chat_id=chat_id, text=body, reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+            await asyncio.sleep(0.4)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 2)
+            try:
+                await client.send_message(
+                    chat_id=chat_id, text=body, reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True)
+            except Exception: pass
+        except Exception as e:
+            logger.warning(f"[MISS] part {p+1}: {e}")
+
+    logger.info(f"[MISS] done: {missing_count} missing ({label} · {period})")
 
 
-__all__ = ["cmd_missing", "snapshot"]
+# ═══════════════════════════════════════════════════════════════════════════
+# CLEANUP LOOP
+# ═══════════════════════════════════════════════════════════════════════════
+async def _cleanup_loop():
+    while True:
+        try:
+            await asyncio.sleep(600)
+            _cleanup_sessions()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+try:
+    asyncio.get_event_loop().create_task(_cleanup_loop())
+except Exception:
+    pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPORTS
+# ═══════════════════════════════════════════════════════════════════════════
+__all__ = ["cmd_missing", "open_panel_for_admin"]
+
+
+logger.info("")
+logger.info("╔════════════════════════════════════════════════════════════════╗")
+logger.info("║  🔍 MISSING FILES FINDER — V1 + V2 MERGED ✅                   ║")
+logger.info("║                                                                ║")
+logger.info("║  Commands: /missing · /gapscan · /lackfiles                    ║")
+logger.info("║  Admin:    /admin → 🔎 MISSING                                 ║")
+logger.info("║                                                                ║")
+logger.info("║  Features: scan · history · settings · templates · buttons     ║")
+logger.info("║  Storage:  MongoDB (settings · history · templates)            ║")
+logger.info("╚════════════════════════════════════════════════════════════════╝")
