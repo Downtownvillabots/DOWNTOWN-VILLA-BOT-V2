@@ -5,31 +5,38 @@ from __future__ import annotations
 import logging, time
 from typing import Any, Dict, List, Optional
 
-from database import db_manager
+from database import db_registry
 
 logger = logging.getLogger(__name__)
 
 
-def _get_db():
+def _get_system_db():
     try:
-        for name in ("get_user_db", "get_system_db", "get_media_db"):
-            fn = getattr(db_manager, name, None)
-            if callable(fn):
-                d = fn()
-                if d is not None: return d
-    except Exception: pass
-    try: return db_manager._db
-    except Exception: return None
+        return db_registry.get_system_db()
+    except Exception:
+        return None
+
+
+def _get_user_db():
+    try:
+        return db_registry.get_user_db()
+    except Exception:
+        return None
 
 
 def _completed_coll():
-    d = _get_db(); return d["ai_completed"] if d is not None else None
+    d = _get_system_db()
+    return d["ai_completed"] if d is not None else None
+
 
 def _prefs_coll():
-    d = _get_db(); return d["ai_prefs"] if d is not None else None
+    d = _get_user_db()
+    return d["ai_prefs"] if d is not None else None
+
 
 def _settings_coll():
-    d = _get_db(); return d["ai_settings"] if d is not None else None
+    d = _get_system_db()
+    return d["ai_settings"] if d is not None else None
 
 
 async def _is_completed(slug):
@@ -93,7 +100,7 @@ async def _set_setting(key, value):
 
 
 __all__ = [
-    "_get_db",
+    "_get_system_db", "_get_user_db",
     "_completed_coll", "_prefs_coll", "_settings_coll",
     "_is_completed", "_mark_completed", "_unmark_completed",
     "_list_completed", "_count_completed",
