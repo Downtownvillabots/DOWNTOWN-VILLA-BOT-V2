@@ -31,4 +31,21 @@ def loaded(): return list(_loaded)
 def failed(): return list(_failed)
 
 discover()
-__all__ = ["discover", "loaded", "failed"]
+
+
+# ── Re-export public API so BOTH import paths work ──
+#   from plugins import missing as MS              ← works
+#   from plugins.missing import missing as MS      ← works
+try:
+    from plugins.missing.missing import (   # noqa: F401
+        cmd_missing as cmd_missing,
+        open_panel_for_admin as open_panel_for_admin,
+    )
+except Exception as e:
+    logger.exception(f"[MISSING] re-export failed: {e}")
+
+
+__all__ = [
+    "discover", "loaded", "failed",
+    "cmd_missing", "open_panel_for_admin",
+]
