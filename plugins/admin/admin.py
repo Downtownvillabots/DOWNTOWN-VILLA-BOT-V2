@@ -177,6 +177,9 @@ def _build_page_builder(page: str, chat_id: int = 0) -> Optional[Callable]:
     if page == "flow":
         from plugins.admin import flow as FLW
         return FLW.build   
+    if page == "groups":
+        from plugins.groups import admin_list as GAL
+        return GAL.build
         
     return None
 
