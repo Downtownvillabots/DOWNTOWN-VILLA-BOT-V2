@@ -1,0 +1,1044 @@
+# ============================================================
+# 🏨 DOWNTOWN VILLA — GROUPS PANEL RENDERER
+# ============================================================
+#
+# Renders every section of the group settings panel.
+# Pure UI — no handlers, no DB writes, no session state.
+#
+# Router (file 4) calls these and edits the message.
+#
+# Callback scheme (all routed by router.py):
+#   ga:s:{section}                    navigate
+#   ga:tog:{path}                     toggle boolean
+#   ga:set:{path}:{value}             set a value
+#   ga:flow:{step_key}                open flow step
+#   ga:flow_tog:{step_key}            toggle flow step
+#   ga:flow_row:{step_key}:{n}        set per_row
+#   ga:flow_skip:{step_key}           toggle auto-skip
+#   ga:cap:edit                       start caption edit session
+#   ga:cap:reset                      reset caption
+#   ga:btn:view:{idx}                 view button
+#   ga:btn:add                        start button add session
+#   ga:btn:tog:{idx}                  toggle button enabled
+#   ga:btn:del:{idx}                  delete button
+#   ga:btn_row:{n}                    set buttons per row
+#   ga:fsub:add                       add fsub channel
+#   ga:fsub:rm:{idx}                  remove fsub channel
+#   ga:req_ch:{id}                    set request channel
+#   ga:reset_do                       execute reset
+#
+# ============================================================
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from plugins.groups import state as S
+from utils import fonts as F
+from utils import format as FM
+
+logger = logging.getLogger(__name__)
+
+# ── short aliases ──
+DIV = F.DIV
+DIV_S = F.DIV_S
+
+
+# ============================================================
+# SECTION 1 — SHARED HELPERS
+# ============================================================
+
+def _on(v: Any) -> str:
+    return "🟢 " + F.sc("on") if v else "🔴 " + F.sc("off")
+
+
+def _line(icon: str, label: str, value: Any) -> str:
+    return f"{icon} {F.sc(label)} · <b>{value}</b>"
+
+
+def _back_close(back: str = "ga:back") -> List[List[InlineKeyboardButton]]:
+    return [[
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=back,
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data="ga:close",
+        ),
+    ]]
+
+
+def _kb(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
+# SECTION 2 — MAIN PANEL
+# ============================================================
+
+async def render_main(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+
+    mode = str(cfg.get("content_mode", "both"))
+    mode_icon = {"movie": "🎬", "series": "📺", "both": "🎬📺"}.get(mode, "🎬📺")
+
+    fsub_n = len((cfg.get("fsub") or {}).get("channels") or [])
+    btn_n = len(cfg.get("result_buttons") or [])
+    ad_timer = int((cfg.get("auto_delete") or {}).get("bot_timer", 600))
+    cap_custom = bool(cfg.get("caption_template"))
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{F.EMO['gear']} <b>{F.fb('GROUP SETTINGS')}</b>",
+        DIV, "",
+        f"👥 <b>{F.sc(str(cfg.get('title') or chat_id)[:50])}</b>",
+        f"🆔 <code>{chat_id}</code>",
+        "",
+        DIV_S, "",
+        _line(mode_icon, "content", mode.upper()),
+        _line("🔎", "search", _on(cfg.get("search_enabled", True))),
+        _line("💬", "pm search", _on(cfg.get("pm_search_enabled", True))),
+        _line("👋", "welcome", _on(cfg.get("welcome_enabled", False))),
+        _line("⏱️", "auto-delete", f"{ad_timer}s"),
+        _line("📢", "force-sub", f"{fsub_n} channels"),
+        _line("🔐", "verify", _on((cfg.get("verify") or {}).get("enabled", False))),
+        _line("📝", "caption", "custom" if cap_custom else "global"),
+        _line("🔘", "buttons", f"{btn_n}"),
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{F.EMO['search']} {F.sc('search settings')}",
+            callback_data="ga:s:search")],
+        [InlineKeyboardButton(
+            f"{mode_icon} {F.sc('content mode')} · {mode.upper()}",
+            callback_data="ga:s:content")],
+        [InlineKeyboardButton(
+            f"🎯 {F.sc('flow editor')}",
+            callback_data="ga:s:flow")],
+        [
+            InlineKeyboardButton(
+                f"📝 {F.sc('caption')}",
+                callback_data="ga:s:caption"),
+            InlineKeyboardButton(
+                f"🔘 {F.sc('buttons')} · {btn_n}",
+                callback_data="ga:s:buttons"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"👋 {F.sc('welcome')}",
+                callback_data="ga:s:welcome"),
+            InlineKeyboardButton(
+                f"⏱️ {F.sc('auto-delete')}",
+                callback_data="ga:s:autodel"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🚫 {F.sc('filters')}",
+                callback_data="ga:s:filters"),
+            InlineKeyboardButton(
+                f"📢 {F.sc('force-sub')} · {fsub_n}",
+                callback_data="ga:s:fsub"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🔐 {F.sc('verify')}",
+                callback_data="ga:s:verify"),
+            InlineKeyboardButton(
+                f"🛡️ {F.sc('security')}",
+                callback_data="ga:s:security"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"📝 {F.sc('requests')}",
+                callback_data="ga:s:requests"),
+            InlineKeyboardButton(
+                f"🎬 {F.sc('metadata')}",
+                callback_data="ga:s:metadata"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"📊 {F.sc('stats')}",
+                callback_data="ga:s:stats"),
+            InlineKeyboardButton(
+                f"📋 {F.sc('view all')}",
+                callback_data="ga:s:view"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"♻️ {F.sc('reset all')}",
+                callback_data="ga:s:reset"),
+            InlineKeyboardButton(
+                f"{F.EMO['refresh']} {F.sc('refresh')}",
+                callback_data="ga:s:refresh"),
+        ],
+        [InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data="ga:close")],
+    ]
+
+    return "\n".join(text.split("\n")[:60]), _kb(rows)
+
+
+# ============================================================
+# SECTION 3 — SEARCH
+# ============================================================
+
+async def render_search(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    on_search = cfg.get("search_enabled", True)
+    on_pm = cfg.get("pm_search_enabled", True)
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{F.EMO['search']} <b>{F.fb('SEARCH SETTINGS')}</b>",
+        DIV, "",
+        _line("🔎", "group search", _on(on_search)),
+        _line("💬", "pm search", _on(on_pm)),
+        "",
+        DIV_S,
+        f"📌 {F.sc('pm search = answer text sent to bot pm')}",
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"🔎 {F.sc('group search')} · {'🟢' if on_search else '🔴'}",
+            callback_data="ga:tog:search_enabled")],
+        [InlineKeyboardButton(
+            f"💬 {F.sc('pm search')} · {'🟢' if on_pm else '🔴'}",
+            callback_data="ga:tog:pm_search_enabled")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 4 — CONTENT MODE
+# ============================================================
+
+async def render_content(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    mode = str(cfg.get("content_mode", "both"))
+
+    def mark(v: str) -> str:
+        return "✅ " if mode == v else ""
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🎬 <b>{F.fb('CONTENT MODE')}</b>",
+        DIV, "",
+        f"📌 {F.sc('what users can search in this group')}",
+        "",
+        f"🎬 {F.sc('movies only')}",
+        f"📺 {F.sc('series only')}",
+        f"🎬📺 {F.sc('both')}",
+        "",
+        f"🎯 {F.sc('current')} · <b>{mode.upper()}</b>",
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{mark('movie')}🎬 {F.sc('movies only')}",
+            callback_data="ga:set:content:movie")],
+        [InlineKeyboardButton(
+            f"{mark('series')}📺 {F.sc('series only')}",
+            callback_data="ga:set:content:series")],
+        [InlineKeyboardButton(
+            f"{mark('both')}🎬📺 {F.sc('both')}",
+            callback_data="ga:set:content:both")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 5 — FLOW (list of steps)
+# ============================================================
+
+_FLOW_STEPS = [
+    ("base_search",   "🔎", "Search"),
+    ("spell_check",   "🔤", "Spell Check"),
+    ("suggestions",   "💡", "Suggestions"),
+    ("language",      "🌍", "Language"),
+    ("season",        "📺", "Season"),
+    ("episode",       "🎞️", "Episode"),
+    ("quality",       "🎯", "Quality"),
+    ("file_delivery", "📤", "Delivery"),
+]
+
+
+async def render_flow(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    flow = cfg.get("flow") or {}
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🎯 <b>{F.fb('FLOW EDITOR')}</b>",
+        DIV, "",
+        f"📌 {F.sc('customize the search flow for this group')}",
+        "",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for key, icon, label in _FLOW_STEPS:
+        s = flow.get(key) or {}
+        enabled = s.get("enabled", True)
+        per_row = s.get("per_row", 2)
+        marker = "🟢" if enabled else "🔴"
+
+        text_lines.append(
+            f"{marker} {icon} <b>{F.sc(label)}</b> · "
+            f"<code>{per_row}/row</code>"
+        )
+
+        rows.append([InlineKeyboardButton(
+            f"{marker} {icon} {label}",
+            callback_data=f"ga:flow:{key}",
+        )])
+
+    rows.append(_back_close("ga:back")[0])
+    return "\n".join(text_lines), _kb(rows)
+
+
+async def render_flow_step(
+    chat_id: int, step_key: str,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    flow = cfg.get("flow") or {}
+    s = flow.get(step_key) or {}
+
+    labels = {k: lbl for k, _, lbl in _FLOW_STEPS}
+    icons = {k: ic for k, ic, _ in _FLOW_STEPS}
+    label = labels.get(step_key, step_key)
+    icon = icons.get(step_key, "⚙️")
+
+    enabled = s.get("enabled", True)
+    per_row = int(s.get("per_row", 2))
+    auto_skip = bool(s.get("auto_skip", True))
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{icon} <b>{F.fb(label.upper())}</b>",
+        DIV, "",
+        _line("⚙️", "enabled", _on(enabled)),
+        _line("📐", "layout", f"{per_row}/row"),
+        _line("🔄", "auto-skip", _on(auto_skip)),
+        "",
+        DIV_S,
+        f"📌 {F.sc('changes apply instantly')}",
+    ])
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    rows.append([InlineKeyboardButton(
+        f"{'🔴 ' + F.sc('disable') if enabled else '🟢 ' + F.sc('enable')}",
+        callback_data=f"ga:flow_tog:{step_key}",
+    )])
+
+    layout_row: List[InlineKeyboardButton] = []
+    for n in (1, 2, 3, 4):
+        mark = "✅ " if per_row == n else ""
+        layout_row.append(InlineKeyboardButton(
+            f"{mark}{n}/row",
+            callback_data=f"ga:flow_row:{step_key}:{n}",
+        ))
+    rows.append(layout_row)
+
+    if step_key in ("language", "season", "quality"):
+        rows.append([InlineKeyboardButton(
+            f"🔄 {F.sc('auto-skip if one')} · {'🟢' if auto_skip else '🔴'}",
+            callback_data=f"ga:flow_skip:{step_key}",
+        )])
+
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="ga:s:flow",
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data="ga:close",
+        ),
+    ])
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 6 — CAPTION
+# ============================================================
+
+async def render_caption(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    tpl = cfg.get("caption_template")
+    has = bool(tpl)
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📝 <b>{F.fb('CAPTION TEMPLATE')}</b>",
+        DIV, "",
+        f"📌 {F.sc('per-group caption for delivered files')}",
+        "",
+        f"🎯 {F.sc('status')} · "
+        f"{'🟢 custom' if has else '⚪ global'}",
+    ]
+    if has:
+        text_lines += ["", f"<code>{F.sc(str(tpl)[:400])}</code>"]
+
+    text_lines += [
+        "",
+        DIV_S,
+        f"📌 {F.sc('variables')}:",
+        "<code>{title}</code> <code>{year}</code>",
+        "<code>{quality}</code> <code>{codec}</code>",
+        "<code>{audio}</code> <code>{subtitle}</code>",
+        "<code>{size}</code> <code>{season}</code>",
+        "<code>{episode}</code> <code>{bot_username}</code>",
+    ]
+
+    rows = [[InlineKeyboardButton(
+        f"✏️ {F.sc('edit caption')}",
+        callback_data="ga:cap:edit",
+    )]]
+    if has:
+        rows.append([InlineKeyboardButton(
+            f"👁️ {F.sc('preview')}",
+            callback_data="ga:cap:preview",
+        )])
+        rows.append([InlineKeyboardButton(
+            f"♻️ {F.sc('reset to global')}",
+            callback_data="ga:cap:reset",
+        )])
+    rows.append(_back_close("ga:back")[0])
+    return "\n".join(text_lines), _kb(rows)
+
+
+async def render_caption_preview(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    tpl = cfg.get("caption_template") or ""
+
+    sample = {
+        "title": "Karnan", "year": "2021",
+        "quality": "1080P", "codec": "HEVC",
+        "audio": "Tamil", "subtitle": "English",
+        "size": "1.4 GB", "season": "", "episode": "",
+        "bot_username": "examplebot",
+        "bot_link": "https://t.me/examplebot",
+    }
+    try:
+        rendered = tpl.format(**sample)
+    except Exception as e:
+        rendered = f"(error: {e})\n\n{tpl}"
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"👁️ <b>{F.fb('CAPTION PREVIEW')}</b>",
+        DIV, "",
+        rendered,
+    ])
+
+    rows = [[
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="ga:s:caption",
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data="ga:close",
+        ),
+    ]]
+    return "\n".join(text)[:4000], _kb(rows)
+
+
+# ============================================================
+# SECTION 7 — BUTTONS
+# ============================================================
+
+async def render_buttons(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    btns = cfg.get("result_buttons") or []
+    per_row = int(cfg.get("buttons_per_row", 2))
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔘 <b>{F.fb('RESULT BUTTONS')}</b>",
+        DIV, "",
+        f"📊 {F.sc('total')} · <b>{len(btns)}</b>",
+        f"📐 {F.sc('per row')} · <b>{per_row}</b>",
+        "",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    for i, b in enumerate(btns, 1):
+        enabled = b.get("enabled", True)
+        marker = "🟢" if enabled else "🔴"
+        name = str(b.get("name", "?"))[:36]
+        text_lines.append(f"<b>{i:02d}.</b> {marker} {F.sc(name)}")
+
+        rows.append([InlineKeyboardButton(
+            f"{marker} {i}. {name[:26]}",
+            callback_data=f"ga:btn:view:{i - 1}",
+        )])
+
+    rows.append([InlineKeyboardButton(
+        f"➕ {F.sc('add button')}",
+        callback_data="ga:btn:add",
+    )])
+
+    per_row_row: List[InlineKeyboardButton] = []
+    for n in (1, 2, 3):
+        mark = "✅ " if per_row == n else ""
+        per_row_row.append(InlineKeyboardButton(
+            f"{mark}{n}/row",
+            callback_data=f"ga:btn_row:{n}",
+        ))
+    rows.append(per_row_row)
+
+    rows.append(_back_close("ga:back")[0])
+    return "\n".join(text_lines), _kb(rows)
+
+
+async def render_button_view(
+    chat_id: int, idx: int,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    btns = cfg.get("result_buttons") or []
+
+    if idx < 0 or idx >= len(btns):
+        return await render_buttons(chat_id)
+
+    b = btns[idx]
+    enabled = b.get("enabled", True)
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔘 <b>{F.fb('BUTTON DETAIL')}</b>",
+        DIV, "",
+        _line("📛", "name", F.sc(str(b.get("name", "?"))[:60])),
+        f"🔗 {F.sc('url')} · <code>{str(b.get('url', '?'))[:60]}</code>",
+        _line("⚙️", "status", _on(enabled)),
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{'🔴 ' + F.sc('disable') if enabled else '🟢 ' + F.sc('enable')}",
+            callback_data=f"ga:btn:tog:{idx}",
+        )],
+        [InlineKeyboardButton(
+            f"🗑️ {F.sc('delete')}",
+            callback_data=f"ga:btn:del:{idx}",
+        )],
+        _back_close("ga:s:buttons")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 8 — WELCOME
+# ============================================================
+
+async def render_welcome(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    w_on = cfg.get("welcome_enabled", False)
+    w_text = cfg.get("welcome_text")
+    ad_on = cfg.get("welcome_auto_delete", True)
+    ad_secs = int(cfg.get("welcome_delete_after", 600))
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"👋 <b>{F.fb('WELCOME MESSAGE')}</b>",
+        DIV, "",
+        _line("📢", "enabled", _on(w_on)),
+        _line("⏱️", "auto-delete", _on(ad_on)),
+        _line("⏳", "delete after", f"{ad_secs}s"),
+    ]
+    if w_text:
+        text_lines += [
+            "",
+            f"📝 {F.sc('current')}:",
+            f"<code>{F.sc(str(w_text)[:300])}</code>",
+        ]
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{'🔴 ' + F.sc('disable') if w_on else '🟢 ' + F.sc('enable')}",
+            callback_data="ga:w_tog",
+        )],
+        [InlineKeyboardButton(
+            f"✏️ {F.sc('edit text')}",
+            callback_data="ga:w_edit",
+        )],
+        [InlineKeyboardButton(
+            f"⏱️ {F.sc('auto-delete')} · {'🟢' if ad_on else '🔴'}",
+            callback_data="ga:w_adtog",
+        )],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text_lines), _kb(rows)
+
+
+# ============================================================
+# SECTION 9 — AUTO-DELETE
+# ============================================================
+
+async def render_autodel(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    ad = cfg.get("auto_delete") or {}
+
+    bot_on = ad.get("bot_messages", True)
+    bot_timer = int(ad.get("bot_timer", 600))
+    user_on = ad.get("user_messages", True)
+    keep_n = int(ad.get("keep_last_n", 10))
+    cmd_on = ad.get("command_messages", True)
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"⏱️ <b>{F.fb('AUTO-DELETE')}</b>",
+        DIV, "",
+        _line("🤖", "bot messages", _on(bot_on)),
+        _line("⏳", "bot timer", f"{bot_timer}s"),
+        _line("👤", "user messages", _on(user_on)),
+        _line("🔢", "keep last", keep_n),
+        _line("⌨️", "command messages", _on(cmd_on)),
+        "",
+        DIV_S,
+        f"📌 {F.sc('bot = delete our sent files/messages')}",
+        f"📌 {F.sc('user = clean up user messages')}",
+    ])
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            f"🤖 {F.sc('bot messages')} · {'🟢' if bot_on else '🔴'}",
+            callback_data="ga:ad_tog:bot_messages")],
+    ]
+
+    timer_row: List[InlineKeyboardButton] = []
+    for secs, label in [(60, "1m"), (300, "5m"), (600, "10m"),
+                        (1800, "30m"), (3600, "1h"), (0, "OFF")]:
+        mark = "✅ " if bot_timer == secs else ""
+        timer_row.append(InlineKeyboardButton(
+            f"{mark}{label}",
+            callback_data=f"ga:ad_timer:{secs}",
+        ))
+    rows.append(timer_row)
+
+    rows.append([InlineKeyboardButton(
+        f"👤 {F.sc('user messages')} · {'🟢' if user_on else '🔴'}",
+        callback_data="ga:ad_tog:user_messages")])
+
+    keep_row: List[InlineKeyboardButton] = []
+    for n in (5, 10, 20, 50):
+        mark = "✅ " if keep_n == n else ""
+        keep_row.append(InlineKeyboardButton(
+            f"{mark}{n}",
+            callback_data=f"ga:ad_keep:{n}",
+        ))
+    rows.append(keep_row)
+
+    rows.append([InlineKeyboardButton(
+        f"⌨️ {F.sc('command messages')} · {'🟢' if cmd_on else '🔴'}",
+        callback_data="ga:ad_tog:command_messages")])
+
+    rows.append(_back_close("ga:back")[0])
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 10 — FILTERS
+# ============================================================
+
+async def render_filters(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    filt = cfg.get("filters") or {}
+
+    bl_on = filt.get("banned_links", True)
+    bf_on = filt.get("block_forward", False)
+    bm_on = filt.get("block_media", False)
+    words = filt.get("banned_words") or []
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🚫 <b>{F.fb('FILTERS')}</b>",
+        DIV, "",
+        _line("🔗", "block links", _on(bl_on)),
+        _line("➡️", "block forwards", _on(bf_on)),
+        _line("📎", "block media", _on(bm_on)),
+        _line("🔤", "banned words", f"{len(words)}"),
+    ])
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🔗 {F.sc('links')} · {'🟢' if bl_on else '🔴'}",
+                callback_data="ga:flt_tog:banned_links"),
+            InlineKeyboardButton(
+                f"➡️ {F.sc('forwards')} · {'🟢' if bf_on else '🔴'}",
+                callback_data="ga:flt_tog:block_forward"),
+        ],
+        [InlineKeyboardButton(
+            f"📎 {F.sc('media')} · {'🟢' if bm_on else '🔴'}",
+            callback_data="ga:flt_tog:block_media")],
+        [InlineKeyboardButton(
+            f"🔤 {F.sc('banned words')} ({len(words)})",
+            callback_data="ga:flt_words")],
+        [InlineKeyboardButton(
+            f"➕ {F.sc('add word')}",
+            callback_data="ga:flt_add")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 11 — FORCE-SUB
+# ============================================================
+
+async def render_fsub(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    f = cfg.get("fsub") or {}
+    enabled = f.get("enabled", False)
+    channels = f.get("channels") or []
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📢 <b>{F.fb('FORCE SUBSCRIPTION')}</b>",
+        DIV, "",
+        _line("⚙️", "enabled", _on(enabled)),
+        _line("📊", "channels", f"{len(channels)}"),
+        "",
+    ]
+    for c in channels[:8]:
+        text_lines.append(f"• <code>{c}</code>")
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{'🔴 ' + F.sc('disable') if enabled else '🟢 ' + F.sc('enable')}",
+            callback_data="ga:fs_tog")],
+        [InlineKeyboardButton(
+            f"➕ {F.sc('add channel')}",
+            callback_data="ga:fs_add")],
+    ]
+
+    if channels:
+        for i, c in enumerate(channels[:5]):
+            rows.append([InlineKeyboardButton(
+                f"🗑️ {str(c)[:40]}",
+                callback_data=f"ga:fs_rm:{i}",
+            )])
+
+    rows.append(_back_close("ga:back")[0])
+    return "\n".join(text_lines), _kb(rows)
+
+
+# ============================================================
+# SECTION 12 — VERIFY
+# ============================================================
+
+async def render_verify(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    v = cfg.get("verify") or {}
+    enabled = v.get("enabled", False)
+    shortener = v.get("shortener_url")
+    vtime = int(v.get("verify_time", 1200))
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔐 <b>{F.fb('VERIFICATION')}</b>",
+        DIV, "",
+        _line("⚙️", "enabled", _on(enabled)),
+        f"🔗 {F.sc('shortener')} · "
+        f"<code>{shortener or 'not set'}</code>",
+        _line("⏱️", "verify time", f"{vtime}s"),
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"{'🔴 ' + F.sc('disable') if enabled else '🟢 ' + F.sc('enable')}",
+            callback_data="ga:v_tog")],
+        [InlineKeyboardButton(
+            f"🔗 {F.sc('set shortener')}",
+            callback_data="ga:v_url")],
+        [InlineKeyboardButton(
+            f"⏱️ {F.sc('verify time')}",
+            callback_data="ga:v_time")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 13 — SECURITY
+# ============================================================
+
+async def render_security(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    sec = cfg.get("security") or {}
+
+    url_on = sec.get("url_blocking", True)
+    tg_on = sec.get("telegram_links", True)
+    ab_on = sec.get("admin_bypass", True)
+    fc_on = sec.get("search_flood_control", True)
+    lim = int(sec.get("search_limit", 5))
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🛡️ <b>{F.fb('SECURITY')}</b>",
+        DIV, "",
+        _line("🌐", "url blocking", _on(url_on)),
+        _line("🔗", "telegram links", _on(tg_on)),
+        _line("👑", "admin bypass", _on(ab_on)),
+        _line("⚠️", "flood control", _on(fc_on)),
+        _line("📊", "search limit", f"{lim}/min"),
+    ])
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🌐 {F.sc('urls')} · {'🟢' if url_on else '🔴'}",
+                callback_data="ga:sec:url_blocking"),
+            InlineKeyboardButton(
+                f"🔗 {F.sc('tg links')} · {'🟢' if tg_on else '🔴'}",
+                callback_data="ga:sec:telegram_links"),
+        ],
+        [InlineKeyboardButton(
+            f"👑 {F.sc('admin bypass')} · {'🟢' if ab_on else '🔴'}",
+            callback_data="ga:sec:admin_bypass")],
+        [InlineKeyboardButton(
+            f"⚠️ {F.sc('flood control')} · {'🟢' if fc_on else '🔴'}",
+            callback_data="ga:sec:search_flood_control")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 14 — REQUESTS
+# ============================================================
+
+async def render_requests(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    r = cfg.get("requests") or {}
+
+    en = r.get("enabled", True)
+    pm_upd = r.get("user_pm_update", True)
+    dup = r.get("duplicate_check", True)
+    ch = r.get("channel")
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📝 <b>{F.fb('REQUESTS')}</b>",
+        DIV, "",
+        _line("⚙️", "enabled", _on(en)),
+        _line("💬", "pm update", _on(pm_upd)),
+        _line("🔁", "dup check", _on(dup)),
+        f"📢 {F.sc('channel')} · <code>{ch or 'global'}</code>",
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"⚙️ {F.sc('enabled')} · {'🟢' if en else '🔴'}",
+            callback_data="ga:req_tog:enabled")],
+        [
+            InlineKeyboardButton(
+                f"💬 {F.sc('pm update')} · {'🟢' if pm_upd else '🔴'}",
+                callback_data="ga:req_tog:user_pm_update"),
+            InlineKeyboardButton(
+                f"🔁 {F.sc('dup check')} · {'🟢' if dup else '🔴'}",
+                callback_data="ga:req_tog:duplicate_check"),
+        ],
+        [InlineKeyboardButton(
+            f"📢 {F.sc('set channel')}",
+            callback_data="ga:req_ch")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 15 — METADATA
+# ============================================================
+
+async def render_metadata(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    m = cfg.get("metadata") or {}
+
+    fields = [
+        ("poster", "🖼️", "Poster"),
+        ("rating", "⭐", "Rating"),
+        ("genre", "🎭", "Genre"),
+        ("year", "📅", "Year"),
+        ("language", "🌐", "Language"),
+    ]
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🎬 <b>{F.fb('METADATA DISPLAY')}</b>",
+        DIV, "",
+        f"📌 {F.sc('what to show with search results')}",
+        "",
+    ]
+
+    for key, icon, label in fields:
+        v = m.get(key, True)
+        text_lines.append(f"{icon} {F.sc(label)} · {_on(v)}")
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for key, icon, label in fields:
+        v = m.get(key, True)
+        rows.append([InlineKeyboardButton(
+            f"{icon} {label} · {'🟢' if v else '🔴'}",
+            callback_data=f"ga:meta_tog:{key}",
+        )])
+
+    rows.append(_back_close("ga:back")[0])
+    return "\n".join(text_lines), _kb(rows)
+
+
+# ============================================================
+# SECTION 16 — STATS
+# ============================================================
+
+async def render_stats(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    st = cfg.get("stats") or {}
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📊 <b>{F.fb('GROUP STATS')}</b>",
+        DIV, "",
+        _line("🔎", "searches today", FM.num(st.get("searches_today", 0))),
+        _line("✅", "results found", FM.num(st.get("results_found", 0))),
+        _line("❌", "not found", FM.num(st.get("not_found", 0))),
+        _line("📤", "files sent", FM.num(st.get("files_sent", 0))),
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"🔄 {F.sc('refresh')}",
+            callback_data="ga:s:stats")],
+        [InlineKeyboardButton(
+            f"🗑️ {F.sc('reset stats')}",
+            callback_data="ga:stats_reset")],
+        _back_close("ga:back")[0],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 17 — VIEW ALL
+# ============================================================
+
+async def render_view(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+
+    ad = cfg.get("auto_delete") or {}
+    fsub = cfg.get("fsub") or {}
+    filt = cfg.get("filters") or {}
+    ver = cfg.get("verify") or {}
+
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📋 <b>{F.fb('ALL SETTINGS')}</b>",
+        DIV, "",
+        _line("🎬", "content", str(cfg.get("content_mode", "both")).upper()),
+        _line("🔎", "search", _on(cfg.get("search_enabled", True))),
+        _line("💬", "pm search", _on(cfg.get("pm_search_enabled", True))),
+        _line("👋", "welcome", _on(cfg.get("welcome_enabled", False))),
+        _line("⏱️", "auto-delete", f"{ad.get('bot_timer', 600)}s"),
+        _line("🔢", "keep last", ad.get("keep_last_n", 10)),
+        _line("📢", "fsub", f"{len(fsub.get('channels') or [])}"),
+        _line("📝", "caption",
+              "custom" if cfg.get("caption_template") else "global"),
+        _line("🔘", "buttons", f"{len(cfg.get('result_buttons') or [])}"),
+        _line("🚫", "banned words",
+              f"{len(filt.get('banned_words') or [])}"),
+        _line("🔐", "verify", _on(ver.get("enabled", False))),
+    ])
+
+    rows = [_back_close("ga:back")[0]]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 18 — RESET (confirm)
+# ============================================================
+
+async def render_reset(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    text = "\n".join([
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"♻️ <b>{F.fb('RESET ALL SETTINGS')}</b>",
+        DIV, "",
+        f"{F.EMO['warn']} {F.sc('this will restore all defaults')}",
+        "",
+        f"📌 {F.sc('title + username are kept')}",
+        f"📌 {F.sc('everything else is reset')}",
+    ])
+
+    rows = [
+        [InlineKeyboardButton(
+            f"♻️ {F.sc('yes, reset all')}",
+            callback_data="ga:reset_do")],
+        [InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('cancel')}",
+            callback_data="ga:back")],
+    ]
+    return "\n".join(text), _kb(rows)
+
+
+# ============================================================
+# SECTION 19 — WORDS LIST (helpers panel)
+# ============================================================
+
+async def render_words_list(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await S.get_config(chat_id)
+    words = ((cfg.get("filters") or {}).get("banned_words") or [])
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🔤 <b>{F.fb('BANNED WORDS')}</b>",
+        DIV, "",
+    ]
+    if not words:
+        text_lines.append(f"⚪ {F.sc('no words yet')}")
+    else:
+        for i, w in enumerate(words, 1):
+            text_lines.append(f"<b>{i:02d}.</b> <code>{w}</code>")
+
+    rows = [
+        [InlineKeyboardButton(
+            f"🗑️ {F.sc('clear all')}",
+            callback_data="ga:flt_clear")],
+        [InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data="ga:s:filters")],
+    ]
+    return "\n".join(text_lines), _kb(rows)
+
+
+# ============================================================
+# SECTION 20 — PUBLIC EXPORTS
+# ============================================================
+
+__all__ = [
+    "render_main",
+    "render_search",
+    "render_content",
+    "render_flow", "render_flow_step",
+    "render_caption", "render_caption_preview",
+    "render_buttons", "render_button_view",
+    "render_welcome",
+    "render_autodel",
+    "render_filters", "render_words_list",
+    "render_fsub",
+    "render_verify",
+    "render_security",
+    "render_requests",
+    "render_metadata",
+    "render_stats",
+    "render_view",
+    "render_reset",
+]
