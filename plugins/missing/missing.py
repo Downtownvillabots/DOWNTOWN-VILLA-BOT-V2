@@ -1013,30 +1013,6 @@ try:
     asyncio.get_event_loop().create_task(_cleanup_loop())
 except Exception:
     pass
-# ═══════════════════════════════════════════════════════════════════════════
-# PUBLIC ENTRY — called from /admin panel button
-# ═══════════════════════════════════════════════════════════════════════════
-async def open_panel_for_admin(client: Client, message: Message) -> bool:
-    """Called by admin.py when user taps 🔎 MISSING button."""
-    try:
-        if not message.from_user or not _is_admin(message.from_user.id):
-            return False
-        if not TMDB_API_KEY:
-            try:
-                await message.reply_text(
-                    "⚠️ <b>TMDB_API_KEY ɴᴏᴛ ꜱᴇᴛ</b>",
-                    parse_mode=ParseMode.HTML)
-            except Exception: pass
-            return False
-        _clear_session(message.from_user.id)
-        await message.reply_text(
-            _view_start(), reply_markup=kb_type(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True)
-        return True
-    except Exception as e:
-        logger.exception(f"[MISS] admin open: {e}")
-        return False
 
 # ═══════════════════════════════════════════════════════════════════════════
 # EXPORTS
