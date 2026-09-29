@@ -1,55 +1,60 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — MISSING TEMPLATES (FANCY)
 # ============================================================
-#
-# Fully customizable captions + buttons for missing finder.
-# Static labels are pre-rendered with fancy fonts.
-# Dynamic values ({PERIOD}, {MISSING}, etc.) are placeholders.
-#
-# ============================================================
-
 from __future__ import annotations
-
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+from string import Formatter
+from typing import Any, Dict, Optional
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from utils import fonts as F
+from plugins.missing import fonts as F
 
 logger = logging.getLogger(__name__)
-
-SETTINGS_COLL = "missing_templates"
+COLL_NAME = "missing_templates"
 
 
 def _coll():
     try:
+        from database import db_manager
+        for n in ("get_system_db", "get_user_db"):
+            fn = getattr(db_manager, n, None)
+            if callable(fn):
+                try:
+                    d = fn()
+                    if d is not None: return d[COLL_NAME]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
         from database import db_registry
-        db = db_registry.get_system_db()
-        return db[SETTINGS_COLL] if db is not None else None
+        d = db_registry.get_system_db()
+        return d[COLL_NAME] if d is not None else None
     except Exception:
         return None
 
 
-# ============================================================
-# DEFAULT TEMPLATES
-# ============================================================
-#
-# IMPORTANT: inside these strings, any `{...}` will be replaced
-# by .format() at render time. Static labels use F.sc()/F.fb()
-# and are pre-baked into the string at import time.
-#
-# ============================================================
+# ── Safe format (never crashes on missing keys) ──
+class _SafeDict(dict):
+    def __missing__(self, key): return "{" + key + "}"
 
+
+def _safe_format(tpl: str, ctx: Dict[str, Any]) -> str:
+    try:
+        return Formatter().vformat(tpl, (), _SafeDict(**ctx))
+    except Exception as e:
+        logger.debug(f"[MISS-TPL] format: {e}")
+        return tpl
+
+
+# ── Default templates ──
 DEFAULT_HEADER = (
     f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>\n"
     f"🔍 <b>{F.fb('MISSING')} {{TYPE}}</b>\n"
-    f"{F.DIV}\n"
-    f"\n"
+    f"{F.DIV}\n\n"
     f"📅 {F.sc('period')} · <code>{{PERIOD}}</code>\n"
-    f"🌍 {F.sc('industry')} · <b>{{INDUSTRY}}</b>\n"
-    f"\n"
+    f"🌍 {F.sc('industry')} · <b>{{INDUSTRY}}</b>\n\n"
     f"📥 {F.sc('fetched')} · <code>{{FETCHED}}</code>\n"
     f"✅ {F.sc('in db')} · <code>{{IN_DB}}</code>\n"
     f"❌ {F.sc('missing')} · <code>{{MISSING}}</code>\n"
@@ -68,17 +73,12 @@ DEFAULT_ITEM_LINE = (
 )
 
 
-# ============================================================
-# TEMPLATE PRESETS
-# ============================================================
-
 TEMPLATES = {
     "default": {
         "header": DEFAULT_HEADER,
         "footer": DEFAULT_FOOTER,
         "item_line": DEFAULT_ITEM_LINE,
     },
-
     "minimal": {
         "header": (
             f"🔍 <b>{F.fb('MISSING')} {{TYPE}}</b>\n"
@@ -87,33 +87,10 @@ TEMPLATES = {
         "footer": f"\n🕒 <code>{{TIME}}</code>",
         "item_line": f"<b>{{N}}.</b> <code>{{NAME}}</code>\n",
     },
-
-    "fancy": {
-        "header": (
-            f"╔════════════════════════════════╗\n"
-            f"║  {F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>  ║\n"
-            f"║  🔍 <b>{F.fb('MISSING')} {{TYPE}}</b>\n"
-            f"╚════════════════════════════════╝\n"
-            f"\n"
-            f"📅 {F.sc('period')}   · <code>{{PERIOD}}</code>\n"
-            f"🌍 {F.sc('industry')} · <b>{{INDUSTRY}}</b>\n"
-            f"\n"
-            f"📥 {F.sc('fetched')}  · <code>{{FETCHED}}</code>\n"
-            f"✅ {F.sc('in db')}   · <code>{{IN_DB}}</code>\n"
-            f"❌ {F.sc('missing')} · <code>{{MISSING}}</code>\n"
-        ),
-        "footer": (
-            f"\n{F.DIV}\n"
-            f"🕒 <code>{{TIME}}</code>"
-        ),
-        "item_line": f"◪ <b>{{N}}.</b> <code>{{NAME}}</code>\n",
-    },
-
     "compact": {
         "header": (
             f"{F.EMO['brand']} <b>{F.fb('MISSING')} {{TYPE}}</b>\n"
-            f"<code>{{PERIOD}}</code> · <b>{{INDUSTRY}}</b>\n"
-            f"\n"
+            f"<code>{{PERIOD}}</code> · <b>{{INDUSTRY}}</b>\n\n"
         ),
         "footer": f"\n🕒 <code>{{TIME}}</code>",
         "item_line": f"<b>{{N}}.</b> <code>{{NAME}}</code>\n",
@@ -121,18 +98,12 @@ TEMPLATES = {
 }
 
 
-# ============================================================
-# GET / SET
-# ============================================================
-
 async def get_template(key: str = "template") -> Optional[Dict[str, Any]]:
     c = _coll()
-    if c is None:
-        return None
+    if c is None: return None
     try:
         d = await c.find_one({"_id": key})
-        if d:
-            d.pop("_id", None)
+        if d: d.pop("_id", None)
         return d
     except Exception:
         return None
@@ -140,60 +111,24 @@ async def get_template(key: str = "template") -> Optional[Dict[str, Any]]:
 
 async def set_template(key: str, value: Dict[str, Any]) -> bool:
     c = _coll()
-    if c is None:
-        return False
+    if c is None: return False
     try:
-        value["updated_at"] = datetime.utcnow()
         await c.update_one({"_id": key}, {"$set": value}, upsert=True)
         return True
     except Exception:
         return False
 
 
-# ============================================================
-# BUTTONS
-# ============================================================
-
-async def get_buttons() -> List[Dict[str, Any]]:
-    c = _coll()
-    if c is None:
-        return []
-    try:
-        d = await c.find_one({"_id": "buttons"})
-        return list(d.get("list") or []) if d else []
-    except Exception:
-        return []
-
-
-async def set_buttons(buttons: List[Dict[str, Any]]) -> bool:
-    c = _coll()
-    if c is None:
-        return False
-    try:
-        await c.update_one(
-            {"_id": "buttons"},
-            {"$set": {"list": buttons, "updated_at": datetime.utcnow()}},
-            upsert=True,
-        )
-        return True
-    except Exception:
-        return False
-
-
-def build_button_kb(buttons: List[Dict]) -> Optional[InlineKeyboardMarkup]:
-    if not buttons:
-        return None
-    rows: List[List[InlineKeyboardButton]] = []
+def build_button_kb(buttons: list) -> Optional[InlineKeyboardMarkup]:
+    if not buttons: return None
+    rows = []
     for b in buttons:
         name = (b.get("name") or "").strip()
         url = (b.get("url") or "").strip()
-        if not name or not url:
-            continue
+        if not name or not url: continue
         if url.startswith("@"):
             url = f"https://t.me/{url[1:]}"
-        elif not (url.startswith("http://")
-                  or url.startswith("https://")
-                  or url.startswith("tg://")):
+        elif not url.startswith(("http://", "https://", "tg://")):
             if "." in url and " " not in url:
                 url = f"https://{url}"
             else:
@@ -202,46 +137,21 @@ def build_button_kb(buttons: List[Dict]) -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-# ============================================================
-# RENDER
-# ============================================================
-#
-# Because headers use F.sc() on STATIC labels only, .format()
-# still works — placeholders like {PERIOD} survive.
-#
-# ============================================================
-
+# ── Render ──
 def render_header(t: Dict[str, Any], ctx: Dict[str, Any]) -> str:
-    try:
-        return t.get("header", DEFAULT_HEADER).format(**ctx)
-    except Exception as e:
-        logger.debug(f"[MISS-TPL] header: {e}")
-        return DEFAULT_HEADER.format(**ctx) if ctx else DEFAULT_HEADER
+    return _safe_format(t.get("header") or DEFAULT_HEADER, ctx)
 
 
 def render_item(t: Dict[str, Any], ctx: Dict[str, Any]) -> str:
-    try:
-        return t.get("item_line", DEFAULT_ITEM_LINE).format(**ctx)
-    except Exception as e:
-        logger.debug(f"[MISS-TPL] item: {e}")
-        return DEFAULT_ITEM_LINE.format(**ctx) if ctx else DEFAULT_ITEM_LINE
+    return _safe_format(t.get("item_line") or DEFAULT_ITEM_LINE, ctx)
 
 
 def render_footer(t: Dict[str, Any], ctx: Dict[str, Any]) -> str:
-    try:
-        return t.get("footer", DEFAULT_FOOTER).format(**ctx)
-    except Exception as e:
-        logger.debug(f"[MISS-TPL] footer: {e}")
-        return DEFAULT_FOOTER.format(**ctx) if ctx else DEFAULT_FOOTER
+    return _safe_format(t.get("footer") or DEFAULT_FOOTER, ctx)
 
-
-# ============================================================
-# PUBLIC
-# ============================================================
 
 __all__ = [
     "TEMPLATES", "DEFAULT_HEADER", "DEFAULT_FOOTER", "DEFAULT_ITEM_LINE",
-    "get_template", "set_template",
-    "get_buttons", "set_buttons", "build_button_kb",
+    "get_template", "set_template", "build_button_kb",
     "render_header", "render_item", "render_footer",
 ]
