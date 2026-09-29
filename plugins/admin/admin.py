@@ -1143,7 +1143,7 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             return
 
         if module == "missing":
-            from plugins import missing as MS
+            from plugins.missing import missing as MS
             fn = getattr(MS, "open_panel_for_admin", None)
             if fn is not None:
                 await fn(client, q.message)
