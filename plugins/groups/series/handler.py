@@ -394,6 +394,25 @@ def view_redirecting(title: str, season: int, quality: str, count: int) -> str:
         f"📌 {sc('files will be delivered there')}",
     ])
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5b — NO-FILES CARD (suggestion clicked but not in DB)
+# ═══════════════════════════════════════════════════════════════════════════
+def view_no_files_card(title: str, year: Any = None) -> str:
+    yr = f" ({year})" if year else ""
+    return "\n".join([
+        f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"❌ <b>{fb('NOT IN DATABASE YET')}</b>",
+        DIV, "",
+        f"🎬 <b>{esc(title)}</b>{yr}",
+        "",
+        f"📌 {sc('this title is not in our database yet')}",
+        f"📌 {sc('your request has been sent to admin')}",
+        f"📌 {sc('we will notify you once it is uploaded')}",
+        "",
+        DIV_S,
+        f"📩 {sc('you will be notified once it is uploaded')}",
+    ])
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 6 — KEYBOARDS
@@ -2263,56 +2282,69 @@ async def cb_pick(client: Client, q: CallbackQuery):
 
         await q.answer("🔍 loading…")
 
+        # ── Step 1: search DB with the suggestion title ──
         db_match = await smart_db_search(title)
 
+        # ── Step 2: no DB hit → post request + show Start Bot card ──
         if not db_match:
+            logger.info(
+                f"[SERIES-H] suggestion click → no DB match: {title!r}"
+            )
+
             token = await post_to_request_channel(
                 client, uid, title,
                 year=year or None, tmdb_id=tmdb_id,
                 source="suggestion_not_in_db",
             )
-            if token:
-                await render(
-                    client, q.message.chat.id, q.message.id,
-                    "\n".join([
-                        f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
-                        f"📩 <b>{fb('REQUEST SENT')}</b>",
-                        DIV, "",
-                        f"🎬 <b>{esc(title)}</b>"
-                        + (f" ({year})" if year else ""),
-                        "",
-                        f"📌 {sc('not in our db')}",
-                        f"📌 {sc('admin will review your request')}",
-                    ]),
-                    InlineKeyboardMarkup([[
-                        InlineKeyboardButton("❌ CLOSE",
-                                              callback_data="sg:close"),
-                    ]]),
-                    None,
-                )
-                return
+
+            # Get bot username for the Start button
+            bot_username = ""
+            try:
+                me = await client.identity()
+                bot_username = me.username or ""
+            except Exception:
+                try:
+                    me = await client.get_me()
+                    bot_username = me.username or ""
+                except Exception:
+                    bot_username = ""
+            if not bot_username:
+                bot_username = str(
+                    getattr(CFG, "BOT_USERNAME", "") or ""
+                ).lstrip("@")
+
+            already = await user_started_bot(uid)
+            rows: List[List[InlineKeyboardButton]] = []
+            if bot_username and not already:
+                start_link = f"https://t.me/{bot_username}?start=start"
+                rows.append([InlineKeyboardButton(
+                    f"{F.EMO['rocket']} {sc('START BOT FOR UPDATES')}",
+                    url=start_link,
+                )])
+            rows.append([InlineKeyboardButton(
+                "❌ CLOSE", callback_data="sg:close",
+            )])
 
             await render(
                 client, q.message.chat.id, q.message.id,
-                "\n".join([
-                    f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
-                    f"❌ <b>{fb('NOT IN DB')}</b>",
-                    DIV, "",
-                    f"🎬 <b>{esc(title)}</b>"
-                    + (f" ({year})" if year else ""),
-                    "",
-                    f"📌 {sc('not available right now')}",
-                ]),
-                InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ CLOSE",
-                                          callback_data="sg:close"),
-                ]]),
+                view_no_files_card(title, year),
+                InlineKeyboardMarkup(rows),
                 None,
+            )
+
+            logger.info(
+                f"[SERIES-H] request posted · uid={uid} "
+                f"title={title!r} req_token={token or 'FAILED'}"
             )
             return
 
+        # ── Step 3: DB hit → start the wizard ──
         matched_title = db_match["matched_title"]
         hits = db_match["hits"]
+        logger.info(
+            f"[SERIES-H] suggestion click → DB match {matched_title!r} "
+            f"({len(hits)} hits)"
+        )
 
         chosen_data = await enrich_with_tmdb(
             matched_title, hits,
