@@ -280,20 +280,21 @@ async def step_enabled(chat_id: int, key: str) -> bool:
 
 
 async def step_auto_skip(chat_id: int, key: str) -> bool:
-    try:
-        return bool(await SFLOW.is_auto_skip(chat_id, key))
-    except Exception:
-        return False
+    """
+    v1 UX: NEVER auto-skip. Always show the picker, even if only
+    one option. Admin can still hide a whole step by disabling it
+    in the Flow Editor — but we never silently skip on count==1.
+    """
+    return False
 
 
 async def wizard_steps(chat_id: int) -> List[str]:
-    try:
-        steps = await SFLOW.get_wizard_steps(chat_id)
-        if steps:
-            return list(steps)
-    except Exception:
-        pass
-    # v1 fallback order
+    """
+    v1 UX: always use the fixed v1 order, extended with the
+    optional episode step. The admin panel controls per-step
+    ENABLE/DISABLE (via is_step_enabled) and LAYOUT (per_row,
+    max_items) — but never the order.
+    """
     return ["language", "season", "episode", "quality", "file_delivery"]
 
 
