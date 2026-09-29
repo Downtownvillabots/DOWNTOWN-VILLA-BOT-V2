@@ -286,24 +286,66 @@ async def _send_welcome(message: Message) -> None:
 
 async def _handle_file(client, message, prefix, extra):
     """
-    file_{token} — deliver a single file to user PM.
-    Token is looked up in DB (plugins.groups.shared.deep_link).
+    file_{token}      → deep_link token (kind="file")
+    file_{sid}_{idx}  → media_search session id + index
+    Tries token first, falls back to session.
     """
     try:
         from plugins.groups.shared import deep_link as DL
         from media_search import delivery as DEL
         from media_search.models import FileHit
+        from media_search import sessions as _sess_mod
 
-        token = str(extra or "").strip()
-        if not token:
+        raw = str(extra or "").strip()
+        if not raw:
             return False
 
-        # Load token
-        doc = await DL.get_token(token)
-        if not doc or doc.get("kind") != "file":
+        uid = message.from_user.id
+
+        # ── Path A: deep_link token ──
+        doc = await DL.get_token(raw)
+        if doc and doc.get("kind") == "file":
+            if int(doc.get("user_id", 0)) != int(uid):
+                await message.reply_text(
+                    f"{F.EMO['cross']} {F.sc('this link is not for you')}",
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
+
+            hit_data = doc.get("hit") or {}
+            if not hit_data.get("file_id"):
+                await message.reply_text("❌ Invalid file")
+                return True
+
+            try:
+                hit = FileHit.from_dict(hit_data)
+            except Exception:
+                class _Hit:
+                    def __init__(self, d):
+                        for k, v in d.items():
+                            setattr(self, k, v)
+                hit = _Hit(hit_data)
+
+            await DEL.delivery.send_file(client, uid, hit)
+            await DL.mark_used(raw)
+            return True
+
+        # ── Path B: session_{sid}_{idx} ──
+        parts = raw.rsplit("_", 1)
+        if len(parts) != 2:
+            return False
+
+        sid, idx_str = parts
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            return False
+
+        session = await _sess_mod.sessions.get(sid)
+        if not session:
             await message.reply_text(
                 "\n".join([
-                    f"{F.EMO['warn']} <b>{F.fb('LINK EXPIRED')}</b>",
+                    f"{F.EMO['warn']} <b>{F.fb('SESSION EXPIRED')}</b>",
                     F.DIV, "",
                     f"{F.EMO['search']} {F.sc('please search again in the group')}",
                 ]),
@@ -311,39 +353,18 @@ async def _handle_file(client, message, prefix, extra):
             )
             return True
 
-        # Ownership
-        uid = message.from_user.id
-        if int(doc.get("user_id", 0)) != int(uid):
-            await message.reply_text(
-                f"{F.EMO['cross']} {F.sc('this link is not for you')}",
-                parse_mode=ParseMode.HTML,
-            )
+        candidates = session.candidates or []
+        if idx < 0 or idx >= len(candidates):
+            await message.reply_text("❌ Invalid file")
             return True
 
-        hit = doc.get("hit") or {}
-        if not hit.get("file_id"):
-            await message.reply_text("❌ invalid file")
-            return True
-
-        # Build FileHit and send
+        data = candidates[idx]
         try:
-            file_hit = FileHit.from_dict(hit)
+            hit = FileHit.from_dict(data) if isinstance(data, dict) else data
         except Exception:
-            # Fallback: raw dict
-            class _Hit:
-                def __init__(self, d):
-                    for k, v in d.items():
-                        setattr(self, k, v)
-            file_hit = _Hit(hit)
+            hit = data
 
-        ok, err = await DEL.delivery.send_file(client, uid, file_hit)
-        if not ok and err:
-            try:
-                await message.reply_text(err)
-            except Exception:
-                pass
-
-        await DL.mark_used(token)
+        await DEL.delivery.send_file(client, uid, hit)
         return True
 
     except Exception as e:
