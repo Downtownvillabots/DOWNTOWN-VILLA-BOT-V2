@@ -1,23 +1,31 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — START ROUTER (FUTURISTIC)
+# 🏨 DOWNTOWN VILLA — START ROUTER (v2)
 # ============================================================
 #
 # Single source of truth for /start deep-links.
 #
 # Supported payloads:
-#   file_{sid}_{idx}      → group search → deliver file
-#   deliver_{token}       → series group → batch deliver
-#   prem_{token}          → premium watch → resume session
-#   prem_start            → premium watch → open panel
-#   wo_{slug}             → watch order → open
-#   ref_{user_id}         → referral → register + welcome
-#   gs:{chat_id}          → group settings panel
-#   (empty)               → welcome message
+#   file_{token}      → single file delivery (from movie/series group)
+#   deliver_{token}   → batch episode delivery (from series wizard)
+#   prem_{token}      → premium watch session
+#   prem_start        → open premium menu
+#   req_{token}       → deferred request (new user)
+#   gs_{chat_id}      → open group settings panel
+#   ref_{user_id}     → referral + welcome
+#   (empty)           → welcome
+#
+# Routing targets:
+#   file_*, deliver_*  → plugins.groups.shared.deep_link
+#   req_*              → plugins.groups.shared.request_flow
+#   gs_*               → plugins.groups.router + panel
+#   prem_*             → plugins.premium
+#   ref_*, empty       → welcome
 #
 # ============================================================
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -45,9 +53,8 @@ _routes: Dict[str, RouteHandler] = {}
 
 
 def register_route(prefix: str, handler: RouteHandler) -> None:
-    """Register a payload prefix → handler."""
     _routes[prefix] = handler
-    logger.info(f"[START] Route registered: {prefix}_*")
+    logger.info(f"[START] route registered: {prefix}_*")
 
 
 def unregister_route(prefix: str) -> None:
@@ -63,11 +70,7 @@ def list_routes() -> List[str]:
 # ============================================================
 
 def parse_payload(text: str) -> Tuple[str, str]:
-    """
-    Split "/start file_abc_3" into ("file", "abc_3").
-    Handles both "_" and ":" separators.
-    Returns ("", "") for empty payload.
-    """
+    """Split "/start file_abc123" → ("file", "abc123")."""
     if not text:
         return "", ""
     parts = text.strip().split(maxsplit=1)
@@ -76,19 +79,22 @@ def parse_payload(text: str) -> Tuple[str, str]:
     payload = parts[1].strip()
     if not payload:
         return "", ""
-    # colon separator (gs:12345, etc.)
+
+    # colon separator (gs:12345)
     if ":" in payload and "_" not in payload.split(":", 1)[0]:
         head, tail = payload.split(":", 1)
         return head, tail
-    # underscore separator
+
+    # underscore separator (file_abc123)
     if "_" in payload:
         head, tail = payload.split("_", 1)
         return head, tail
+
     return payload, ""
 
 
 # ============================================================
-# SECTION 3 — DEEP-LINK BUILDER
+# SECTION 3 — LINK BUILDERS
 # ============================================================
 
 def build_link(bot_username: str, payload: str) -> str:
@@ -97,12 +103,20 @@ def build_link(bot_username: str, payload: str) -> str:
     return f"https://t.me/{bot_username}?start={payload}"
 
 
-def link_file(bot_username: str, session_id: str, index: int) -> str:
-    return build_link(bot_username, f"file_{session_id}_{index}")
+def link_file(bot_username: str, token: str) -> str:
+    return build_link(bot_username, f"file_{token}")
 
 
 def link_deliver(bot_username: str, token: str) -> str:
     return build_link(bot_username, f"deliver_{token}")
+
+
+def link_request(bot_username: str, token: str) -> str:
+    return build_link(bot_username, f"req_{token}")
+
+
+def link_group_settings(bot_username: str, chat_id: int) -> str:
+    return build_link(bot_username, f"gs_{chat_id}")
 
 
 def link_premium(bot_username: str, slug: str = "start") -> str:
@@ -120,7 +134,9 @@ def link_referral(bot_username: str, user_id: int) -> str:
 async def _check_maintenance(message: Message) -> bool:
     if not config.MAINTENANCE_MODE:
         return False
-    if message.from_user and message.from_user.id in config.ADMINS:
+    if message.from_user and message.from_user.id in [
+        int(a) for a in config.ADMINS
+    ]:
         return False
 
     text = "\n".join([
@@ -164,7 +180,7 @@ async def _check_banned(message: Message) -> bool:
             pass
         return True
     except Exception as e:
-        logger.debug(f"[START] ban check error: {e}")
+        logger.debug(f"[START] ban check: {e}")
         return False
 
 
@@ -201,7 +217,7 @@ async def _register_user(message: Message) -> None:
             upsert=True,
         )
     except Exception as e:
-        logger.debug(f"[START] register error: {e}")
+        logger.debug(f"[START] register: {e}")
 
 
 # ============================================================
@@ -239,22 +255,336 @@ def _welcome_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 f"{F.EMO['channel']} {F.sc('updates')}",
-                url=config.UPDATE_CHNL_LNK,
+                url=config.UPDATE_CHNL_LNK or "https://t.me/",
             ),
             InlineKeyboardButton(
                 f"{F.EMO['users']} {F.sc('support')}",
-                url=config.SUPPORT_CHAT,
+                url=config.SUPPORT_CHAT or "https://t.me/",
             ),
         ],
     ])
+
+
+async def _send_welcome(message: Message) -> None:
+    name = message.from_user.first_name if message.from_user else ""
+    try:
+        await message.reply_text(
+            _welcome_text(name),
+            reply_markup=_welcome_kb(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"[START] welcome: {e}")
 
 
 # ============================================================
 # SECTION 7 — ROUTE HANDLERS
 # ============================================================
 
-async def _handle_referral(client, message, payload, extra):
-    """ref_{user_id} — capture referral + show welcome."""
+# ── FILE (single file from movie/series group) ──
+
+async def _handle_file(client, message, prefix, extra):
+    """
+    file_{token} — deliver a single file to user PM.
+    Token is looked up in DB (plugins.groups.shared.deep_link).
+    """
+    try:
+        from plugins.groups.shared import deep_link as DL
+        from media_search import delivery as DEL
+        from media_search.models import FileHit
+
+        token = str(extra or "").strip()
+        if not token:
+            return False
+
+        # Load token
+        doc = await DL.get_token(token)
+        if not doc or doc.get("kind") != "file":
+            await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['warn']} <b>{F.fb('LINK EXPIRED')}</b>",
+                    F.DIV, "",
+                    f"{F.EMO['search']} {F.sc('please search again in the group')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        # Ownership
+        uid = message.from_user.id
+        if int(doc.get("user_id", 0)) != int(uid):
+            await message.reply_text(
+                f"{F.EMO['cross']} {F.sc('this link is not for you')}",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        hit = doc.get("hit") or {}
+        if not hit.get("file_id"):
+            await message.reply_text("❌ invalid file")
+            return True
+
+        # Build FileHit and send
+        try:
+            file_hit = FileHit.from_dict(hit)
+        except Exception:
+            # Fallback: raw dict
+            class _Hit:
+                def __init__(self, d):
+                    for k, v in d.items():
+                        setattr(self, k, v)
+            file_hit = _Hit(hit)
+
+        ok, err = await DEL.delivery.send_file(client, uid, file_hit)
+        if not ok and err:
+            try:
+                await message.reply_text(err)
+            except Exception:
+                pass
+
+        await DL.mark_used(token)
+        return True
+
+    except Exception as e:
+        logger.exception(f"[START] file route: {e}")
+        return False
+
+
+# ── DELIVER (batch episodes from series wizard) ──
+
+async def _handle_deliver(client, message, prefix, extra):
+    """
+    deliver_{token} — send every episode stored in the token.
+    """
+    try:
+        from plugins.groups.shared import deep_link as DL
+        from media_search import delivery as DEL
+        from media_search.models import FileHit
+
+        token = str(extra or "").strip()
+        if not token:
+            return False
+
+        doc = await DL.get_token(token)
+        if not doc or doc.get("kind") != "deliver":
+            await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['warn']} <b>{F.fb('LINK EXPIRED')}</b>",
+                    F.DIV, "",
+                    f"{F.EMO['search']} {F.sc('please search again in the group')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        # Ownership
+        uid = message.from_user.id
+        if int(doc.get("user_id", 0)) != int(uid):
+            await message.reply_text(
+                f"{F.EMO['cross']} {F.sc('this link is not for you')}",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        title = str(doc.get("title") or "?")
+        season = doc.get("season") or 0
+        quality = doc.get("quality") or "?"
+        language = doc.get("language") or ""
+        hits = list(doc.get("hits") or [])
+
+        if not hits:
+            await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['cross']} <b>{F.fb('NO FILES')}</b>",
+                    F.DIV, "",
+                    f"📌 {F.sc('no files available for this delivery')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        # Progress card
+        header_lines = [
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"{F.EMO['rocket']} <b>{F.fb('DELIVERING')}</b>",
+            F.DIV, "",
+            f"🎬 <b>{F.sc(title[:60])}</b>",
+            f"📺 <b>Season {int(season):02d}</b>",
+            f"🎯 <code>{quality}</code>",
+        ]
+        if language:
+            header_lines.append(f"🔊 <code>{language}</code>")
+        header_lines += [
+            "",
+            f"📁 <b>{len(hits)}</b> {F.sc('episodes queued')}",
+            "",
+            f"⏳ {F.sc('this may take a moment…')}",
+        ]
+
+        try:
+            await message.reply_text(
+                "\n".join(header_lines),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        # Send each
+        sent = 0
+        failed = 0
+        for h in hits:
+            try:
+                try:
+                    fh = FileHit.from_dict(h)
+                except Exception:
+                    class _Hit:
+                        def __init__(self, d):
+                            for k, v in d.items():
+                                setattr(self, k, v)
+                    fh = _Hit(h)
+
+                ok, err = await DEL.delivery.send_file(client, uid, fh)
+                if ok:
+                    sent += 1
+                else:
+                    failed += 1
+                await asyncio.sleep(0.7)
+            except Exception as e:
+                failed += 1
+                logger.debug(f"[START] deliver hit: {e}")
+
+        # Summary
+        try:
+            await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['check']} <b>{F.fb('DELIVERY COMPLETE')}</b>",
+                    F.DIV, "",
+                    f"✅ {F.sc('sent')} · <b>{sent}</b>",
+                    f"❌ {F.sc('failed')} · <b>{failed}</b>",
+                    "",
+                    f"{F.EMO['spark']} <i>{F.sc('enjoy!')}</i>",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        await DL.mark_used(token)
+        return True
+
+    except Exception as e:
+        logger.exception(f"[START] deliver route: {e}")
+        return False
+
+
+# ── REQ (deferred request from new user) ──
+
+async def _handle_request(client, message, prefix, extra):
+    """
+    req_{token} — user tapped "Send Request" from a group.
+    Posts the deferred request to admin channel.
+    """
+    try:
+        from plugins.groups.shared import request_flow as RF
+        token = str(extra or "").strip()
+        if not token:
+            return False
+        handled = await RF.handle_req_token(client, message, token)
+        return bool(handled)
+    except Exception as e:
+        logger.exception(f"[START] req route: {e}")
+        return False
+
+
+# ── GS (group settings from PM) ──
+
+async def _handle_group_settings(client, message, prefix, extra):
+    """
+    gs_{chat_id} — open group settings panel from PM.
+    """
+    try:
+        from plugins.groups import state as GS
+        from plugins.groups import panel as GP
+
+        try:
+            chat_id = int(extra)
+        except (ValueError, TypeError):
+            return False
+
+        uid = message.from_user.id
+
+        # Verify admin
+        ok = False
+        try:
+            m = await client.get_chat_member(chat_id, uid)
+            st = getattr(m, "status", None)
+            st_str = st.name.lower() if hasattr(st, "name") else str(st).lower()
+            ok = st_str in ("administrator", "creator", "owner")
+        except Exception:
+            ok = False
+
+        if not ok:
+            # Allow bot admins
+            try:
+                ok = uid in [int(a) for a in config.ADMINS]
+            except Exception:
+                ok = False
+
+        if not ok:
+            await message.reply_text(
+                f"{F.EMO['cross']} {F.sc('you are not admin of that group')}",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+
+        await GS.register_group(chat_id)
+        text, kb = await GP.render_main(chat_id)
+        await message.reply_text(
+            text,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return True
+
+    except Exception as e:
+        logger.exception(f"[START] gs route: {e}")
+        return False
+
+
+# ── PREMIUM (unchanged — uses premium module) ──
+
+async def _handle_premium(client, message, prefix, extra):
+    """
+    prem_{token} — open premium watch session.
+    prem_start   — open premium menu.
+    """
+    try:
+        slug = str(extra or "").strip()
+
+        if slug in ("start", ""):
+            try:
+                from plugins.premium import premium_watch as PW
+                await PW.cmd_premium(client, message)
+                return True
+            except Exception as e:
+                logger.debug(f"[START] prem_start: {e}")
+                return False
+
+        from plugins.premium import deep_link as PDL
+        handled = await PDL.handle_prem_token(client, message, slug)
+        return bool(handled)
+
+    except Exception as e:
+        logger.debug(f"[START] premium route: {e}")
+        return False
+
+
+# ── REF (referral) ──
+
+async def _handle_referral(client, message, prefix, extra):
+    """ref_{user_id} — capture referral + welcome."""
     try:
         inviter_id = int(extra.split("_")[0])
         uid = message.from_user.id if message.from_user else 0
@@ -272,313 +602,43 @@ async def _handle_referral(client, message, payload, extra):
                     upsert=True,
                 )
     except Exception as e:
-        logger.debug(f"[START] referral error: {e}")
+        logger.debug(f"[START] referral: {e}")
+
     await _send_welcome(message)
     return True
 
 
-async def _handle_file(client, message, payload, extra):
-    """
-    file_{sid}_{idx} — deliver file from a search session.
-    """
+# ── WO (watch order — placeholder) ──
+
+async def _handle_watch_order(client, message, prefix, extra):
     try:
-        parts = extra.rsplit("_", 1)
-        if len(parts) != 2:
-            return False
-        sid, idx_str = parts
-        idx = int(idx_str)
-    except Exception:
-        return False
-
-    try:
-        from media_search import sessions as _sess_mod
-        from media_search import delivery as _del_mod
-        from media_search.models import FileHit
-
-        session = await _sess_mod.sessions.get(sid)
-        if not session:
-            await message.reply_text(
-                "\n".join([
-                    f"{F.EMO['warn']} <b>{F.fb('SESSION EXPIRED')}</b>",
-                    F.DIV, "",
-                    f"{F.EMO['search']} {F.sc('please search again in the group')}",
-                ]),
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        if idx < 0 or idx >= len(session.candidates):
-            await message.reply_text("❌ Invalid file.")
-            return True
-
-        data = session.candidates[idx]
-        hit = FileHit.from_dict(data)
-
-        ok, err = await _del_mod.delivery.send_file(
-            client, message.from_user.id, hit
-        )
-        if not ok and err:
-            try:
-                await message.reply_text(err)
-            except Exception:
-                pass
-        return True
-    except Exception as e:
-        logger.exception(f"[START] file route: {e}")
-        return False
-
-
-async def _handle_deliver(client, message, payload, extra):
-    """
-    deliver_{token} — series group batch delivery.
-    Loads token, verifies user, delivers every episode in token.
-    """
-    try:
-        from plugins.series_group import deep_link as DL
-        from media_search import delivery as _del_mod
-        from media_search.models import FileHit
-
-        token = str(extra or "").strip()
-        if not token:
-            return False
-
-        data = await DL.get_token(token)
-        if not data:
-            await message.reply_text(
-                "\n".join([
-                    f"{F.EMO['warn']} <b>{F.fb('LINK EXPIRED')}</b>",
-                    F.DIV, "",
-                    f"{F.EMO['search']} {F.sc('please search again in the group')}",
-                ]),
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        # Verify this token belongs to the user
-        uid = message.from_user.id
-        if int(data.get("user_id", 0)) != int(uid):
-            await message.reply_text(
-                f"{F.EMO['cross']} {F.sc('this link is not for you')}",
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        # Only handle "deliver" kind here
-        if data.get("kind") != "deliver":
-            return False
-
-        title = str(data.get("title") or "?")
-        season = data.get("season")
-        quality = data.get("quality") or "?"
-        language = data.get("language") or "—"
-        episodes = list(data.get("episodes") or [])
-        hits = list(data.get("hits") or [])
-
-        if not hits:
-            await message.reply_text(
-                "\n".join([
-                    f"{F.EMO['cross']} <b>{F.fb('NO FILES')}</b>",
-                    F.DIV, "",
-                    f"📌 {F.sc('no files available for this delivery')}",
-                ]),
-                parse_mode=ParseMode.HTML,
-            )
-            return True
-
-        # Progress card
-        header = "\n".join([
-            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
-            f"{F.EMO['rocket']} <b>{F.fb('DELIVERING')}</b>",
-            F.DIV, "",
-            f"🎬 <b>{F.sc(title[:50])}</b>",
-            f"📺 <b>Season {int(season) if season else '?'}</b>",
-            f"🎯 <code>{quality}</code> · 🔉 <code>{language}</code>",
-            "",
-            f"📁 <b>{len(hits)}</b> {F.sc('episodes queued')}",
-            "",
-            f"⏳ {F.sc('this may take a moment…')}",
-        ])
-        try:
-            await message.reply_text(header, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-        # Deliver each hit
-        sent = 0
-        failed = 0
-        for h in hits:
-            try:
-                hit = FileHit.from_dict(h) if isinstance(h, dict) else h
-                ok, err = await _del_mod.delivery.send_file(client, uid, hit)
-                if ok:
-                    sent += 1
-                else:
-                    failed += 1
-                    logger.debug(f"[START] deliver fail: {err}")
-                # Small delay to avoid flood
-                import asyncio
-                await asyncio.sleep(0.7)
-            except Exception as e:
-                failed += 1
-                logger.debug(f"[START] deliver hit: {e}")
-
-        # Summary
-        try:
-            summary = "\n".join([
-                f"{F.EMO['check']} <b>{F.fb('DELIVERY COMPLETE')}</b>",
-                F.DIV, "",
-                f"✅ {F.sc('sent')} · <b>{sent}</b>",
-                f"❌ {F.sc('failed')} · <b>{failed}</b>",
-                "",
-                f"{F.EMO['spark']} <i>{F.sc('enjoy!')}</i>",
-            ])
-            await message.reply_text(summary, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-        # Mark token used
-        try:
-            await DL.mark_used(token)
-        except Exception:
-            pass
-
-        return True
-
-    except Exception as e:
-        logger.exception(f"[START] deliver route: {e}")
-        return False
-
-
-async def _handle_premium(client, message, payload, extra):
-    """
-    prem_{token} — open premium watch session.
-    prem_start   — open premium menu.
-    """
-    try:
-        slug = str(extra or "").strip()
-
-        # Special: prem_start → open menu
-        if slug in ("start", ""):
-            try:
-                from plugins.premium import premium_watch as PW
-                await PW.cmd_premium(client, message)
-                return True
-            except Exception as e:
-                logger.debug(f"[START] prem_start: {e}")
-                return False
-
-        # Otherwise: treat as token
-        from plugins.premium import deep_link as PDL
-        handled = await PDL.handle_prem_token(client, message, slug)
-        return bool(handled)
-    except Exception as e:
-        logger.debug(f"[START] premium route: {e}")
-        return False
-
-
-async def _handle_watch_order(client, message, payload, extra):
-    """
-    wo_{slug} — watch order placeholder.
-    Watch order is a future feature; show a friendly message.
-    """
-    try:
-        text = "\n".join([
-            f"{F.EMO['book']} <b>{F.fb('WATCH ORDER')}</b>",
-            F.DIV, "",
-            f"📌 {F.sc('watch order for franchises')}",
-            f"{F.EMO['clock']} {F.sc('coming soon')}",
-            "",
-            f"{F.EMO['spark']} <i>{F.sc('stay tuned!')}</i>",
-        ])
-        await message.reply_text(text, parse_mode=ParseMode.HTML)
-        return True
-    except Exception:
-        return False
-
-
-async def _handle_group_settings(client, message, payload, extra):
-    """
-    gs:{chat_id} — open group settings panel (from /settings in a group).
-    """
-    try:
-        from plugins.group_admin import panel as P
-        from plugins.group_admin import state as S
-
-        chat_id = int(extra)
-        uid = message.from_user.id
-
-        # Verify user is admin in that group
-        try:
-            m = await client.get_chat_member(chat_id, uid)
-            st = getattr(m, "status", None)
-            st_str = (
-                st.name.lower() if hasattr(st, "name") else str(st).lower()
-            )
-            if st_str not in ("administrator", "creator", "owner"):
-                if uid not in [int(a) for a in config.ADMINS]:
-                    await message.reply_text(
-                        f"{F.EMO['cross']} {F.sc('you are not admin of that group')}",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return True
-        except Exception as e:
-            logger.debug(f"[START] gs member check: {e}")
-            return False
-
-        await S.register_group(chat_id)
-        text, kb = await P.render_main(chat_id)
         await message.reply_text(
-            text, reply_markup=kb,
+            "\n".join([
+                f"{F.EMO['book']} <b>{F.fb('WATCH ORDER')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('coming soon')}",
+            ]),
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
         )
         return True
-    except Exception as e:
-        logger.debug(f"[START] gs route: {e}")
+    except Exception:
         return False
 
-async def _handle_deferred_request(client, message, payload, extra):
-    """
-    req_{token} — user tapped "send request" from a group.
-    Posts the deferred request to admin channel.
-    """
-    try:
-        from plugins.search import deferred as DF
-        token = str(extra or "").strip()
-        if not token:
-            return False
-        handled = await DF.handle_req_token(client, message, token)
-        return bool(handled)
-    except Exception as e:
-        logger.debug(f"[START] req route: {e}")
-        return False
 
-# Register default routes
-register_route("req",     _handle_deferred_request)
+# ── REGISTER ROUTES ──
+
 register_route("file",    _handle_file)
 register_route("deliver", _handle_deliver)
+register_route("req",     _handle_request)
 register_route("prem",    _handle_premium)
-register_route("wo",      _handle_watch_order)
 register_route("ref",     _handle_referral)
 register_route("gs",      _handle_group_settings)
+register_route("wo",      _handle_watch_order)
 
 
 # ============================================================
 # SECTION 8 — MAIN HANDLER
 # ============================================================
-
-async def _send_welcome(message: Message) -> None:
-    name = message.from_user.first_name if message.from_user else ""
-    try:
-        await message.reply_text(
-            _welcome_text(name),
-            reply_markup=_welcome_kb(),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.debug(f"[START] welcome: {e}")
-
 
 @Client.on_message(
     filters.command("start") & filters.private,
@@ -597,7 +657,7 @@ async def start_router(client: Client, message: Message):
             # 2. Register user
             await _register_user(message)
 
-            # 3. Parse payload
+            # 3. Parse
             text = message.text or ""
             prefix, extra = parse_payload(text)
 
@@ -618,7 +678,7 @@ async def start_router(client: Client, message: Message):
                 await _send_welcome(message)
 
         except Exception as e:
-            logger.exception(f"[START] router crashed: {e}")
+            logger.exception(f"[START] router crash: {e}")
             try:
                 await message.reply_text(
                     f"{F.EMO['cross']} <b>{F.fb('ERROR')}</b>\n"
@@ -630,7 +690,7 @@ async def start_router(client: Client, message: Message):
 
 
 # ============================================================
-# SECTION 9 — CALLBACK HANDLERS
+# SECTION 9 — CALLBACK HANDLERS (welcome buttons)
 # ============================================================
 
 @Client.on_callback_query(filters.regex(r"^start:how$"), group=-9000)
@@ -654,7 +714,7 @@ async def cb_how(client, q: CallbackQuery):
     ]])
     try:
         await q.message.edit_text(
-            text, reply_markup=kb, parse_mode=ParseMode.HTML
+            text, reply_markup=kb, parse_mode=ParseMode.HTML,
         )
     except Exception:
         pass
@@ -679,7 +739,7 @@ async def cb_premium(client, q: CallbackQuery):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"{F.EMO['users']} {F.sc('contact admin')}",
-            url=config.OWNER_LNK,
+            url=config.OWNER_LNK or "https://t.me/",
         )],
         [InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
@@ -734,6 +794,8 @@ __all__ = [
     "build_link",
     "link_file",
     "link_deliver",
+    "link_request",
+    "link_group_settings",
     "link_premium",
     "link_referral",
     "snapshot",
