@@ -15,7 +15,7 @@ from plugins.broadcast.config import (
 )
 from plugins.ott import database as DB
 from plugins.ott import keyboards as KB
-from plugins.ott.config import LANGUAGE_LABELS, PRIMARY_LANGS
+from plugins.ott.config import LANGUAGE_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,21 @@ async def safe_edit(target, text: str, kb=None) -> bool:
         return False
 
 
+async def safe_edit_caption(target, text: str, kb=None) -> bool:
+    try:
+        msg = getattr(target, "message", target)
+        await msg.edit_caption(
+            caption=text, reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except MessageNotModified:
+        return True
+    except Exception as e:
+        logger.debug(f"[OTT-V] edit_cap: {type(e).__name__}: {e}")
+        return False
+
+
 def _header(title: str) -> str:
     return "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -45,71 +60,87 @@ def _header(title: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# HOME
+# HOME (PM)
 # ═══════════════════════════════════════════════════════════
 
 async def view_home() -> Tuple[str, InlineKeyboardMarkup]:
     pending = await DB.pending_subs_total()
     bc7 = await DB.broadcast_recent_count(7)
+    mon, nxt = DB.week_range()
+    sun = nxt - __import__("datetime").timedelta(days=1)
 
     text = "\n".join([
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📅 <b>{fb('OTT CONTROL CENTER')}</b>",
         DIV, "",
-        f"🎬 {sc('pick a language to browse OTT releases')}",
+        f"🗓️ {sc('this week')} · "
+        f"<code>{mon.strftime('%d %b')} → {sun.strftime('%d %b')}</code>",
         "",
-        DIV2,
+        f"🎬 {sc('pick a language to see this week releases')}",
+        "", DIV2,
         f"🔔 {sc('pending subscribers')} · <b>{_fmt_int(pending)}</b>",
         f"📢 {sc('broadcasts 7d')} · <b>{_fmt_int(bc7)}</b>",
         "", DIV2,
-        f"📌 {sc('only OTT/digital releases are shown')}",
-        f"📌 {sc('all data lives in SYSTEM db')}",
+        f"📌 {sc('only this week\'s OTT releases are shown')}",
     ])
     return text, KB.kb_home()
 
 
 # ═══════════════════════════════════════════════════════════
-# LANGUAGE MENU
+# LANGUAGE MOVIE LIST (PM)
 # ═══════════════════════════════════════════════════════════
 
 async def view_lang(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
-    from plugins.ott.tmdb import fetch_ott_by_language
+    from plugins.ott.tmdb import fetch_week_by_lang
+
+    cfg = await DB.get_cfg()
+    movies = await fetch_week_by_lang(
+        lang=lang,
+        region=cfg.get("region", "IN"),
+        min_vote=int(cfg.get("min_vote_count", 0)),
+    )
+
+    mon, nxt = DB.week_range()
+    sun = nxt - __import__("datetime").timedelta(days=1)
 
     if lang == "all":
         label = "🌐 All Languages"
     else:
         label = f"🎬 {LANGUAGE_LABELS.get(lang, lang.upper())}"
 
-    cfg = await DB.get_cfg()
-    movies = await fetch_ott_by_language(
-        lang=lang,
-        region=cfg.get("region", "IN"),
-        min_vote=int(cfg.get("min_vote_count", 5)),
-        limit=40,
-    )
-
     lines = [
-        _header("OTT RELEASES"),
+        _header("THIS WEEK"),
         f"{label}",
-        f"📊 {sc('found')} · <b>{len(movies)}</b>",
+        f"🗓️ <code>{mon.strftime('%d %b')} → {sun.strftime('%d %b %Y')}</code>",
+        f"📊 {sc('movies')} · <b>{len(movies)}</b>",
         "", DIV2,
         "",
     ]
     for m in movies[:15]:
         title = str(m.get("title", "?"))[:45]
-        year = (m.get("release_date") or "")[:4]
+        rd = (m.get("release_date") or "")[5:10]
         rating = m.get("vote_average", 0)
-        lines.append(f"🎬 <b>{sc(title)}</b> ({year})")
+        lang_ = (m.get("original_language") or "").upper()
+        lines.append(f"🎬 <b>{sc(title)}</b>")
+        meta = []
+        if rd:
+            meta.append(f"📅 {rd}")
+        if lang_:
+            meta.append(f"🌐 {lang_}")
         if rating:
-            lines.append(f"   ⭐ <code>{rating:.1f}</code>")
+            meta.append(f"⭐ {rating:.1f}")
+        if meta:
+            lines.append(f"   <code>{' · '.join(meta)}</code>")
     if not movies:
-        lines.append(f"⚪ {sc('no OTT releases found')}")
+        lines.append(f"⚪ {sc('no releases found for this week')}")
+        lines.append("")
+        lines.append(f"📌 {sc('try again later or refetch')}")
 
-    return "\n".join(lines)[:4000], KB.kb_lang_movies(lang, movies)
+    return "\n".join(lines)[:4000], KB.kb_movie_list(lang, movies)
 
 
 # ═══════════════════════════════════════════════════════════
-# MOVIE CARD
+# MOVIE CARD (PM)
 # ═══════════════════════════════════════════════════════════
 
 async def view_movie(tmdb_id: int, back_cb: str = "ott:home"
@@ -129,18 +160,16 @@ async def view_movie(tmdb_id: int, back_cb: str = "ott:home"
     overview = (movie.get("overview") or "")[:400]
     provider = movie.get("provider") or "—"
     lang = (movie.get("original_language") or "").upper()
-    release_date = movie.get("release_date") or "—"
 
     rr = movie.get("region_release") or {}
-    rel_date = rr.get("date") or release_date
-    rel_type = rr.get("type") or "—"
+    rel_date = rr.get("date") or movie.get("release_date") or "—"
+    rel_type = rr.get("type") or "Digital"
     cert = rr.get("certification") or ""
     ended = stats.get("ended")
 
     lines = [
         f"🎬 <b>{sc(str(title)[:60])}</b> ({year})",
         DIV, "",
-        # ── DATE + PLATFORM block (the important one) ──
         f"📅 <b>{sc('RELEASES')}</b> · <code>{rel_date}</code>",
         f"📺 <b>{sc('PLATFORM')}</b> · <b>{sc(provider)}</b>",
         f"🏷️ {sc('type')} · <code>{rel_type}</code>"
@@ -164,94 +193,117 @@ async def view_movie(tmdb_id: int, back_cb: str = "ott:home"
         lines += ["", f"📖 <b>{sc('plot')}</b>", f"<i>{sc(overview)}</i>"]
 
     poster = poster_url(movie.get("poster_path"), "w500")
-    is_bc = bool(stats.get("broadcast"))
-    kb = KB.kb_movie(tmdb_id, stats["total_subs"], is_bc, back_cb)
-    return "\n".join(lines)[:4000], kb, poster
+    return "\n".join(lines)[:4000], KB.kb_movie(tmdb_id, back_cb), poster
+
 
 # ═══════════════════════════════════════════════════════════
-# BROADCAST SETUP
+# SETUP POST (CHANNEL)
 # ═══════════════════════════════════════════════════════════
 
-async def view_bc_setup(tmdb_id: int, channel: int, notify: bool,
-                         hours: int, show_file: bool = True
-                         ) -> Tuple[str, InlineKeyboardMarkup]:
-    movie = await DB.get_movie(tmdb_id) or {}
-    title = (movie.get("title") or "?")[:50]
+def _setup_text_sync(movie: Dict[str, Any], stats: Dict[str, Any],
+                     notify: bool, show_file: bool,
+                     hours: int) -> str:
+    title = (movie.get("title") or "?")[:60]
     year = (movie.get("release_date") or "")[:4]
+    provider = movie.get("provider") or "—"
+    rel = (movie.get("region_release") or {}).get("date") \
+        or movie.get("release_date") or "—"
     rating = movie.get("vote_average", 0) or 0
     lang = (movie.get("original_language") or "").upper()
+    genres = (movie.get("genres") or "—")[:50]
 
     notify_lbl = "🟢 on" if notify else "🔴 off"
     file_lbl = "🟢 on" if show_file else "🔴 off"
     timer_lbl = "♾️ never" if hours <= 0 else f"⏱️ {hours}h"
 
-    text = "\n".join([
-        _header("BROADCAST SETUP"),
+    return "\n".join([
+        f"⚙️ <b>{fb('BROADCAST SETUP')}</b>",
+        DIV, "",
         f"🎬 <b>{sc(title)}</b> ({year})",
+        f"📅 <code>{rel}</code> · 📺 <code>{sc(provider)}</code>",
         f"⭐ <code>{rating:.1f}/10</code> · 🌐 <code>{lang or '—'}</code>",
+        f"🎭 <code>{sc(genres)}</code>",
         "", DIV2,
-        f"📢 {sc('channel')} · <code>{channel or '— not set —'}</code>",
+        f"🔔 {sc('subs')} · <b>{_fmt_int(stats['total_subs'])}</b>",
+        f"✅ {sc('notified')} · <b>{_fmt_int(stats['notified'])}</b>",
+        f"⏳ {sc('pending')} · <b>{_fmt_int(stats['pending'])}</b>",
+        f"📥 {sc('files sent')} · <b>{_fmt_int(stats['files_sent'])}</b>",
+        "", DIV2,
         f"🔔 {sc('notify button')} · <b>{notify_lbl}</b>",
         f"📥 {sc('get file button')} · <b>{file_lbl}</b>",
         f"🗑️ {sc('auto-delete')} · <b>{timer_lbl}</b>",
         "", DIV2,
-        f"📌 {sc('poster + caption + buttons under it')}",
-        f"📌 {sc('users tap Notify → saved → DM-ed when file lands')}",
+        f"📌 {sc('configure below, then POST NOW')}",
+        f"📌 {sc('or BROADCAST to other targets')}",
     ])
-    return text, KB.kb_bc_setup(tmdb_id, channel, notify, hours, show_file)
 
 
-async def view_bcsetup_timer(tmdb_id: int, current: int
-                              ) -> Tuple[str, InlineKeyboardMarkup]:
-    text = "\n".join([
-        _header("AUTO-DELETE TIMER"),
-        f"📌 {sc('when should the channel post self-delete?')}",
-        "", DIV2,
-        f"📌 {sc('current')} · "
-        f"{('♾️ never' if current <= 0 else f'⏱️ {current}h')}",
-        "", DIV2,
-        f"📌 {sc('💡 users still get the file via DM')}",
-    ])
-    return text, KB.kb_bcsetup_timer(tmdb_id, current)
-
-
-async def view_bc_history() -> Tuple[str, InlineKeyboardMarkup]:
-    items = await DB.broadcast_list(limit=15)
-    lines = [_header("BROADCAST HISTORY")]
-    if not items:
-        lines.append(f"⚪ {sc('no broadcasts yet')}")
-    else:
-        for it in items:
-            movie = await DB.get_movie(it.get("tmdb_id")) or {}
-            title = (movie.get("title") or "?")[:32]
-            cancelled = "💥 ENDED" if it.get("cancelled") else "✅"
-            lines += [
-                f"{cancelled} <b>{sc(title)}</b>",
-                f"   🎯 <code>{it.get('target')}</code>",
-                f"   📬 <b>{it.get('delivered', 0)}</b> · "
-                f"❌ <b>{it.get('failed', 0)}</b>",
-                "",
-            ]
-    return "\n".join(lines)[:4000], KB.kb_bc_history()
-
-
-async def view_bc_center() -> Tuple[str, InlineKeyboardMarkup]:
-    w = await DB.get_week(DB.week_key())
-    movies = []
-    if w:
-        for d in (w.get("days") or []):
-            movies.extend(d)
-    text = "\n".join([
-        _header("BROADCAST CENTER"),
-        f"🎬 {sc('movies this week')} · <b>{len(movies)}</b>",
-        "", DIV2,
-        f"📌 {sc('pick a movie to post to channel')}",
-    ])
-    return text, KB.kb_bc_center(movies)
+async def view_setup(movie: Dict[str, Any], notify: bool,
+                     show_file: bool, hours: int
+                     ) -> Tuple[str, InlineKeyboardMarkup]:
+    stats = await DB.movie_stats(movie.get("tmdb_id"))
+    text = _setup_text_sync(movie, stats, notify, show_file, hours)
+    kb = KB.kb_setup(movie.get("tmdb_id"), notify, show_file, hours)
+    return text, kb
 
 
 # ═══════════════════════════════════════════════════════════
-# STATS
+# LIVE POST
+# ═══════════════════════════════════════════════════════════
+
+def _live_text_sync(movie: Dict[str, Any], stats: Dict[str, Any],
+                    ended: bool = False) -> str:
+    title = (movie.get("title") or "?")[:60]
+    year = (movie.get("release_date") or "")[:4]
+    provider = movie.get("provider") or "—"
+    rel = (movie.get("region_release") or {}).get("date") \
+        or movie.get("release_date") or "—"
+    rating = movie.get("vote_average", 0) or 0
+    votes = movie.get("vote_count", 0) or 0
+    lang = (movie.get("original_language") or "").upper()
+    genres = (movie.get("genres") or "—")[:70]
+    overview = (movie.get("overview") or "")[:250]
+
+    head = ("🎬 <b>" + fb("NOW STREAMING") + "</b>") if not ended else \
+           ("💥 <b>" + fb("EVENT ENDED") + "</b>")
+
+    lines = [
+        head,
+        DIV, "",
+        f"🎥 <b>{sc(str(title)[:60])}</b> ({year})",
+        f"⭐ <code>{rating:.1f}/10</code> "
+        f"(<code>{_fmt_int(votes)}</code>) · 🌐 <code>{lang or '—'}</code>",
+        f"🎭 <code>{sc(genres)}</code>",
+        f"📅 <code>{rel}</code> · 📺 <code>{sc(provider)}</code>",
+    ]
+    if overview and not ended:
+        lines += ["", f"<i>{sc(overview)}</i>"]
+    lines += [
+        "", DIV2,
+        f"🔔 {sc('subs')} · <b>{_fmt_int(stats['total_subs'])}</b>",
+        f"✅ {sc('notified')} · <b>{_fmt_int(stats['notified'])}</b>",
+        f"⏳ {sc('pending')} · <b>{_fmt_int(stats['pending'])}</b>",
+        f"📥 {sc('files sent')} · <b>{_fmt_int(stats['files_sent'])}</b>",
+        "", DIV2,
+    ]
+    if not ended:
+        lines.append(f"🔔 {sc('tap below to get notified')}")
+    return "\n".join(lines)
+
+
+async def view_live(movie: Dict[str, Any], notify: bool = True,
+                     show_file: bool = True, is_admin_view: bool = False,
+                     ended: bool = False
+                     ) -> Tuple[str, InlineKeyboardMarkup]:
+    stats = await DB.movie_stats(movie.get("tmdb_id"))
+    text = _live_text_sync(movie, stats, ended=ended)
+    kb = KB.kb_live(movie.get("tmdb_id"), notify, show_file,
+                    is_admin_view=is_admin_view, ended=ended)
+    return text, kb
+
+
+# ═══════════════════════════════════════════════════════════
+# STATS / END
 # ═══════════════════════════════════════════════════════════
 
 async def view_stats(tmdb_id: int) -> Tuple[str, InlineKeyboardMarkup]:
@@ -271,14 +323,14 @@ async def view_stats(tmdb_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         _header("STATISTICS"),
         f"🎬 <b>{sc(title)}</b>",
         "", DIV2,
-        f"🔔 {sc('total subscribers')} · <b>{stats['total_subs']}</b>",
-        f"✅ {sc('notified')} · <b>{stats['notified']}</b>",
-        f"⏳ {sc('still pending')} · <b>{stats['pending']}</b>",
-        f"📥 {sc('files sent')} · <b>{stats['files_sent']}</b>",
+        f"🔔 {sc('total subscribers')} · <b>{_fmt_int(stats['total_subs'])}</b>",
+        f"✅ {sc('notified')} · <b>{_fmt_int(stats['notified'])}</b>",
+        f"⏳ {sc('pending')} · <b>{_fmt_int(stats['pending'])}</b>",
+        f"📥 {sc('files sent')} · <b>{_fmt_int(stats['files_sent'])}</b>",
         "", DIV2,
-        f"📢 {sc('broadcast')} · {bc_line}",
+        f"📢 {sc('last broadcast')} · {bc_line}",
         "", DIV2,
-        f"📌 {sc('press END EVENT to wipe all tokens')}",
+        f"📌 {sc('press END TASK to wipe pending')}",
     ])
     return text, KB.kb_stats(tmdb_id)
 
@@ -290,12 +342,12 @@ async def view_end_confirm(tmdb_id: int, tok: str
     stats = await DB.movie_stats(tmdb_id)
 
     text = "\n".join([
-        _header("CONFIRM END EVENT"),
+        _header("CONFIRM END TASK"),
         f"🎬 <b>{sc(title)}</b>",
         "", DIV2,
         f"⚠️ {sc('this will')}:",
         f"• 💥 {sc('delete')} <b>{stats['pending']}</b> {sc('pending tokens')}",
-        f"• 🚫 {sc('block new Get Notified taps')}",
+        f"• 🚫 {sc('refuse new Get Notified taps')}",
         f"• 🏷️ {sc('mark broadcast as ENDED')}",
         f"• ✅ {sc('keep')} <b>{stats['notified']}</b> {sc('notified users')}",
         "", DIV2,
@@ -305,47 +357,58 @@ async def view_end_confirm(tmdb_id: int, tok: str
 
 
 # ═══════════════════════════════════════════════════════════
-# SUBSCRIBERS
+# USER: FILE LIST
 # ═══════════════════════════════════════════════════════════
 
-async def view_subs_overview() -> Tuple[str, InlineKeyboardMarkup]:
-    items = await DB.subs_overview(limit=15)
-    lines = [_header("SUBSCRIBERS")]
-    if not items:
-        lines.append(f"⚪ {sc('no subscribers yet')}")
-    else:
-        for it in items:
-            title = str(it.get("title") or "?")[:40]
-            cnt = it.get("count", 0)
-            n = it.get("notified", 0)
-            lines.append(f"🎬 <b>{sc(title)}</b>")
-            lines.append(f"   🔔 <b>{cnt}</b> · ✅ {n}")
-    return "\n".join(lines)[:4000], KB.kb_subs_overview(items)
-
-
-async def view_subs_movie(tmdb_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+async def view_files(tmdb_id: int, page: int = 0
+                      ) -> Tuple[str, InlineKeyboardMarkup]:
     movie = await DB.get_movie(tmdb_id) or {}
-    subs = await DB.subs_for_movie(tmdb_id, limit=200)
-    notified = sum(1 for s in subs if s.get("notified"))
-    pending = len(subs) - notified
     title = (movie.get("title") or "?")[:50]
+    year = (movie.get("release_date") or "")[:4]
+
+    files = await DB.find_files_for_movie(movie, limit=50)
+    per_page = 8
+    start = page * per_page
+    chunk = files[start:start + per_page]
 
     lines = [
-        _header("SUBSCRIBERS OF MOVIE"),
-        f"🎬 <b>{sc(title)}</b>",
+        f"🎬 <b>{sc(title)}</b> ({year})",
+        f"📥 <b>{fb('AVAILABLE FILES')}</b>",
+        DIV, "",
+        f"📊 {sc('total')} · <b>{len(files)}</b>",
         "", DIV2,
-        f"📊 {sc('total')} · <b>{len(subs)}</b>",
-        f"✅ {sc('notified')} · <b>{notified}</b>",
-        f"🔔 {sc('pending')} · <b>{pending}</b>",
-        "", DIV2,
+        "",
     ]
-    for s in subs[:20]:
-        uid = s.get("user_id", 0)
-        flag = "✅" if s.get("notified") else "🔔"
-        lines.append(f"{flag} <code>{uid}</code>")
-    if len(subs) > 20:
-        lines.append(f"<i>… +{len(subs) - 20} more</i>")
-    return "\n".join(lines)[:4000], KB.kb_subs_movie(tmdb_id)
+
+    if not files:
+        lines.append(f"⚪ {sc('no files available yet')}")
+        lines.append("")
+        lines.append(f"📌 {sc('we will notify you when uploaded')}")
+    else:
+        for i, f in enumerate(chunk, start=start + 1):
+            quality = str(f.get("quality") or "HD")[:12]
+            size = _human(f.get("file_size") or 0)
+            codec = str(f.get("codec") or "—")[:12]
+            audio = str(f.get("audio") or "—")[:12]
+            lines.append(f"<b>{i:02d}.</b> 💾 <b>{sc(quality)}</b> · {size}")
+            lines.append(f"   🎥 {sc(codec)} · 🔊 {sc(audio)}")
+            lines.append("")
+
+    kb = KB.kb_file_list(tmdb_id, files, page, per_page)
+    return "\n".join(lines)[:4000], kb
+
+
+def _human(size) -> str:
+    try:
+        s = float(size or 0)
+    except (TypeError, ValueError):
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while s >= 1024 and i < len(units) - 1:
+        s /= 1024.0
+        i += 1
+    return f"{s:.2f} {units[i]}"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -403,10 +466,6 @@ async def view_settings() -> Tuple[str, InlineKeyboardMarkup]:
         f"{'🟢 on' if cfg.get('hype_enabled') else '🔴 off'}",
         f"📅 {sc('weekly loop')} · "
         f"{'🟢 on' if cfg.get('weekly_enabled') else '🔴 off'}",
-        f"🔔 {sc('share button')} · "
-        f"{'🟢 on' if cfg.get('share_button') else '🔴 off'}",
-        f"🗑️ {sc('auto-delete')} · "
-        f"{'🟢 on' if cfg.get('auto_delete_broadcast') else '🔴 off'}",
     ])
     return text, KB.kb_settings()
 
@@ -439,8 +498,10 @@ async def view_minvote() -> Tuple[str, InlineKeyboardMarkup]:
     text = "\n".join([
         _header("MIN VOTES"),
         f"⭐ {sc('current')} · <code>{cfg.get('min_vote_count')}</code>",
+        "", DIV2,
+        f"📌 {sc('0 = show all releases')}",
     ])
-    return text, KB.kb_minvote(int(cfg.get("min_vote_count", 5)))
+    return text, KB.kb_minvote(int(cfg.get("min_vote_count", 0)))
 
 
 async def view_notifttl() -> Tuple[str, InlineKeyboardMarkup]:
@@ -461,6 +522,88 @@ async def view_bcttl() -> Tuple[str, InlineKeyboardMarkup]:
         f"📢 {sc('current')} · <code>{cfg.get('broadcast_ttl_hours')}h</code>",
     ])
     return text, KB.kb_bcttl(int(cfg.get("broadcast_ttl_hours", 24)))
+
+
+async def view_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
+    wk = DB.week_key()
+    w = await DB.get_week(wk)
+    movies = []
+    if w:
+        for d in (w.get("days") or []):
+            movies.extend(d)
+
+    cache_n = await DB.cache_count()
+    sent_7d = await DB.sent_count_last(7)
+    bc_7d = await DB.broadcast_recent_count(7)
+    pending = await DB.pending_subs_total()
+    pend_msgs = await DB.pending_count()
+
+    top = "—"
+    top_c = 0
+    try:
+        rows = await DB.subs_overview(limit=1)
+        if rows:
+            top = rows[0].get("title") or "—"
+            top_c = rows[0].get("count", 0)
+    except Exception:
+        pass
+
+    text = "\n".join([
+        _header("DASHBOARD"),
+        f"🗓️ {sc('week')} · <code>{wk}</code>",
+        f"🎬 {sc('movies')} · <b>{len(movies)}</b>",
+        "", DIV2, "",
+        f"📨 {sc('sent 7d')} · <b>{_fmt_int(sent_7d)}</b>",
+        f"⏳ {sc('pending subs')} · <b>{_fmt_int(pending)}</b>",
+        f"🗑️ {sc('pending auto-del')} · <b>{_fmt_int(pend_msgs)}</b>",
+        "", DIV2, "",
+        f"📢 {sc('broadcasts 7d')} · <b>{_fmt_int(bc_7d)}</b>",
+        "", DIV2, "",
+        f"🏆 {sc('top movie')} · <code>{_esc(str(top)[:40])}</code>",
+        f"🔔 {sc('subs')} · <b>{top_c}</b>",
+        f"🎬 {sc('cache')} · <b>{_fmt_int(cache_n)}</b>",
+    ])
+    return text, KB.kb_dashboard()
+
+
+async def view_subs_overview() -> Tuple[str, InlineKeyboardMarkup]:
+    items = await DB.subs_overview(limit=15)
+    lines = [_header("SUBSCRIBERS")]
+    if not items:
+        lines.append(f"⚪ {sc('no subscribers yet')}")
+    else:
+        for it in items:
+            title = str(it.get("title") or "?")[:40]
+            cnt = it.get("count", 0)
+            n = it.get("notified", 0)
+            lines.append(f"🎬 <b>{sc(title)}</b>")
+            lines.append(f"   🔔 <b>{cnt}</b> · ✅ {n}")
+    return "\n".join(lines)[:4000], KB.kb_subs_overview(items)
+
+
+async def view_subs_movie(tmdb_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    movie = await DB.get_movie(tmdb_id) or {}
+    subs = await DB.subs_for_movie(tmdb_id, limit=200)
+    notified = sum(1 for s in subs if s.get("notified"))
+    pending = len(subs) - notified
+    title = (movie.get("title") or "?")[:50]
+
+    lines = [
+        _header("SUBSCRIBERS OF MOVIE"),
+        f"🎬 <b>{sc(title)}</b>",
+        "", DIV2,
+        f"📊 {sc('total')} · <b>{len(subs)}</b>",
+        f"✅ {sc('notified')} · <b>{notified}</b>",
+        f"🔔 {sc('pending')} · <b>{pending}</b>",
+        "", DIV2,
+    ]
+    for s in subs[:20]:
+        uid = s.get("user_id", 0)
+        flag = "✅" if s.get("notified") else "🔔"
+        lines.append(f"{flag} <code>{uid}</code>")
+    if len(subs) > 20:
+        lines.append(f"<i>… +{len(subs) - 20} more</i>")
+    return "\n".join(lines)[:4000], KB.kb_subs_movie(tmdb_id)
 
 
 async def view_diag() -> Tuple[str, InlineKeyboardMarkup]:
@@ -494,21 +637,19 @@ async def view_diag() -> Tuple[str, InlineKeyboardMarkup]:
         f"<code>{','.join(cfg.get('languages') or [])}</code>",
         "", DIV2,
         f"⏰ {sc('now')} · <code>{now_ist}</code>",
-        f"🕐 {sc('weekly fires')} · <code>Mon 10:00 → admin PM</code>",
-        f"🕐 {sc('file checker')} · "
-        f"<code>23-06 & 12-18 · hourly · 100 files</code>",
     ])
     return text, KB.kb_diag()
 
 
 __all__ = [
-    "safe_edit",
+    "safe_edit", "safe_edit_caption",
     "view_home", "view_lang", "view_movie",
-    "view_bc_setup", "view_bcsetup_timer", "view_bc_history",
-    "view_bc_center",
+    "view_setup", "view_live",
     "view_stats", "view_end_confirm",
+    "view_files",
     "view_subs_overview", "view_subs_movie",
     "view_notif", "view_cache",
     "view_settings", "view_region", "view_langs", "view_minvote",
-    "view_notifttl", "view_bcttl", "view_diag",
+    "view_notifttl", "view_bcttl",
+    "view_dashboard", "view_diag",
 ]
