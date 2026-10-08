@@ -35,30 +35,6 @@ async def ott_input(client: Client, message):
     except Exception:
         pass
 
-    # ── SET PRIMARY CHANNEL ──
-    if action == "set_channel":
-        if text == "-":
-            ST.clear_session(message.from_user.id)
-            return await message.reply_text("❌ Cancelled")
-        try:
-            cid = int(text) if text.lstrip("-").isdigit() else None
-            if cid is None and text.startswith("@"):
-                chat = await client.get_chat(text)
-                cid = chat.id
-            if not cid:
-                raise ValueError
-        except Exception:
-            return await message.reply_text(
-                "❌ send a numeric chat id or @username",
-                parse_mode=ParseMode.HTML)
-        await DB.save_cfg(primary_channel=int(cid))
-        ST.clear_session(message.from_user.id)
-        t, k = await V.view_settings()
-        await message.reply_text(t, reply_markup=k,
-                                 parse_mode=ParseMode.HTML,
-                                 disable_web_page_preview=True)
-        return
-
     # ── SET OTT BROADCAST CHANNEL ──
     if action == "set_ott_channel":
         if text == "-":
