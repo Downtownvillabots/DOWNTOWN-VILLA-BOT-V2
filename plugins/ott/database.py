@@ -661,3 +661,83 @@ async def ensure_indexes() -> bool:
     except Exception as e:
         logger.warning(f"[OTT-DB] index: {e}")
         return False
+
+
+# ═══════════════════════════════════════════════════════════
+# ATOMIC SUBSCRIPTION (concurrency-safe)
+# ═══════════════════════════════════════════════════════════
+
+async def sub_add_atomic(user_id, tmdb_id, title, year="",
+                          release_date="") -> bool:
+    """
+    Atomic upsert. Returns True if newly added.
+    Uses $setOnInsert so concurrent calls can't double-count.
+    """
+    c = subs_coll()
+    if c is None:
+        return False
+    try:
+        exp = datetime.now(timezone.utc) + timedelta(days=SUB_TTL_DAYS)
+        r = await c.update_one(
+            {"user_id": int(user_id), "tmdb_id": int(tmdb_id)},
+            {
+                "$setOnInsert": {
+                    "user_id": int(user_id),
+                    "tmdb_id": int(tmdb_id),
+                    "title": title,
+                    "year": year,
+                    "release_date": release_date,
+                    "notified": False,
+                    "created_at": time.time(),
+                    "expires_at": exp,
+                }
+            },
+            upsert=True,
+        )
+        # upserted_id != None means newly inserted
+        return r.upserted_id is not None
+    except Exception as e:
+        logger.debug(f"[OTT-DB] sub_add_atomic: {e}")
+        return False
+
+
+async def sub_count_atomic(tmdb_id) -> Dict[str, int]:
+    """Return total / pending / notified atomically (approximate)."""
+    c = subs_coll()
+    if c is None:
+        return {"total": 0, "pending": 0, "notified": 0}
+    try:
+        pipeline = [
+            {"$match": {"tmdb_id": int(tmdb_id)}},
+            {"$group": {
+                "_id": None,
+                "total": {"$sum": 1},
+                "pending": {"$sum": {
+                    "$cond": [{"$eq": ["$notified", False]}, 1, 0]}},
+            }},
+        ]
+        r = await c.aggregate(pipeline).to_list(length=1)
+        if not r:
+            return {"total": 0, "pending": 0, "notified": 0}
+        total = r[0]["total"]
+        pending = r[0]["pending"]
+        return {"total": total, "pending": pending,
+                "notified": total - pending}
+    except Exception:
+        return {"total": 0, "pending": 0, "notified": 0}
+
+
+# ═══════════════════════════════════════════════════════════
+# USER SUBSCRIPTION CHECK
+# ═══════════════════════════════════════════════════════════
+
+async def user_subbed_movies(user_id, limit: int = 100) -> List[int]:
+    c = subs_coll()
+    if c is None:
+        return []
+    try:
+        cur = c.find({"user_id": int(user_id)}, {"tmdb_id": 1}).limit(limit)
+        docs = await cur.to_list(length=limit)
+        return [int(d["tmdb_id"]) for d in docs if d.get("tmdb_id")]
+    except Exception:
+        return []
