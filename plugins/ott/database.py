@@ -1,5 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT DATABASE
+# 🏨 DOWNTOWN VILLA — OTT DATABASE (v2 — atomic subs)
 # ============================================================
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ def settings_coll():    return _c("ott_settings")
 def sent_coll():        return _c("ott_sent_log")
 def pending_coll():     return _c("ott_pending_msgs")
 def broadcasts_coll():  return _c("ott_broadcasts")
+def events_coll():      return _c("ott_events")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -201,6 +202,37 @@ async def sub_add(user_id, tmdb_id, title, year="", release_date="") -> bool:
         return False
 
 
+async def sub_add_atomic(user_id, tmdb_id, title, year="",
+                          release_date="") -> bool:
+    """
+    Atomic upsert — concurrency-safe.
+    Returns True ONLY if newly inserted (not already subscribed).
+    """
+    c = subs_coll()
+    if c is None:
+        return False
+    try:
+        exp = datetime.now(timezone.utc) + timedelta(days=SUB_TTL_DAYS)
+        r = await c.update_one(
+            {"user_id": int(user_id), "tmdb_id": int(tmdb_id)},
+            {"$setOnInsert": {
+                "user_id": int(user_id),
+                "tmdb_id": int(tmdb_id),
+                "title": title,
+                "year": year,
+                "release_date": release_date,
+                "notified": False,
+                "created_at": time.time(),
+                "expires_at": exp,
+            }},
+            upsert=True,
+        )
+        return r.upserted_id is not None
+    except Exception as e:
+        logger.debug(f"[OTT-DB] sub_add_atomic: {e}")
+        return False
+
+
 async def sub_exists(user_id, tmdb_id) -> bool:
     c = subs_coll()
     if c is None:
@@ -246,6 +278,32 @@ async def count_subs_for_movie(tmdb_id) -> int:
         return await c.count_documents({"tmdb_id": int(tmdb_id)})
     except Exception:
         return 0
+
+
+async def sub_count_atomic(tmdb_id) -> Dict[str, int]:
+    """Aggregate total / pending / notified in one call."""
+    c = subs_coll()
+    if c is None:
+        return {"total": 0, "pending": 0, "notified": 0}
+    try:
+        pipeline = [
+            {"$match": {"tmdb_id": int(tmdb_id)}},
+            {"$group": {
+                "_id": None,
+                "total": {"$sum": 1},
+                "pending": {"$sum": {
+                    "$cond": [{"$eq": ["$notified", False]}, 1, 0]}},
+            }},
+        ]
+        r = await c.aggregate(pipeline).to_list(length=1)
+        if not r:
+            return {"total": 0, "pending": 0, "notified": 0}
+        total = r[0]["total"]
+        pending = r[0]["pending"]
+        return {"total": total, "pending": pending,
+                "notified": total - pending}
+    except Exception:
+        return {"total": 0, "pending": 0, "notified": 0}
 
 
 async def pending_movies_to_notify(limit: int = 50) -> List[Dict[str, Any]]:
@@ -323,6 +381,18 @@ async def pending_subs_total() -> int:
         return await c.count_documents({"notified": False})
     except Exception:
         return 0
+
+
+async def user_subbed_movies(user_id, limit: int = 100) -> List[int]:
+    c = subs_coll()
+    if c is None:
+        return []
+    try:
+        cur = c.find({"user_id": int(user_id)}, {"tmdb_id": 1}).limit(limit)
+        docs = await cur.to_list(length=limit)
+        return [int(d["tmdb_id"]) for d in docs if d.get("tmdb_id")]
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════
@@ -561,17 +631,12 @@ async def is_movie_ended(tmdb_id: int) -> bool:
 
 async def find_files_for_movie(movie: Dict[str, Any],
                                 limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Search media DB for files matching a movie's title + year.
-    Tries media_search engine first, then falls back to direct query.
-    """
     title = (movie.get("title") or "").strip()
     if not title:
         return []
     year = (movie.get("release_date") or "")[:4]
-    tmdb_id = movie.get("tmdb_id")
 
-    # ── Try media_search engine ──
+    # Try media_search engine
     try:
         from media_search import engine as MSE
         results = await MSE.search(title, kind="movie", year=year or None)
@@ -580,7 +645,7 @@ async def find_files_for_movie(movie: Dict[str, Any],
     except Exception as e:
         logger.debug(f"[OTT-DB] media_search: {e}")
 
-    # ── Direct DB query ──
+    # Direct DB query
     try:
         from database import db_registry
         db = db_registry.get_media_db(0) or db_registry.get_user_db()
@@ -641,103 +706,100 @@ def _normalize_files(docs: List[Dict[str, Any]],
 
 async def ensure_indexes() -> bool:
     try:
-        if (s := subs_coll()) is not None:
+        # ── Subs ──
+        s = subs_coll()
+        if s is not None:
             await s.create_index("expires_at", expireAfterSeconds=0)
             await s.create_index([("tmdb_id", 1), ("notified", 1)])
-        if (p := pending_coll()) is not None:
+            # Unique compound — ensures no duplicate (user, movie)
+            try:
+                await s.create_index(
+                    [("user_id", 1), ("tmdb_id", 1)],
+                    unique=True,
+                    name="uniq_user_movie",
+                    background=True,
+                )
+            except Exception as e:
+                # Index may already exist (and that's fine)
+                logger.debug(f"[OTT-DB] unique subs index: {e}")
+
+        # ── Pending auto-delete ──
+        p = pending_coll()
+        if p is not None:
             await p.create_index("delete_at", expireAfterSeconds=0)
-        if (w := weeks_coll()) is not None:
+
+        # ── Weeks ──
+        w = weeks_coll()
+        if w is not None:
             await w.create_index("expires_at", expireAfterSeconds=0)
-        if (m := movies_coll()) is not None:
+
+        # ── Movies ──
+        m = movies_coll()
+        if m is not None:
             await m.create_index(
-                "cached_at", expireAfterSeconds=MOVIE_CACHE_DAYS * 86400)
-        if (sl := sent_coll()) is not None:
+                "cached_at",
+                expireAfterSeconds=MOVIE_CACHE_DAYS * 86400,
+            )
+
+        # ── Sent log ──
+        sl = sent_coll()
+        if sl is not None:
             await sl.create_index(
-                "sent_at", expireAfterSeconds=SENT_LOG_DAYS * 86400)
-        if (b := broadcasts_coll()) is not None:
+                "sent_at",
+                expireAfterSeconds=SENT_LOG_DAYS * 86400,
+            )
+
+        # ── Broadcasts ──
+        b = broadcasts_coll()
+        if b is not None:
             await b.create_index("expires_at", expireAfterSeconds=0)
             await b.create_index("tmdb_id")
+
+        # ── Events ──
+        ev = events_coll()
+        if ev is not None:
+            await ev.create_index("expires_at", expireAfterSeconds=0)
+            await ev.create_index("tmdb_id")
+            await ev.create_index([("state", 1), ("created_at", -1)])
+
         return True
     except Exception as e:
         logger.warning(f"[OTT-DB] index: {e}")
         return False
 
 
-# ═══════════════════════════════════════════════════════════
-# ATOMIC SUBSCRIPTION (concurrency-safe)
-# ═══════════════════════════════════════════════════════════
-
-async def sub_add_atomic(user_id, tmdb_id, title, year="",
-                          release_date="") -> bool:
-    """
-    Atomic upsert. Returns True if newly added.
-    Uses $setOnInsert so concurrent calls can't double-count.
-    """
-    c = subs_coll()
-    if c is None:
-        return False
-    try:
-        exp = datetime.now(timezone.utc) + timedelta(days=SUB_TTL_DAYS)
-        r = await c.update_one(
-            {"user_id": int(user_id), "tmdb_id": int(tmdb_id)},
-            {
-                "$setOnInsert": {
-                    "user_id": int(user_id),
-                    "tmdb_id": int(tmdb_id),
-                    "title": title,
-                    "year": year,
-                    "release_date": release_date,
-                    "notified": False,
-                    "created_at": time.time(),
-                    "expires_at": exp,
-                }
-            },
-            upsert=True,
-        )
-        # upserted_id != None means newly inserted
-        return r.upserted_id is not None
-    except Exception as e:
-        logger.debug(f"[OTT-DB] sub_add_atomic: {e}")
-        return False
-
-
-async def sub_count_atomic(tmdb_id) -> Dict[str, int]:
-    """Return total / pending / notified atomically (approximate)."""
-    c = subs_coll()
-    if c is None:
-        return {"total": 0, "pending": 0, "notified": 0}
-    try:
-        pipeline = [
-            {"$match": {"tmdb_id": int(tmdb_id)}},
-            {"$group": {
-                "_id": None,
-                "total": {"$sum": 1},
-                "pending": {"$sum": {
-                    "$cond": [{"$eq": ["$notified", False]}, 1, 0]}},
-            }},
-        ]
-        r = await c.aggregate(pipeline).to_list(length=1)
-        if not r:
-            return {"total": 0, "pending": 0, "notified": 0}
-        total = r[0]["total"]
-        pending = r[0]["pending"]
-        return {"total": total, "pending": pending,
-                "notified": total - pending}
-    except Exception:
-        return {"total": 0, "pending": 0, "notified": 0}
-
-
-# ═══════════════════════════════════════════════════════════
-# USER SUBSCRIPTION CHECK
-# ═══════════════════════════════════════════════════════════
-
-async def user_subbed_movies(user_id, limit: int = 100) -> List[int]:
-    c = subs_coll()
-    if c is None:
-        return []
-    try:
-        cur = c.find({"user_id": int(user_id)}, {"tmdb_id": 1}).limit(limit)
-        docs = await cur.to_list(length=limit)
-        return [int(d["tmdb_id"]) for d in docs if d.get("tmdb_id")]
-    except Exception:
-        return []
+__all__ = [
+    # collections
+    "weeks_coll", "movies_coll", "subs_coll", "prefs_coll",
+    "settings_coll", "sent_coll", "pending_coll",
+    "broadcasts_coll", "events_coll",
+    # constants
+    "IST",
+    # settings
+    "get_cfg", "save_cfg",
+    # weeks
+    "week_key", "week_range", "day_date",
+    "save_week", "get_week",
+    # movies
+    "save_movie", "get_movie", "cache_count", "cache_clear",
+    # subs
+    "sub_add", "sub_add_atomic", "sub_exists", "sub_remove",
+    "subs_for_movie", "count_subs_for_movie", "sub_count_atomic",
+    "pending_movies_to_notify", "mark_subs_notified",
+    "cancel_all_subs", "subs_overview", "pending_subs_total",
+    "user_subbed_movies",
+    # sent
+    "sent_log", "sent_count_last", "sent_clear",
+    # pending
+    "pending_add", "pending_due", "pending_remove", "pending_count",
+    # broadcasts
+    "broadcast_log", "broadcast_list", "broadcast_count_for_movie",
+    "broadcast_recent_count", "broadcast_mark_cancelled",
+    "broadcast_get_latest", "broadcast_update_msg_id",
+    # stats / end
+    "movie_stats", "end_movie", "is_movie_ended",
+    # files
+    "find_files_for_movie",
+    # indexes
+    "ensure_indexes",
+]
