@@ -3,61 +3,47 @@
 # ============================================================
 
 from __future__ import annotations
-import os
-from typing import List
-
-# ── Reuse broadcast fonts/helpers for consistency ──
 from plugins.broadcast.config import (
     fb, sc, _esc, _fmt_int, _fmt_size, _fmt_duration,
     _progress_colored, DIV, DIV2, _is_admin,
 )
 
-# ── File checker windows (IST) ──
 CHECK_WINDOWS = [(23, 6), (12, 18)]
-CHECK_INTERVAL_SEC = 3600          # every 1 hour
-FILE_CHECK_LIMIT = 100             # only latest 100 files
+CHECK_INTERVAL_SEC = 3600
+FILE_CHECK_LIMIT = 100
 
-# ── Weekly post ──
-WEEKLY_DAY = 0                     # Monday
-WEEKLY_HOUR = 10                   # 10 AM IST
-WEEKLY_MINUTE_WINDOW = 5           # fire once within first 5 min
+WEEKLY_DAY = 0
+WEEKLY_HOUR = 10
+WEEKLY_MINUTE_WINDOW = 5
 
-# ── Hype loop ──
-HYPE_HOUR = 20                     # 8 PM IST
-
-# ── Auto-delete ──
+HYPE_HOUR = 20
 PENDING_SCAN_INTERVAL = 60
 
-# ── TTLs ──
 SESSION_TTL = 900
 CONFIRM_TTL = 300
 JOB_TTL = 3600
 
-# ── Regions ──
 REGIONS = ["IN", "US", "GB", "AE", "SA", "AU", "CA", "SG", "MY"]
 
-# ── Languages (ISO 639-1) ──
+# Priority languages for the weekly fetch
+PRIORITY_LANGS = ["ml", "ta", "en", "hi"]
+
 LANGUAGE_LABELS = {
-    "ml": "Malayalam", "hi": "Hindi", "en": "English",
-    "ta": "Tamil", "te": "Telugu", "kn": "Kannada",
-    "bn": "Bengali", "mr": "Marathi", "pa": "Punjabi",
-    "gu": "Gujarati", "ur": "Urdu", "ko": "Korean",
-    "ja": "Japanese", "zh": "Chinese", "es": "Spanish",
-    "fr": "French", "de": "German", "ar": "Arabic",
-    "tr": "Turkish", "th": "Thai",
+    "ml": "Malayalam", "ta": "Tamil", "en": "English", "hi": "Hindi",
+    "te": "Telugu", "kn": "Kannada", "bn": "Bengali", "mr": "Marathi",
+    "pa": "Punjabi", "gu": "Gujarati", "ur": "Urdu", "ko": "Korean",
+    "ja": "Japanese", "zh": "Chinese", "es": "Spanish", "fr": "French",
+    "de": "German", "ar": "Arabic", "tr": "Turkish", "th": "Thai",
 }
-DEFAULT_LANGS = ["ml", "hi", "en", "ta", "te"]
+DEFAULT_LANGS = ["ml", "ta", "en", "hi"]
 
-# ── Min vote count presets ──
 MIN_VOTE_PRESETS = [5, 10, 20, 50]
-
-# ── Notify TTL presets (hours) ──
 NOTIFY_TTL_PRESETS = [1, 6, 12, 24, 48]
-
-# ── Broadcast TTL presets (hours) ──
 BROADCAST_TTL_PRESETS = [1, 6, 12, 24, 72, 168]
 
-# ── Default settings ──
+# Auto-delete options shown on the broadcast setup page
+BC_DELETE_HOURS = [0, 1, 6, 12, 24, 72, 168]
+
 DEFAULT_SETTINGS = {
     "region": "IN",
     "languages": DEFAULT_LANGS,
@@ -72,7 +58,8 @@ DEFAULT_SETTINGS = {
     "spotlight_enabled": True,
     "auto_delete_broadcast": True,
     "primary_channel": 0,
-    "weekly_target_admin": 0,      # 0 = all ADMINS
+    "ott_broadcast_channel": 0,   # dedicated OTT channel
+    "weekly_target_admin": 0,
 }
 
 PREFIX = "ott"
