@@ -5,7 +5,7 @@
 from __future__ import annotations
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from core import config
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p"
 
-# Highest priority first
 PRIORITY_LANGS = ["ml", "ta", "en", "hi"]
 
 
@@ -43,7 +42,7 @@ async def _get(path: str, params: Optional[Dict] = None) -> Optional[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════
-# WORLDWIDE + PER-LANGUAGE FETCH (priority-aware)
+# WEEKLY FETCH (multi-language, priority-first)
 # ═══════════════════════════════════════════════════════════
 
 async def fetch_weekly_multi_lang(
@@ -51,13 +50,6 @@ async def fetch_weekly_multi_lang(
     languages: list = None,
     min_vote: int = 5,
 ) -> Dict[int, List[Dict[str, Any]]]:
-    """
-    Priority-aware weekly fetch.
-    1. Malayalam, Tamil, English, Hindi — each fetched individually
-    2. Every other selected language individually
-    3. Worldwide discover (popular fallback)
-    Dedup by tmdb_id. Sort priority languages first, then popularity.
-    """
     if region is None:
         cfg = await DB.get_cfg()
         region = cfg.get("region", "IN")
@@ -65,7 +57,6 @@ async def fetch_weekly_multi_lang(
         cfg = await DB.get_cfg()
         languages = cfg.get("languages") or []
 
-    # Build ordered list: priority first, then user-set (dedup)
     all_langs: List[str] = []
     for code in PRIORITY_LANGS + list(languages or []):
         if code and code not in all_langs:
@@ -76,7 +67,6 @@ async def fetch_weekly_multi_lang(
     lte = (next_mon - timedelta(days=1)).strftime("%Y-%m-%d")
 
     tasks = []
-    # Worldwide
     tasks.append(("__world__", _get("discover/movie", {
         "region": region,
         "primary_release_date.gte": gte,
@@ -85,7 +75,6 @@ async def fetch_weekly_multi_lang(
         "vote_count.gte": int(min_vote),
         "page": 1,
     })))
-    # Each language
     for lang in all_langs:
         tasks.append((lang, _get("discover/movie", {
             "region": region,
@@ -124,7 +113,6 @@ async def fetch_weekly_multi_lang(
                 continue
 
             lang = item.get("original_language", "")
-            # Priority score: 0 for ml, 1 for ta, 2 for en, 3 for hi, 99 else
             try:
                 prio = PRIORITY_LANGS.index(lang)
             except ValueError:
@@ -146,7 +134,6 @@ async def fetch_weekly_multi_lang(
                 "_prio": prio,
             })
 
-    # Sort: priority first, then popularity
     for i in range(7):
         out[i].sort(key=lambda m: (m.get("_prio", 99), -m.get("popularity", 0)))
         for m in out[i]:
@@ -154,10 +141,6 @@ async def fetch_weekly_multi_lang(
 
     return out
 
-
-# ═══════════════════════════════════════════════════════════
-# SINGLE-LANG (kept for compat)
-# ═══════════════════════════════════════════════════════════
 
 async def fetch_weekly(region: str = None) -> Dict[int, List[Dict[str, Any]]]:
     return await fetch_weekly_multi_lang(region=region)
