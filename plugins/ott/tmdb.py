@@ -1,30 +1,24 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT TMDB
-# ============================================================
-#
-# Fetches weekly releases + enriches movies.
-#
+# 🏨 DOWNTOWN VILLA — OTT TMDB (priority languages)
 # ============================================================
 
 from __future__ import annotations
-
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from core import config
-from plugins.ott import state as S
+from plugins.ott import database as DB
 
 logger = logging.getLogger(__name__)
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p"
 
+# Highest priority first
+PRIORITY_LANGS = ["ml", "ta", "en", "hi"]
 
-# ============================================================
-# HTTP
-# ============================================================
 
 async def _get(path: str, params: Optional[Dict] = None) -> Optional[Dict]:
     if not config.TMDB_API_KEY:
@@ -33,12 +27,10 @@ async def _get(path: str, params: Optional[Dict] = None) -> Optional[Dict]:
         import aiohttp
     except ImportError:
         return None
-
     p = dict(params or {})
     p["api_key"] = config.TMDB_API_KEY
     p.setdefault("language", "en-US")
     url = f"{TMDB_BASE}/{path.lstrip('/')}"
-
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, params=p, timeout=15) as r:
@@ -50,76 +42,136 @@ async def _get(path: str, params: Optional[Dict] = None) -> Optional[Dict]:
         return None
 
 
-# ============================================================
-# WEEKLY RELEASES
-# ============================================================
+# ═══════════════════════════════════════════════════════════
+# WORLDWIDE + PER-LANGUAGE FETCH (priority-aware)
+# ═══════════════════════════════════════════════════════════
 
-async def fetch_weekly(region: str = None) -> Dict[int, List[Dict[str, Any]]]:
-    """Return {day_index: [movie, ...]} for Mon-Sun of this week."""
+async def fetch_weekly_multi_lang(
+    region: str = None,
+    languages: list = None,
+    min_vote: int = 5,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Priority-aware weekly fetch.
+    1. Malayalam, Tamil, English, Hindi — each fetched individually
+    2. Every other selected language individually
+    3. Worldwide discover (popular fallback)
+    Dedup by tmdb_id. Sort priority languages first, then popularity.
+    """
     if region is None:
-        cfg = await S.get_cfg()
+        cfg = await DB.get_cfg()
         region = cfg.get("region", "IN")
+    if languages is None:
+        cfg = await DB.get_cfg()
+        languages = cfg.get("languages") or []
 
-    monday, next_mon = S.week_range()
+    # Build ordered list: priority first, then user-set (dedup)
+    all_langs: List[str] = []
+    for code in PRIORITY_LANGS + list(languages or []):
+        if code and code not in all_langs:
+            all_langs.append(code)
+
+    monday, next_mon = DB.week_range()
     gte = monday.strftime("%Y-%m-%d")
     lte = (next_mon - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    data = await _get("discover/movie", {
+    tasks = []
+    # Worldwide
+    tasks.append(("__world__", _get("discover/movie", {
         "region": region,
         "primary_release_date.gte": gte,
         "primary_release_date.lte": lte,
         "sort_by": "popularity.desc",
+        "vote_count.gte": int(min_vote),
         "page": 1,
-    })
-
-    out: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(7)}
-    if not data:
-        return out
-
-    for item in (data.get("results") or []):
-        rd = item.get("release_date") or ""
-        if not rd:
-            continue
-        try:
-            d = datetime.strptime(rd, "%Y-%m-%d").replace(tzinfo=S.IST)
-        except Exception:
-            continue
-        idx = d.weekday()
-        if not (0 <= idx <= 6):
-            continue
-
-        movie = {
-            "tmdb_id": item.get("id"),
-            "title": item.get("title") or item.get("original_title") or "",
-            "overview": item.get("overview") or "",
-            "poster_path": item.get("poster_path"),
-            "backdrop_path": item.get("backdrop_path"),
-            "release_date": rd,
-            "vote_average": item.get("vote_average", 0),
-            "vote_count": item.get("vote_count", 0),
-            "popularity": item.get("popularity", 0),
-            "original_language": item.get("original_language", ""),
-            "genre_ids": item.get("genre_ids", []),
+    })))
+    # Each language
+    for lang in all_langs:
+        tasks.append((lang, _get("discover/movie", {
             "region": region,
-        }
-        out[idx].append(movie)
+            "with_original_language": lang,
+            "primary_release_date.gte": gte,
+            "primary_release_date.lte": lte,
+            "sort_by": "popularity.desc",
+            "vote_count.gte": int(min_vote),
+            "page": 1,
+        })))
+
+    results = await asyncio.gather(
+        *[t[1] for t in tasks], return_exceptions=True)
+
+    seen: set = set()
+    out: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(7)}
+
+    for (src, _), data in zip(tasks, results):
+        if not isinstance(data, dict):
+            continue
+        for item in (data.get("results") or []):
+            mid = item.get("id")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+
+            rd = item.get("release_date") or ""
+            if not rd:
+                continue
+            try:
+                d = datetime.strptime(rd, "%Y-%m-%d").replace(tzinfo=DB.IST)
+            except Exception:
+                continue
+            idx = d.weekday()
+            if not 0 <= idx <= 6:
+                continue
+
+            lang = item.get("original_language", "")
+            # Priority score: 0 for ml, 1 for ta, 2 for en, 3 for hi, 99 else
+            try:
+                prio = PRIORITY_LANGS.index(lang)
+            except ValueError:
+                prio = 99
+
+            out[idx].append({
+                "tmdb_id": mid,
+                "title": item.get("title") or item.get("original_title") or "",
+                "overview": item.get("overview") or "",
+                "poster_path": item.get("poster_path"),
+                "backdrop_path": item.get("backdrop_path"),
+                "release_date": rd,
+                "vote_average": item.get("vote_average", 0),
+                "vote_count": item.get("vote_count", 0),
+                "popularity": item.get("popularity", 0),
+                "original_language": lang,
+                "genre_ids": item.get("genre_ids", []),
+                "region": region,
+                "_prio": prio,
+            })
+
+    # Sort: priority first, then popularity
+    for i in range(7):
+        out[i].sort(key=lambda m: (m.get("_prio", 99), -m.get("popularity", 0)))
+        for m in out[i]:
+            m.pop("_prio", None)
 
     return out
 
 
-# ============================================================
+# ═══════════════════════════════════════════════════════════
+# SINGLE-LANG (kept for compat)
+# ═══════════════════════════════════════════════════════════
+
+async def fetch_weekly(region: str = None) -> Dict[int, List[Dict[str, Any]]]:
+    return await fetch_weekly_multi_lang(region=region)
+
+
+# ═══════════════════════════════════════════════════════════
 # DETAILS
-# ============================================================
+# ═══════════════════════════════════════════════════════════
 
 async def fetch_details(tmdb_id: int) -> Optional[Dict[str, Any]]:
     return await _get(f"movie/{tmdb_id}", {
         "append_to_response": "watch/providers,credits,release_dates",
     })
 
-
-# ============================================================
-# ENRICH
-# ============================================================
 
 _GENRE_MAP = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
@@ -188,17 +240,15 @@ def _extract_release_info(details: Dict, region: str) -> Dict[str, str]:
 
 
 async def enrich_movie(movie: Dict[str, Any], region: str = None) -> Dict[str, Any]:
-    """Fetch + enrich with full details, cache result."""
     if region is None:
-        cfg = await S.get_cfg()
+        cfg = await DB.get_cfg()
         region = cfg.get("region", "IN")
 
     tmdb_id = movie.get("tmdb_id")
     if not tmdb_id:
         return movie
 
-    # Cached?
-    cached = await S.get_movie(tmdb_id)
+    cached = await DB.get_movie(tmdb_id)
     if cached and cached.get("overview"):
         return cached
 
@@ -231,13 +281,9 @@ async def enrich_movie(movie: Dict[str, Any], region: str = None) -> Dict[str, A
         "region_release": _extract_release_info(details, region),
     }
 
-    await S.save_movie(enriched)
+    await DB.save_movie(enriched)
     return enriched
 
-
-# ============================================================
-# POSTER
-# ============================================================
 
 def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
     if not path:
@@ -245,99 +291,8 @@ def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
     return f"{TMDB_IMG}/{size}{path}"
 
 
-
-# ═══════════════════════════════════════════════════════════
-# MULTI-LANGUAGE WORLDWIDE FETCH
-# ═══════════════════════════════════════════════════════════
-
-async def fetch_weekly_multi_lang(
-    region: str = None,
-    languages: list = None,
-    min_vote: int = 5,
-) -> Dict[int, List[Dict[str, Any]]]:
-    """
-    Worldwide + per-language discover.
-    Dedup by tmdb_id, sort by popularity desc.
-    Returns {day_index: [movie, ...]} for Mon-Sun.
-    """
-    if region is None:
-        cfg = await S.get_cfg()
-        region = cfg.get("region", "IN")
-    if languages is None:
-        cfg = await S.get_cfg()
-        languages = cfg.get("languages", ["ml", "hi", "en"])
-
-    monday, next_mon = S.week_range()
-    gte = monday.strftime("%Y-%m-%d")
-    lte = (next_mon - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    seen: set = set()
-    out: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(7)}
-
-    tasks = [
-        _get("discover/movie", {
-            "region": region,
-            "primary_release_date.gte": gte,
-            "primary_release_date.lte": lte,
-            "sort_by": "popularity.desc",
-            "vote_count.gte": int(min_vote),
-            "page": 1,
-        })
-    ]
-    for lang in languages:
-        tasks.append(_get("discover/movie", {
-            "region": region,
-            "with_original_language": lang,
-            "primary_release_date.gte": gte,
-            "primary_release_date.lte": lte,
-            "sort_by": "popularity.desc",
-            "vote_count.gte": int(min_vote),
-            "page": 1,
-        }))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for data in results:
-        if not isinstance(data, dict):
-            continue
-        for item in (data.get("results") or []):
-            mid = item.get("id")
-            if not mid or mid in seen:
-                continue
-            seen.add(mid)
-
-            rd = item.get("release_date") or ""
-            if not rd:
-                continue
-            try:
-                d = datetime.strptime(rd, "%Y-%m-%d").replace(tzinfo=S.IST)
-            except Exception:
-                continue
-            idx = d.weekday()
-            if not 0 <= idx <= 6:
-                continue
-
-            out[idx].append({
-                "tmdb_id": mid,
-                "title": item.get("title") or item.get("original_title") or "",
-                "overview": item.get("overview") or "",
-                "poster_path": item.get("poster_path"),
-                "backdrop_path": item.get("backdrop_path"),
-                "release_date": rd,
-                "vote_average": item.get("vote_average", 0),
-                "vote_count": item.get("vote_count", 0),
-                "popularity": item.get("popularity", 0),
-                "original_language": item.get("original_language", ""),
-                "genre_ids": item.get("genre_ids", []),
-                "region": region,
-            })
-
-    for i in range(7):
-        out[i].sort(key=lambda m: m.get("popularity", 0), reverse=True)
-    return out
-
-
 __all__ = [
+    "PRIORITY_LANGS",
     "fetch_weekly", "fetch_weekly_multi_lang",
     "fetch_details", "enrich_movie", "poster_url",
 ]
