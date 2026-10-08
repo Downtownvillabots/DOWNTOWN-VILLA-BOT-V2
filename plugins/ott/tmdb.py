@@ -245,7 +245,99 @@ def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
     return f"{TMDB_IMG}/{size}{path}"
 
 
+
+# ═══════════════════════════════════════════════════════════
+# MULTI-LANGUAGE WORLDWIDE FETCH
+# ═══════════════════════════════════════════════════════════
+
+async def fetch_weekly_multi_lang(
+    region: str = None,
+    languages: list = None,
+    min_vote: int = 5,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Worldwide + per-language discover.
+    Dedup by tmdb_id, sort by popularity desc.
+    Returns {day_index: [movie, ...]} for Mon-Sun.
+    """
+    if region is None:
+        cfg = await S.get_cfg()
+        region = cfg.get("region", "IN")
+    if languages is None:
+        cfg = await S.get_cfg()
+        languages = cfg.get("languages", ["ml", "hi", "en"])
+
+    monday, next_mon = S.week_range()
+    gte = monday.strftime("%Y-%m-%d")
+    lte = (next_mon - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    seen: set = set()
+    out: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(7)}
+
+    tasks = [
+        _get("discover/movie", {
+            "region": region,
+            "primary_release_date.gte": gte,
+            "primary_release_date.lte": lte,
+            "sort_by": "popularity.desc",
+            "vote_count.gte": int(min_vote),
+            "page": 1,
+        })
+    ]
+    for lang in languages:
+        tasks.append(_get("discover/movie", {
+            "region": region,
+            "with_original_language": lang,
+            "primary_release_date.gte": gte,
+            "primary_release_date.lte": lte,
+            "sort_by": "popularity.desc",
+            "vote_count.gte": int(min_vote),
+            "page": 1,
+        }))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for data in results:
+        if not isinstance(data, dict):
+            continue
+        for item in (data.get("results") or []):
+            mid = item.get("id")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+
+            rd = item.get("release_date") or ""
+            if not rd:
+                continue
+            try:
+                d = datetime.strptime(rd, "%Y-%m-%d").replace(tzinfo=S.IST)
+            except Exception:
+                continue
+            idx = d.weekday()
+            if not 0 <= idx <= 6:
+                continue
+
+            out[idx].append({
+                "tmdb_id": mid,
+                "title": item.get("title") or item.get("original_title") or "",
+                "overview": item.get("overview") or "",
+                "poster_path": item.get("poster_path"),
+                "backdrop_path": item.get("backdrop_path"),
+                "release_date": rd,
+                "vote_average": item.get("vote_average", 0),
+                "vote_count": item.get("vote_count", 0),
+                "popularity": item.get("popularity", 0),
+                "original_language": item.get("original_language", ""),
+                "genre_ids": item.get("genre_ids", []),
+                "region": region,
+            })
+
+    for i in range(7):
+        out[i].sort(key=lambda m: m.get("popularity", 0), reverse=True)
+    return out
+
+
 __all__ = [
-    "fetch_weekly", "fetch_details",
-    "enrich_movie", "poster_url",
+    "fetch_weekly", "fetch_weekly_multi_lang",
+    "fetch_details", "enrich_movie", "poster_url",
 ]
