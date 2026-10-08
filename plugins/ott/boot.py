@@ -16,6 +16,15 @@ from plugins.ott import events as EVENTS
 logger = logging.getLogger(__name__)
 
 
+async def _boot_once(client: Client, message: Message) -> None:
+    try:
+        await DB.ensure_indexes()
+        await EVENTS.ensure_indexes()
+        W.ensure_loops(client)
+    except Exception as e:
+        logger.exception(f"[OTT-BOOT] {e}")
+
+
 @Client.on_message(
     filters.private & filters.text & filters.regex(r"^/ott_boot$"),
     group=-8998,
@@ -23,9 +32,7 @@ logger = logging.getLogger(__name__)
 async def _ott_boot(client: Client, message: Message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return
-    await DB.ensure_indexes()
-    await EVENTS.ensure_indexes()
-    W.ensure_loops(client)
+    await _boot_once(client, message)
     try:
         await message.delete()
     except Exception:
@@ -39,9 +46,7 @@ async def _ott_boot(client: Client, message: Message):
 async def _ott_lazy(client: Client, message: Message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return
-    await DB.ensure_indexes()
-    await EVENTS.ensure_indexes()
-    W.ensure_loops(client)
+    await _boot_once(client, message)
     try:
         message.stop_propagation()
     except Exception:
