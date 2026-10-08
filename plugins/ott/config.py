@@ -9,17 +9,16 @@ from plugins.broadcast.config import (
     _progress_colored, DIV, DIV2, _is_admin,
 )
 
-# ── File checker windows (IST) ──
+# ── File checker windows ──
 CHECK_WINDOWS = [(23, 6), (12, 18)]
 CHECK_INTERVAL_SEC = 3600
 FILE_CHECK_LIMIT = 100
 
-# ── Weekly post (admin PM) ──
+# ── Weekly post ──
 WEEKLY_DAY = 0
 WEEKLY_HOUR = 10
 WEEKLY_MINUTE_WINDOW = 5
 
-# ── Hype loop ──
 HYPE_HOUR = 20
 PENDING_SCAN_INTERVAL = 60
 
@@ -32,10 +31,22 @@ SETUP_TTL = 1800
 # ── Regions ──
 REGIONS = ["IN", "US", "GB", "AE", "SA", "AU", "CA", "SG", "MY"]
 
-# ── Priority languages for weekly fetch ──
+# ── PRIMARY LANGUAGE BUTTONS (shown on home page) ──
+PRIMARY_LANGS = [
+    ("ml", "Malayalam"),
+    ("kn", "Kannada"),
+    ("te", "Telugu"),
+    ("hi", "Hindi"),
+    ("en", "English"),
+    ("ta", "Tamil"),
+    ("bn", "Bengali"),
+    ("mr", "Marathi"),
+]
+
+# ── Weekly fetch priority ──
 PRIORITY_LANGS = ["ml", "ta", "en", "hi"]
 
-# ── Language labels ──
+# ── All language labels ──
 LANGUAGE_LABELS = {
     "ml": "Malayalam", "ta": "Tamil", "en": "English", "hi": "Hindi",
     "te": "Telugu", "kn": "Kannada", "bn": "Bengali", "mr": "Marathi",
@@ -50,6 +61,10 @@ MIN_VOTE_PRESETS = [5, 10, 20, 50]
 NOTIFY_TTL_PRESETS = [1, 6, 12, 24, 48]
 BROADCAST_TTL_PRESETS = [1, 6, 12, 24, 72, 168]
 BC_DELETE_HOURS = [0, 1, 6, 12, 24, 72, 168]
+
+# ── OTT release type (TMDB) ──
+# 1=Premiere, 2=Limited, 3=Theatrical, 4=Digital/OTT, 5=Physical, 6=TV
+OTT_RELEASE_TYPE = 4
 
 # ── Default settings ──
 DEFAULT_SETTINGS = {
