@@ -46,11 +46,10 @@ def _header(title: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-# HOME
+# HOME / DASHBOARD / WEEK / DAY
 # ═══════════════════════════════════════════════════════════
 
 async def view_home() -> Tuple[str, InlineKeyboardMarkup]:
-    from plugins.ott.tmdb import fetch_weekly_multi_lang  # noqa
     wk = DB.week_key()
     w = await DB.get_week(wk)
     movies = []
@@ -75,10 +74,6 @@ async def view_home() -> Tuple[str, InlineKeyboardMarkup]:
     ])
     return text, KB.kb_home()
 
-
-# ═══════════════════════════════════════════════════════════
-# DASHBOARD
-# ═══════════════════════════════════════════════════════════
 
 async def view_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
     wk = DB.week_key()
@@ -133,10 +128,6 @@ async def view_dashboard() -> Tuple[str, InlineKeyboardMarkup]:
     ])
     return text, KB.kb_dashboard()
 
-
-# ═══════════════════════════════════════════════════════════
-# WEEK / DAY
-# ═══════════════════════════════════════════════════════════
 
 async def view_week() -> Tuple[str, InlineKeyboardMarkup]:
     wk = DB.week_key()
@@ -197,12 +188,12 @@ async def view_day(idx: int) -> Tuple[str, InlineKeyboardMarkup]:
 
 
 # ═══════════════════════════════════════════════════════════
-# MOVIE CARD
+# MOVIE
 # ═══════════════════════════════════════════════════════════
 
 async def view_movie(tmdb_id: int, back_cb: str = "ott:week"
                      ) -> Tuple[str, InlineKeyboardMarkup, Optional[str]]:
-    from plugins.ott.tmdb import enrich_movie, poster_url  # noqa
+    from plugins.ott.tmdb import enrich_movie, poster_url
 
     wk = DB.week_key()
     w = await DB.get_week(wk)
@@ -255,7 +246,7 @@ async def view_movie(tmdb_id: int, back_cb: str = "ott:week"
 
 
 # ═══════════════════════════════════════════════════════════
-# BROADCAST CENTER
+# BROADCAST CENTER / SETUP
 # ═══════════════════════════════════════════════════════════
 
 async def view_bc_center() -> Tuple[str, InlineKeyboardMarkup]:
@@ -270,66 +261,50 @@ async def view_bc_center() -> Tuple[str, InlineKeyboardMarkup]:
         f"🎬 {sc('movies this week')} · <b>{len(movies)}</b>",
         "", DIV2,
         f"📌 {sc('pick a movie to broadcast')}",
+        f"📌 {sc('posts to your OTT channel with Notify button')}",
     ])
     return text, KB.kb_bc_center(movies)
 
 
-async def view_bc_targets(tmdb_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+async def view_bc_setup(tmdb_id: int, channel: int, notify: bool,
+                         hours: int) -> Tuple[str, InlineKeyboardMarkup]:
     movie = await DB.get_movie(tmdb_id) or {}
-    title = movie.get("title") or "?"
+    title = (movie.get("title") or "?")[:50]
+    year = (movie.get("release_date") or "")[:4]
+    rating = movie.get("vote_average", 0) or 0
+    lang = (movie.get("original_language") or "").upper()
 
-    counts: Dict[str, int] = {"channels": 0, "groups": 0, "subs": 0,
-                               "premium": 0, "all": 0}
-    try:
-        from plugins.broadcast import database as BDB
-        counts["channels"] = len(await BDB.get_saved_channels())
-        counts["groups"] = len(await BDB.get_all_groups())
-        counts["all"] = len(await BDB.get_all_users())
-    except Exception:
-        pass
-    try:
-        from plugins.premium import state as PS
-        counts["premium"] = len(await PS.list_users(limit=50000))
-    except Exception:
-        pass
-    counts["subs"] = await DB.count_subs_for_movie(tmdb_id)
+    notify_lbl = "🟢 on" if notify else "🔴 off"
+    timer_lbl = "♾️ never" if hours <= 0 else f"⏱️ {hours}h"
 
     text = "\n".join([
-        _header("BROADCAST TARGET"),
-        f"🎬 <b>{sc(str(title)[:50])}</b>",
+        _header("BROADCAST SETUP"),
+        f"🎬 <b>{sc(title)}</b> ({year})",
+        f"⭐ <code>{rating:.1f}/10</code> · 🌐 <code>{lang or '—'}</code>",
         "", DIV2,
-        f"📌 {sc('choose where to send')}",
-        "",
-        f"📡 {sc('channels')} · <b>{counts['channels']}</b>",
-        f"👥 {sc('groups')} · <b>{counts['groups']}</b>",
-        f"👤 {sc('subscribers of this movie')} · <b>{counts['subs']}</b>",
-        f"💎 {sc('premium')} · <b>{counts['premium']}</b>",
-        f"🌐 {sc('all users')} · <b>{_fmt_int(counts['all'])}</b>",
+        f"📢 {sc('channel')} · <code>{channel or '— not set —'}</code>",
+        f"🔔 {sc('notify button')} · <b>{notify_lbl}</b>",
+        f"🗑️ {sc('auto-delete')} · <b>{timer_lbl}</b>",
+        "", DIV2,
+        f"📌 {sc('poster + caption + buttons will be sent')}",
+        f"📌 {sc('users who tap Notify get DM\\'d when file lands')}",
     ])
-    return text, KB.kb_bc_targets(tmdb_id, counts)
+    return text, KB.kb_bc_setup(tmdb_id, channel, notify, hours)
 
 
-async def view_bc_confirm(tmdb_id: int, target: str
-                          ) -> Tuple[str, InlineKeyboardMarkup]:
-    movie = await DB.get_movie(tmdb_id) or {}
-    title = movie.get("title") or "?"
-    label = {
-        "channels": "📡 Channels", "groups": "👥 Groups",
-        "users": "👤 Subscribers", "premium": "💎 Premium only",
-        "all": "🌐 ALL users",
-    }.get(target, target)
-
+async def view_bcsetup_timer(tmdb_id: int, current: int
+                              ) -> Tuple[str, InlineKeyboardMarkup]:
     text = "\n".join([
-        _header("CONFIRM BROADCAST"),
-        f"🎬 <b>{sc(str(title)[:50])}</b>",
-        f"🎯 {sc('target')} · <b>{label}</b>",
+        _header("AUTO-DELETE TIMER"),
+        f"📌 {sc('when should the channel post self-delete?')}",
         "", DIV2,
-        f"⚠️ {sc('poster + Get Notified button will be sent')}",
-        f"📌 {sc('users who tap will be saved for auto-notify')}",
+        f"📌 {sc('current')} · "
+        f"{('♾️ never' if current <= 0 else f'⏱️ {current}h')}",
         "", DIV2,
-        f"❓ {sc('proceed?')}",
+        f"📌 {sc('💡 tip')} · {sc('users get the file link via DM')}",
+        f"📌 {sc('the channel post is just the announcement')}",
     ])
-    return text, KB.kb_bc_confirm(tmdb_id, target)
+    return text, KB.kb_bcsetup_timer(tmdb_id, current)
 
 
 async def view_bc_history() -> Tuple[str, InlineKeyboardMarkup]:
@@ -349,7 +324,7 @@ async def view_bc_history() -> Tuple[str, InlineKeyboardMarkup]:
                 f"❌ <b>{it.get('failed', 0)}</b>",
                 "",
             ]
-    return "\n".join(lines)[:4000], KB.kb_bc_history(items)
+    return "\n".join(lines)[:4000], KB.kb_bc_history()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -425,7 +400,6 @@ async def view_cancel_confirm(tmdb_id: int, tok: str
         f"• 💥 {sc('delete')} <b>{count}</b> {sc('pending subs')}",
         f"• 🚫 {sc('refuse any future Get Notified for this token')}",
         f"• 🏷️ {sc('flag the broadcast as cancelled')}",
-        f"• 🗑️ {sc('delete the channel post if you tap twice')}",
         "", DIV2,
         f"⚠️ {sc('cannot be undone.')}",
     ])
@@ -482,9 +456,9 @@ async def view_settings() -> Tuple[str, InlineKeyboardMarkup]:
         f"🌐 {sc('languages')} · "
         f"<code>{','.join(langs) or '—'}</code>",
         f"   <i>{sc(', '.join(lang_labels)[:120] or '—')}</i>",
+        f"📢 {sc('OTT channel')} · "
+        f"<code>{cfg.get('ott_broadcast_channel') or '—'}</code>",
         f"⭐ {sc('min votes')} · <code>{cfg.get('min_vote_count')}</code>",
-        f"📺 {sc('primary channel')} · "
-        f"<code>{cfg.get('primary_channel') or '—'}</code>",
         f"🔔 {sc('notify TTL')} · "
         f"<code>{cfg.get('notify_ttl_hours')}h</code>",
         f"📢 {sc('broadcast TTL')} · "
@@ -520,6 +494,8 @@ async def view_langs() -> Tuple[str, InlineKeyboardMarkup]:
         _header("LANGUAGES"),
         f"🌐 {sc('selected')} · <code>{','.join(langs) or '—'}</code>",
         "", DIV2,
+        f"📌 {sc('priority order')} · "
+        f"<code>ML → TA → EN → HI</code>",
         f"📌 {sc('tap a code to toggle')}",
     ])
     return text, KB.kb_langs(langs)
@@ -561,7 +537,6 @@ async def view_bcttl() -> Tuple[str, InlineKeyboardMarkup]:
 # ═══════════════════════════════════════════════════════════
 
 async def view_diag() -> Tuple[str, InlineKeyboardMarkup]:
-    import time as _t
     cfg = await DB.get_cfg()
     tmdb_ok = False
     try:
@@ -577,13 +552,8 @@ async def view_diag() -> Tuple[str, InlineKeyboardMarkup]:
     ch_ok = False
     ch_id = 0
     try:
-        from plugins.broadcast import database as BDB
-        chans = await BDB.get_saved_channels()
-        if chans:
-            primary = next((c for c in chans if c.get("primary")),
-                           chans[0])
-            ch_id = int(primary.get("chat_id", 0))
-            ch_ok = True
+        ch_id = int(cfg.get("ott_broadcast_channel") or 0)
+        ch_ok = ch_id != 0
     except Exception:
         pass
 
@@ -595,7 +565,7 @@ async def view_diag() -> Tuple[str, InlineKeyboardMarkup]:
         f"{'🟢 set' if tmdb_ok else '🔴 missing'}",
         f"🗄️ {sc('system DB')} · "
         f"{'🟢 online' if db_ok else '🔴 offline'}",
-        f"📺 {sc('channel')} · "
+        f"📺 {sc('OTT channel')} · "
         f"{('🟢 ' + str(ch_id)) if ch_ok else '⚪ none'}",
         f"📅 {sc('week data')} · "
         f"{'🟢 loaded' if w else '⚪ not fetched'}",
@@ -617,7 +587,7 @@ __all__ = [
     "safe_edit",
     "view_home", "view_dashboard", "view_week", "view_day",
     "view_movie",
-    "view_bc_center", "view_bc_targets", "view_bc_confirm",
+    "view_bc_center", "view_bc_setup", "view_bcsetup_timer",
     "view_bc_history",
     "view_subs_overview", "view_subs_movie", "view_cancel_confirm",
     "view_notif", "view_cache",
