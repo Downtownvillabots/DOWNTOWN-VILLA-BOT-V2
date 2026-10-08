@@ -3,22 +3,18 @@
 # ============================================================
 
 from __future__ import annotations
-import asyncio
 import logging
-from typing import Optional
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
 )
 
 from plugins.broadcast.config import fb, sc, DIV, _is_admin
 from plugins.ott import database as DB
 from plugins.ott import state as ST
 from plugins.ott import views as V
-from plugins.ott import keyboards as KB
 from plugins.ott import engine as EG
 from plugins.ott import watcher as W
 from plugins.ott.config import PREFIX
@@ -29,11 +25,10 @@ PFX = PREFIX
 
 
 # ═══════════════════════════════════════════════════════════
-# /admin ENTRY POINT
+# /admin ENTRY
 # ═══════════════════════════════════════════════════════════
 
 async def open_panel_for_admin(client: Client, q: CallbackQuery) -> None:
-    """Called from /admin → [📅 OTT]"""
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("⛔ admins only", show_alert=True)
 
@@ -102,7 +97,6 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
-        # ── DAY ──
         if action == "day":
             try:
                 idx = int(args[0])
@@ -137,7 +131,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
-        # ── REFETCH WEEK ──
+        # ── REFETCH ──
         if action == "refetch":
             await q.answer("🔄 Fetching…")
             try:
@@ -167,33 +161,74 @@ async def ott_router(client: Client, q: CallbackQuery):
                 tmdb_id = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            text, kb = await V.view_bc_targets(tmdb_id)
+            ch = await EG.get_ott_channel()
+            if not ch:
+                return await q.answer(
+                    "⚠️ Set the OTT broadcast channel in Settings first",
+                    show_alert=True)
+            ST.setup_new(q.from_user.id, tmdb_id, ch)
+            s = ST.setup_get(q.from_user.id)
+            text, kb = await V.view_bc_setup(
+                tmdb_id, ch, s["notify"], s["auto_delete_hours"])
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
-        if action == "bc_confirm":
+        if action == "bcsetup":
             try:
                 tmdb_id = int(args[0])
-                target = args[1]
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            text, kb = await V.view_bc_confirm(tmdb_id, target)
+            s = ST.setup_get(q.from_user.id)
+            if not s or s["tmdb_id"] != tmdb_id:
+                ch = await EG.get_ott_channel()
+                ST.setup_new(q.from_user.id, tmdb_id, ch)
+                s = ST.setup_get(q.from_user.id)
+            text, kb = await V.view_bc_setup(
+                tmdb_id, s["channel_id"], s["notify"],
+                s["auto_delete_hours"])
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
-        if action == "bc_do":
+        if action == "bcsetup_tog_notify":
+            s = ST.setup_get(q.from_user.id)
+            if not s:
+                return await q.answer("⏱️ expired", show_alert=True)
+            s["notify"] = not s["notify"]
+            text, kb = await V.view_bc_setup(
+                s["tmdb_id"], s["channel_id"], s["notify"],
+                s["auto_delete_hours"])
+            await V.safe_edit(q, text, kb)
+            return await q.answer("🟢 on" if s["notify"] else "🔴 off")
+
+        if action == "bcsetup_timer":
+            s = ST.setup_get(q.from_user.id)
+            if not s:
+                return await q.answer("⏱️ expired", show_alert=True)
+            text, kb = await V.view_bcsetup_timer(
+                s["tmdb_id"], s["auto_delete_hours"])
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "bcsetup_timer_do":
             try:
-                tmdb_id = int(args[0])
-                target = args[1]
+                h = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            await q.answer("🚀 Starting…")
-            return await EG.run_broadcast(client, q, tmdb_id, target)
+            s = ST.setup_get(q.from_user.id)
+            if not s:
+                return await q.answer("⏱️ expired", show_alert=True)
+            s["auto_delete_hours"] = h
+            text, kb = await V.view_bc_setup(
+                s["tmdb_id"], s["channel_id"], s["notify"],
+                s["auto_delete_hours"])
+            await V.safe_edit(q, text, kb)
+            return await q.answer("✅" if h else "♾️")
 
-        if action == "bc_stop":
-            jid = args[0] if args else ""
-            EG.cancel_job(jid)
-            return await q.answer("⏹️ Cancelling…")
+        if action == "bcsetup_send":
+            s = ST.setup_get(q.from_user.id)
+            if not s:
+                return await q.answer("⏱️ expired", show_alert=True)
+            return await EG.send_channel_broadcast(client, q, s)
 
         if action == "bc_hist":
             text, kb = await V.view_bc_history()
@@ -275,7 +310,6 @@ async def ott_router(client: Client, q: CallbackQuery):
                 f"🗑️ {sc('pending subs deleted')} · <b>{n}</b>",
                 f"🏷️ {sc('broadcast flagged')}",
                 "", f"📌 {sc('channel post NOT touched')}",
-                "", f"📌 {sc('tap below to open subscribers')}",
             ])
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -284,30 +318,6 @@ async def ott_router(client: Client, q: CallbackQuery):
                 [InlineKeyboardButton(
                     "❌ Close", callback_data="ott:close")],
             ])
-            await V.safe_edit(q, text, kb)
-            return
-
-        if action == "del_post":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            bc = await DB.broadcast_get_latest(tmdb_id)
-            msg_id = bc.get("channel_msg_id") if bc else 0
-            if not msg_id:
-                return await q.answer(
-                    "⚪ no channel post on record", show_alert=True)
-            cfg = await DB.get_cfg()
-            ch = int(cfg.get("primary_channel") or 0)
-            if not ch:
-                return await q.answer(
-                    "⚪ no primary channel set", show_alert=True)
-            try:
-                await client.delete_messages(ch, msg_id)
-                await q.answer("🗑️ Deleted")
-            except Exception as e:
-                await q.answer(f"❌ {type(e).__name__}", show_alert=True)
-            text, kb = await V.view_subs_movie(tmdb_id)
             await V.safe_edit(q, text, kb)
             return
 
@@ -323,10 +333,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                 if raw:
                     details = await fetch_details(tmdb_id)
                     if details:
-                        from plugins.ott import tmdb as T
-                        # force refresh by clearing cache marker
                         raw["overview"] = ""
-                        fresh = await T.enrich_movie(raw)
+                        fresh = await enrich_movie(raw)
                         if fresh:
                             await DB.save_movie(fresh)
             except Exception as e:
@@ -422,19 +430,19 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return
 
-        if action == "set_channel":
-            ST.new_session(q.from_user.id, "set_channel")
+        if action == "set_ott_channel":
+            ST.new_session(q.from_user.id, "set_ott_channel")
             text = "\n".join([
                 f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"📺 <b>{fb('SET PRIMARY CHANNEL')}</b>",
+                f"📢 <b>{fb('SET OTT BROADCAST CHANNEL')}</b>",
                 DIV, "",
                 f"📝 {sc('send a chat id or @username')}",
-                f"📌 {sc('bot must be admin')}",
+                f"📌 {sc('this is where movie announcements go')}",
+                f"📌 {sc('users will tap Notify from there')}",
                 "", f"📌 {sc('send')} <code>-</code> {sc('to cancel')}",
             ])
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "❌ Cancel", callback_data="ott:set")]])
+                InlineKeyboardButton("❌ Cancel", callback_data="ott:set")]])
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -493,7 +501,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
-        # ── USER-SIDE: SUBSCRIBE / WATCHLIST / GET FILE ──
+        # ── USER SIDE ──
         if action == "sub":
             try:
                 tmdb_id = int(args[0])
@@ -517,16 +525,16 @@ async def ott_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             movie = await DB.get_movie(tmdb_id) or {}
-            from plugins.ott.database import _c as _coll
-            c = _coll("ott_prefs")
+            c = DB.prefs_coll()
             if c is not None:
                 try:
+                    import time as _t
                     await c.update_one(
                         {"user_id": int(q.from_user.id)},
                         {"$addToSet": {"watchlist": {
                             "tmdb_id": int(tmdb_id),
                             "title": movie.get("title") or "?",
-                            "added_at": __import__("time").time(),
+                            "added_at": _t.time(),
                         }}},
                         upsert=True,
                     )
@@ -547,7 +555,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             movie = await DB.get_movie(tmdb_id) or {}
             title = movie.get("title") or "?"
             await q.answer(
-                f"📤 Share this: https://t.me/{q.message.chat.username or ''}",
+                f"📤 Share: {title}",
                 show_alert=True)
             return
 
