@@ -734,6 +734,597 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return
 
+                # ═══════════════════════════════════════════════════
+        # SETTINGS — CAPTION
+        # ═══════════════════════════════════════════════════
+        if action == "cap_settings":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_settings()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_global":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_global()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_global_tpl":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_global_templates()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_global_tpl_use":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            name = args[0] if args else "default"
+            tpl = SD.CAPTION_TEMPLATES.get(name)
+            if tpl:
+                await SD.set_global_caption(tpl)
+            await q.answer(f"✅ {name}")
+            text, kb = await SUI.view_caption_global()
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "cap_global_edit":
+            from plugins.ott import settings_ui as SUI
+            ST.new_set_session(q.from_user.id, "edit_caption_global")
+            text, kb = SUI.prompt_caption_edit("GLOBAL", "ott:cap_global")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_global_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.reset_global_caption()
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_caption_global()
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "cap_global_prev":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_global_preview()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── CHANNEL CAPTION ──
+        if action == "cap_ch_list":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_ch_list()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_ch":
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await SUI.view_caption_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_ch_edit":
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            ST.new_set_session(q.from_user.id, "edit_caption_ch", cid=cid)
+            text, kb = SUI.prompt_caption_edit(f"CHANNEL {cid}",
+                                                f"ott:cap_ch:{cid}")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_ch_tpl":
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await SUI.view_caption_channel_templates(cid)
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_ch_tpl_use":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+                name = args[1]
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            tpl = SD.CAPTION_TEMPLATES.get(name)
+            if tpl:
+                await SD.set_channel_caption(cid, tpl)
+            await q.answer(f"✅ {name}")
+            text, kb = await SUI.view_caption_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "cap_ch_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await SD.set_channel_caption(cid, None)
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_caption_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        # ── GROUP CAPTION ──
+        if action == "cap_gr_list":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_gr_list()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_gr":
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await SUI.view_caption_group(gid)
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_gr_edit":
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            ST.new_set_session(q.from_user.id, "edit_caption_gr", gid=gid)
+            text, kb = SUI.prompt_caption_edit(f"GROUP {gid}",
+                                                f"ott:cap_gr:{gid}")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_gr_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await SD.set_group_caption(gid, None)
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_caption_group(gid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        # ── USERS / PREMIUM CAPTION ──
+        if action == "cap_us":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_users("user")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_us_edit":
+            from plugins.ott import settings_ui as SUI
+            ST.new_set_session(q.from_user.id, "edit_caption_us")
+            text, kb = SUI.prompt_caption_edit("USERS", "ott:cap_us")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_us_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_user_caption(None)
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_caption_users("user")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "cap_pm":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_caption_users("premium")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_pm_edit":
+            from plugins.ott import settings_ui as SUI
+            ST.new_set_session(q.from_user.id, "edit_caption_pm")
+            text, kb = SUI.prompt_caption_edit("PREMIUM", "ott:cap_pm")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "cap_pm_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_premium_caption(None)
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_caption_users("premium")
+            await V.safe_edit(q, text, kb)
+            return
+
+        # ═══════════════════════════════════════════════════
+        # SETTINGS — BUTTONS
+        # ═══════════════════════════════════════════════════
+        if action == "btn_settings":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_buttons_settings()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_global":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_buttons_global()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_global_tog":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            key = args[0] if args else ""
+            r = await SD.toggle_global_button(key)
+            if r is None:
+                return await q.answer("❌")
+            await q.answer("🟢 ON" if r else "🔴 OFF")
+            text, kb = await SUI.view_buttons_global()
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_global_add":
+            from plugins.ott import settings_ui as SUI
+            ST.new_set_session(q.from_user.id, "btn_add_global")
+            text, kb = SUI.prompt_add_custom_button("GLOBAL",
+                                                     "ott:btn_global")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_global_rm":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                idx = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            gb = await SD.get_global_buttons()
+            custom = list(gb.get("custom") or [])
+            if 0 <= idx < len(custom):
+                custom.pop(idx)
+                gb["custom"] = custom
+                await SD.set_global_buttons(gb)
+            await q.answer("🗑️ removed")
+            text, kb = await SUI.view_buttons_global()
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_global_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_global_buttons(dict(SD.DEFAULT_BUTTONS))
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_buttons_global()
+            await V.safe_edit(q, text, kb)
+            return
+
+        # Channel buttons
+        if action == "btn_ch_list":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_buttons_ch_list()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_ch":
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await SUI.view_buttons_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_ch_custom":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await SD.set_channel_buttons(cid, dict(SD.DEFAULT_BUTTONS))
+            await q.answer("✏️ custom created")
+            text, kb = await SUI.view_buttons_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_ch_tog":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+                key = args[1]
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            if key not in ("get_notified", "get_files", "watchlist"):
+                return await q.answer("❌")
+            ov = await SD.get_channel_override(cid)
+            btn = dict(ov.get("buttons") or await SD.get_global_buttons())
+            btn[key] = not bool(btn.get(key, True))
+            await SD.set_channel_buttons(cid, btn)
+            await q.answer("🟢 ON" if btn[key] else "🔴 OFF")
+            text, kb = await SUI.view_buttons_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_ch_add":
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            ST.new_set_session(q.from_user.id, "btn_add_ch", cid=cid)
+            text, kb = SUI.prompt_add_custom_button(f"CHANNEL {cid}",
+                                                     f"ott:btn_ch:{cid}")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_ch_rm":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+                idx = int(args[1])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            ov = await SD.get_channel_override(cid)
+            btn = dict(ov.get("buttons") or await SD.get_global_buttons())
+            custom = list(btn.get("custom") or [])
+            if 0 <= idx < len(custom):
+                custom.pop(idx)
+                btn["custom"] = custom
+                await SD.set_channel_buttons(cid, btn)
+            await q.answer("🗑️ removed")
+            text, kb = await SUI.view_buttons_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_ch_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await SD.set_channel_buttons(cid, None)
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_buttons_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        # Group buttons
+        if action == "btn_gr_list":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_buttons_gr_list()
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_gr":
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await SUI.view_buttons_group(gid)
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_gr_custom":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await SD.set_group_buttons(gid, dict(SD.DEFAULT_BUTTONS))
+            await q.answer("✏️ custom created")
+            text, kb = await SUI.view_buttons_group(gid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_gr_tog":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+                key = args[1]
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            if key not in ("get_notified", "get_files", "watchlist"):
+                return await q.answer("❌")
+            ov = await SD.get_group_override(gid)
+            btn = dict(ov.get("buttons") or await SD.get_global_buttons())
+            btn[key] = not bool(btn.get(key, True))
+            await SD.set_group_buttons(gid, btn)
+            await q.answer("🟢 ON" if btn[key] else "🔴 OFF")
+            text, kb = await SUI.view_buttons_group(gid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_gr_add":
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            ST.new_set_session(q.from_user.id, "btn_add_gr", gid=gid)
+            text, kb = SUI.prompt_add_custom_button(f"GROUP {gid}",
+                                                     f"ott:btn_gr:{gid}")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_gr_rm":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+                idx = int(args[1])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            ov = await SD.get_group_override(gid)
+            btn = dict(ov.get("buttons") or await SD.get_global_buttons())
+            custom = list(btn.get("custom") or [])
+            if 0 <= idx < len(custom):
+                custom.pop(idx)
+                btn["custom"] = custom
+                await SD.set_group_buttons(gid, btn)
+            await q.answer("🗑️ removed")
+            text, kb = await SUI.view_buttons_group(gid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_gr_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await SD.set_group_buttons(gid, None)
+            await q.answer("♻️ reset")
+            text, kb = await SUI.view_buttons_group(gid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        # Users / Premium buttons
+        if action == "btn_us":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_buttons_users("user")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_us_custom":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_user_buttons(dict(SD.DEFAULT_BUTTONS))
+            await q.answer("✏️ custom created")
+            text, kb = await SUI.view_buttons_users("user")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_us_tog":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            key = args[0] if args else ""
+            if key not in ("get_notified", "get_files", "watchlist"):
+                return await q.answer("❌")
+            btn = dict(await SD.get_user_buttons()
+                       or await SD.get_global_buttons())
+            btn[key] = not bool(btn.get(key, True))
+            await SD.set_user_buttons(btn)
+            await q.answer("🟢 ON" if btn[key] else "🔴 OFF")
+            text, kb = await SUI.view_buttons_users("user")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_us_add":
+            from plugins.ott import settings_ui as SUI
+            ST.new_set_session(q.from_user.id, "btn_add_us")
+            text, kb = SUI.prompt_add_custom_button("USERS", "ott:btn_us")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_us_rm":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                idx = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            btn = dict(await SD.get_user_buttons()
+                       or await SD.get_global_buttons())
+            custom = list(btn.get("custom") or [])
+            if 0 <= idx < len(custom):
+                custom.pop(idx)
+                btn["custom"] = custom
+                await SD.set_user_buttons(btn)
+            await q.answer("🗑️")
+            text, kb = await SUI.view_buttons_users("user")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_us_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_user_buttons(None)
+            await q.answer("♻️")
+            text, kb = await SUI.view_buttons_users("user")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_pm":
+            from plugins.ott import settings_ui as SUI
+            text, kb = await SUI.view_buttons_users("premium")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_pm_custom":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_premium_buttons(dict(SD.DEFAULT_BUTTONS))
+            await q.answer("✏️ custom created")
+            text, kb = await SUI.view_buttons_users("premium")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_pm_tog":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            key = args[0] if args else ""
+            if key not in ("get_notified", "get_files", "watchlist"):
+                return await q.answer("❌")
+            btn = dict(await SD.get_premium_buttons()
+                       or await SD.get_global_buttons())
+            btn[key] = not bool(btn.get(key, True))
+            await SD.set_premium_buttons(btn)
+            await q.answer("🟢 ON" if btn[key] else "🔴 OFF")
+            text, kb = await SUI.view_buttons_users("premium")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_pm_add":
+            from plugins.ott import settings_ui as SUI
+            ST.new_set_session(q.from_user.id, "btn_add_pm")
+            text, kb = SUI.prompt_add_custom_button("PREMIUM", "ott:btn_pm")
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "btn_pm_rm":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            try:
+                idx = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            btn = dict(await SD.get_premium_buttons()
+                       or await SD.get_global_buttons())
+            custom = list(btn.get("custom") or [])
+            if 0 <= idx < len(custom):
+                custom.pop(idx)
+                btn["custom"] = custom
+                await SD.set_premium_buttons(btn)
+            await q.answer("🗑️")
+            text, kb = await SUI.view_buttons_users("premium")
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "btn_pm_rst":
+            from plugins.ott import settings_db as SD
+            from plugins.ott import settings_ui as SUI
+            await SD.set_premium_buttons(None)
+            await q.answer("♻️")
+            text, kb = await SUI.view_buttons_users("premium")
+            await V.safe_edit(q, text, kb)
+            return
+
         if action == "diag":
             text, kb = await V.view_diag()
             await V.safe_edit(q, text, kb)
