@@ -252,6 +252,61 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
+
+        # ── CHANNEL SETUP (in-channel broadcast setup) ──
+        if action == "csetup":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            from plugins.ott import channel_flow as CF
+            return await CF.open_setup(client, q, tmdb_id)
+
+        if action == "csetup_n":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            from plugins.ott import channel_flow as CF
+            return await CF.toggle_notify(client, q, tmdb_id)
+
+        if action == "csetup_f":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            from plugins.ott import channel_flow as CF
+            return await CF.toggle_file(client, q, tmdb_id)
+
+        if action == "csetup_t":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            from plugins.ott import channel_flow as CF
+            return await CF.show_timer(client, q, tmdb_id)
+
+        if action == "csetup_td":
+            try:
+                tmdb_id = int(args[0])
+                h = int(args[1])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            from plugins.ott import channel_flow as CF
+            return await CF.set_timer(client, q, tmdb_id, h)
+
+        if action == "csetup_go":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            from plugins.ott import channel_flow as CF
+            return await CF.post_now(client, q, tmdb_id)
+
+        if action == "csetup_x":
+            from plugins.ott import channel_flow as CF
+            return await CF.cancel_setup(client, q)
+
         if action == "bcsetup":
             try:
                 tmdb_id = int(args[0])
