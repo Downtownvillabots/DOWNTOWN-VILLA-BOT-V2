@@ -16,6 +16,23 @@ _loaded: List[str] = []
 _failed: List[str] = []
 
 
+# ── PRELOAD: modules that are imported by other submodules ──
+# Must load BEFORE discover() to avoid circular-import errors
+# (e.g. views.py does `from plugins.ott import progress`).
+_PRELOAD = (
+    "progress",   # used by views.py
+    "config",     # used by nearly everything
+    "database",   # used by tmdb, events, etc.
+    "state",      # used by panel, channel_flow
+)
+
+for _name in _PRELOAD:
+    try:
+        importlib.import_module(f"{__package__}.{_name}")
+    except Exception as _e:
+        logger.warning(f"[OTT] preload {_name} failed: {_e}")
+
+
 def discover() -> None:
     global _loaded, _failed
     _loaded.clear()
@@ -26,6 +43,10 @@ def discover() -> None:
     for mod in pkgutil.iter_modules([str(pkg_dir)]):
         name = mod.name
         if name.startswith("_"):
+            continue
+        if name in _PRELOAD:
+            # already loaded above
+            _loaded.append(name)
             continue
         full = f"{__package__}.{name}"
         try:
