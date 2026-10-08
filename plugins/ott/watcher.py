@@ -54,12 +54,16 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     mon = DB.day_date(0).strftime("%d %b")
     sun = DB.day_date(6).strftime("%d %b %Y")
 
+    # Group language counts
     lang_counts: Dict[str, int] = {}
     for d in days:
         for m in d:
             code = (m.get("original_language") or "").upper()
             if code:
                 lang_counts[code] = lang_counts.get(code, 0) + 1
+
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
 
     lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
@@ -73,10 +77,20 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     for code, n in sorted(lang_counts.items(), key=lambda x: -x[1])[:8]:
         lines.append(f"• <code>{code}</code> · <b>{n}</b>")
 
-    lines += ["", DIV2, f"📌 {sc('by day')}"]
+    lines += ["", DIV2, f"📌 <b>{sc('BY DAY')}</b>", ""]
     for i in range(7):
-        d = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][i]
-        lines.append(f"📅 <b>{d}</b> · <code>{counts[i]}</code>")
+        day_date = DB.day_date(i)
+        lines.append(
+            f"📅 <b>{day_names[i]}</b> · "
+            f"<code>{day_date.strftime('%d %b')}</code> · "
+            f"<b>{counts[i]}</b>"
+        )
+        # Show top 3 per day
+        for m in (days[i][:3] if i < len(days) else []):
+            title = str(m.get("title", "?"))[:40]
+            lines.append(f"   🎬 {sc(title)}")
+        if counts[i] > 3:
+            lines.append(f"   <i>… +{counts[i] - 3} more</i>")
 
     lines += [
         "", DIV2,
@@ -102,7 +116,6 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     except Exception as e:
         logger.warning(f"[OTT-WK] send: {e}")
         return False
-
 
 async def weekly_loop(client: Client) -> None:
     await asyncio.sleep(30)
