@@ -1,10 +1,10 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT ENGINE (channel broadcast)
+# 🏨 DOWNTOWN VILLA — OTT ENGINE
 # ============================================================
 
 from __future__ import annotations
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
@@ -21,10 +21,6 @@ from plugins.ott.tmdb import poster_url
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════
-# RESOLVE THE OTT BROADCAST CHANNEL
-# ═══════════════════════════════════════════════════════════
-
 async def get_ott_channel() -> int:
     cfg = await DB.get_cfg()
     ch = int(cfg.get("ott_broadcast_channel") or 0)
@@ -39,10 +35,6 @@ async def get_ott_channel() -> int:
     return 0
 
 
-# ═══════════════════════════════════════════════════════════
-# CAPTION BUILDER
-# ═══════════════════════════════════════════════════════════
-
 def build_caption(movie: Dict[str, Any]) -> str:
     title = movie.get("title") or "?"
     year = (movie.get("release_date") or "")[:4]
@@ -55,7 +47,7 @@ def build_caption(movie: Dict[str, Any]) -> str:
     provider = movie.get("provider") or "—"
 
     lines = [
-        f"🎬 <b>{fb('COMING SOON')}</b>",
+        f"🎬 <b>{fb('NOW STREAMING')}</b>",
         DIV, "",
         f"🎥 <b>{sc(str(title)[:60])}</b> ({year})",
         f"⭐ <code>{rating:.1f}/10</code> "
@@ -69,15 +61,11 @@ def build_caption(movie: Dict[str, Any]) -> str:
     lines += [
         "",
         DIV2,
-        f"🔔 {sc('tap below to get notified')}",
-        f"📥 {sc('we will DM you when the file is uploaded')}",
+        f"🔔 {sc('tap below to get notified when file is uploaded')}",
+        f"📥 {sc('or tap Get File if already available')}",
     ]
     return "\n".join(lines)
 
-
-# ═══════════════════════════════════════════════════════════
-# SEND BROADCAST (setup-driven)
-# ═══════════════════════════════════════════════════════════
 
 async def send_channel_broadcast(
     client: Client,
@@ -94,11 +82,12 @@ async def send_channel_broadcast(
         return await q.answer("⚠️ movie missing", show_alert=True)
 
     notify = bool(setup.get("notify", True))
+    show_file = bool(setup.get("show_file", True))
     hours = int(setup.get("auto_delete_hours", 0))
     ttl = hours * 3600 if hours > 0 else 0
 
     caption = build_caption(movie)
-    kb = KB.ott_channel_kb(tmdb_id, notify=notify)
+    kb = KB.kb_channel_post(tmdb_id, notify=notify, show_file=show_file)
     poster = poster_url(movie.get("poster_path"), "w500")
 
     await q.answer("📤 Sending…")
@@ -170,14 +159,16 @@ async def send_channel_broadcast(
         DIV, "",
         f"🎬 <b>{sc(movie_title)}</b>",
         f"📢 <code>{ch}</code>",
-        f"🔔 {sc('notify button')} · "
-        f"{'🟢 on' if notify else '🔴 off'}",
+        f"🔔 {sc('notify')} · {'🟢' if notify else '🔴'} · "
+        f"📥 {sc('file')} · {'🟢' if show_file else '🔴'}",
         ttl_line,
         "", DIV2,
-        f"📌 {sc('users who tap Notify will be DM-ed when file lands')}",
-        f"📌 {sc('view subscribers from the movie card')}",
+        f"📌 {sc('users who tap Notify are saved')}",
     ])
     kb2 = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"📊 {sc('Statistics')}",
+            callback_data=f"ott:stats:{tmdb_id}")],
         [InlineKeyboardButton(
             f"👥 {sc('Subscribers')}",
             callback_data=f"ott:subs_mv:{tmdb_id}")],
