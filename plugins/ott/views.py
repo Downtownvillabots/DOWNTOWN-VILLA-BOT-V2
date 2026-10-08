@@ -21,10 +21,6 @@ from plugins.ott import database as DB
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════
-# SAFE EDIT
-# ═══════════════════════════════════════════════════════════
-
 async def safe_edit(target, text: str, kb=None) -> bool:
     try:
         msg = getattr(target, "message", target)
@@ -40,10 +36,6 @@ async def safe_edit(target, text: str, kb=None) -> bool:
         logger.debug(f"[OTT-V] edit: {type(e).__name__}: {e}")
         return False
 
-
-# ═══════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════
 
 def _week_range():
     now = _dt.datetime.now()
@@ -69,12 +61,16 @@ def _freq_label(freq: Dict[str, Any]) -> str:
     if mode == "daily":
         return f"DAILY · {hour:02d}:00"
     if mode == "weekly":
-        d = freq.get("day_of_week") or 0
+        d = int(freq.get("day_of_week") or 0)
         return f"WEEKLY · {FREQ_DAYS[d]} · {hour:02d}:00"
     if mode == "monthly":
-        dm = freq.get("day_of_month") or 1
+        dm = int(freq.get("day_of_month") or 1)
         return f"MONTHLY · {dm} · {hour:02d}:00"
     return "OFF"
+
+
+def _fmt_langs(langs: List[str]) -> str:
+    return ",".join(x.upper() for x in langs) if langs else "NONE"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -107,14 +103,12 @@ async def view_home() -> Tuple[str, InlineKeyboardMarkup]:
 
 async def view_lang(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
     from plugins.ott.tmdb import fetch_week_grouped_by_lang
-
     grouped = await fetch_week_grouped_by_lang(
         lang=lang, region="IN", min_vote=0)
 
     mon, sun = _week_range()
     counts = [len(grouped.get(i, [])) for i in range(7)]
     total = sum(counts)
-
     label = ("🌐 ALL LANGUAGES" if lang == "all"
              else f"🎬 {LANGUAGE_LABELS.get(lang, lang.upper())}")
 
@@ -128,19 +122,15 @@ async def view_lang(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
         f"📊 {sc('total')} · <b>{total}</b>",
         "", DIV2, "",
     ]
-
     if total == 0:
         lines.append(f"⚪ {sc('no releases this week')}")
-        lines.append("")
-        lines.append(f"📌 {sc('try again later or refresh')}")
     else:
         for i in range(7):
             day_date = mon + _dt.timedelta(days=i)
             c = counts[i]
             lines.append(
                 f"📅 <b>{day_names[i]}</b> · "
-                f"<code>{day_date.strftime('%d %b')}</code> · "
-                f"<b>{c}</b>"
+                f"<code>{day_date.strftime('%d %b')}</code> · <b>{c}</b>"
             )
             for m in grouped.get(i, [])[:5]:
                 title = str(m.get("title", "?"))[:42]
@@ -151,18 +141,12 @@ async def view_lang(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
                 lines.append(f"   <i>… +{c - 5} more</i>")
             lines.append("")
 
-    lines += [DIV2, f"📌 {sc('tap a day button below')}"]
     return "\n".join(lines)[:4000], KB.kb_lang(lang, counts)
 
-
-# ═══════════════════════════════════════════════════════════
-# DAY VIEW
-# ═══════════════════════════════════════════════════════════
 
 async def view_day(lang: str, day_idx: int
                     ) -> Tuple[str, InlineKeyboardMarkup]:
     from plugins.ott.tmdb import fetch_week_grouped_by_lang
-
     grouped = await fetch_week_grouped_by_lang(
         lang=lang, region="IN", min_vote=0)
     movies = grouped.get(day_idx, [])
@@ -172,7 +156,6 @@ async def view_day(lang: str, day_idx: int
     day_names = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY",
                  "FRIDAY", "SATURDAY", "SUNDAY"]
     day_name = day_names[day_idx] if 0 <= day_idx <= 6 else "?"
-
     label = ("🌐 ALL LANGUAGES" if lang == "all"
              else f"🎬 {LANGUAGE_LABELS.get(lang, lang.upper())}")
 
@@ -183,7 +166,6 @@ async def view_day(lang: str, day_idx: int
         f"📊 {sc('movies')} · <b>{len(movies)}</b>",
         "", DIV2, "",
     ]
-
     if not movies:
         lines.append(f"⚪ {sc('no releases on this day')}")
     else:
@@ -224,7 +206,6 @@ async def view_movie(tmdb_id: int, lang: str, day_idx: int
     provider = movie.get("provider") or "—"
     lang_code = (movie.get("original_language") or "").upper()
     imdb_id = movie.get("imdb_id") or ""
-
     rr = movie.get("region_release") or {}
     rel_date = rr.get("date") or movie.get("release_date") or "—"
     rel_type = rr.get("type") or "Digital"
@@ -239,23 +220,19 @@ async def view_movie(tmdb_id: int, lang: str, day_idx: int
         + (f" · 🔒 <code>{cert}</code>" if cert else ""),
         f"🌐 {sc('language')} · <code>{lang_code or '—'}</code>",
     ]
-
     if imdb_id:
         lines.append(
             f"🔗 <b>IMDb</b> · "
             f"<a href=\"https://www.imdb.com/title/{imdb_id}/\">"
             f"{imdb_id}</a>"
         )
-
     lines += [
-        "",
-        DIV2,
+        "", DIV2,
         f"⭐ {sc('rating')} · <code>{rating:.1f}/10</code> "
         f"(<code>{_fmt_int(votes)}</code>)",
         f"🎭 {sc('genres')} · <code>{sc(genres)}</code>",
         f"⏱️ {sc('runtime')} · <code>{runtime} min</code>",
     ]
-
     if overview:
         lines += ["", DIV2, "", f"📖 <b>{sc('PLOT')}</b>",
                   f"<i>{sc(overview)}</i>"]
@@ -266,33 +243,35 @@ async def view_movie(tmdb_id: int, lang: str, day_idx: int
 
 
 # ═══════════════════════════════════════════════════════════
-# SETTINGS MAIN
+# SETTINGS
 # ═══════════════════════════════════════════════════════════
 
 async def view_settings() -> Tuple[str, InlineKeyboardMarkup]:
     fav = await DB.get_fav_languages()
-    ch = await DB.get_channels()
-    gr = await DB.get_groups()
+    live_ch = await DB.get_live_channels()
+    live_gr = await DB.get_live_groups()
+    en_ch = await DB.get_enabled_channels()
+    en_gr = await DB.get_enabled_groups()
     us = await DB.get_users()
     pm = await DB.get_premium()
 
     text = "\n".join([
         _header("SETTINGS"),
         f"🌐 {sc('favorite languages')} · <b>{len(fav)}</b>",
-        f"📢 {sc('update channels')} · <b>{len(ch)}</b>",
-        f"👥 {sc('update groups')} · <b>{len(gr)}</b>",
+        f"📢 {sc('channels in bot')} · <b>{len(live_ch)}</b>",
+        f"   ✅ {sc('enabled for OTT')} · <b>{len(en_ch)}</b>",
+        f"👥 {sc('groups in bot')} · <b>{len(live_gr)}</b>",
+        f"   ✅ {sc('enabled for OTT')} · <b>{len(en_gr)}</b>",
         f"👤 {sc('send to users')} · "
         f"{'🟢 ON' if us.get('running') else '🔴 OFF'}",
         f"💎 {sc('send to premium')} · "
         f"{'🟢 ON' if pm.get('running') else '🔴 OFF'}",
         "", DIV2,
-        f"📌 {sc('each target has its own config')}",
+        f"📌 {sc('channels/groups come from bot DB')}",
     ])
-    kb = KB.kb_settings(
-        len(ch), len(gr),
-        bool(us.get("running")), bool(pm.get("running")),
-        len(fav),
-    )
+    kb = KB.kb_settings(len(live_ch), len(live_gr),
+                        us.get("running"), pm.get("running"),
+                        len(fav))
     return text, kb
 
 
@@ -302,105 +281,89 @@ async def view_settings() -> Tuple[str, InlineKeyboardMarkup]:
 
 async def view_fav_langs() -> Tuple[str, InlineKeyboardMarkup]:
     fav = await DB.get_fav_languages()
-
     lines = [
         _header("FAVORITE LANGUAGES"),
         f"📌 {sc('these appear as buttons on home')}",
         "",
-        DIV2,
-        "",
+        DIV2, "",
     ]
-    if fav:
-        for code in fav:
-            lines.append(
-                f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}"
-            )
-    else:
+    for code in fav:
+        lines.append(f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}")
+    if not fav:
         lines.append(f"⚪ {sc('none selected')}")
-
     return "\n".join(lines), KB.kb_fav_langs(fav)
 
 
 # ═══════════════════════════════════════════════════════════
-# CHANNELS LIST
+# CHANNELS
 # ═══════════════════════════════════════════════════════════
 
 async def view_ch_list() -> Tuple[str, InlineKeyboardMarkup]:
-    chans = await DB.get_channels()
+    channels = await DB.get_live_channels()
+    enabled = await DB.get_enabled_channels()
 
-    lines = [_header("UPDATE CHANNELS")]
-    running = sum(1 for c in chans if c.get("running"))
-    stopped = len(chans) - running
-
-    lines.append(f"🟢 {sc('running')} · <b>{running}</b>")
-    lines.append(f"🔴 {sc('stopped')} · <b>{stopped}</b>")
+    lines = [_header("OTT UPDATE CHANNELS")]
+    lines.append(f"📢 {sc('total in bot')} · <b>{len(channels)}</b>")
+    lines.append(f"✅ {sc('enabled for OTT')} · <b>{len(enabled)}</b>")
     lines.append("")
     lines.append(DIV2)
     lines.append("")
 
-    if not chans:
-        lines.append(f"⚪ {sc('no channels yet')}")
+    if not channels:
+        lines.append(f"⚪ {sc('no channels in bot DB yet')}")
         lines.append("")
-        lines.append(f"📌 {sc('tap ADD CHANNEL to start')}")
+        lines.append(f"📌 {sc('use')} <b>/broadcast</b> {sc('to add')}")
     else:
-        for i, c in enumerate(chans[:20], 1):
-            dot = "🟢" if c.get("running") else "🔴"
-            title = str(c.get("title") or c.get("chat_id"))[:40]
-            freq = _freq_label(c.get("frequency") or {})
-            langs = c.get("languages") or []
-            lines.append(f"{i}. {dot} <b>{_esc(title)}</b>")
-            lines.append(
-                f"   <code>{c.get('chat_id')}</code> · "
-                f"🌐 <code>{','.join(langs) or '—'}</code>"
-            )
-            lines.append(f"   ⏰ <code>{freq}</code>")
-            lines.append("")
+        for c in channels[:20]:
+            cid = int(c["chat_id"])
+            mark = "✅" if cid in enabled else "☐"
+            lines.append(f"{mark} 📢 <b>{_esc(c['title'])}</b>")
+            lines.append(f"   <code>{cid}</code>")
 
-    return "\n".join(lines)[:4000], KB.kb_ch_list(chans)
+    return "\n".join(lines)[:4000], KB.kb_ch_list(channels, enabled)
 
-
-# ═══════════════════════════════════════════════════════════
-# PER-CHANNEL CONFIG
-# ═══════════════════════════════════════════════════════════
 
 async def view_channel(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    ch = await DB.get_channel(cid)
-    if not ch:
+    live = await DB.get_live_channels()
+    title = None
+    for c in live:
+        if int(c["chat_id"]) == int(cid):
+            title = c["title"]
+            break
+    if title is None:
         return (f"❌ {sc('channel not found')}",
-                KB.kb_ch_list([]))
+                KB.kb_ch_list(live, []))
 
-    running = bool(ch.get("running"))
-    freq = ch.get("frequency") or {}
-    langs = ch.get("languages") or []
+    cfg = await DB.get_channel_config(cid)
+    running = bool(cfg.get("running"))
 
     lines = [
         _header("CHANNEL CONFIG"),
-        f"📢 <b>{_esc(ch.get('title') or cid)}</b>",
+        f"📢 <b>{_esc(title)}</b>",
         f"🆔 <code>{cid}</code>",
         "", DIV2,
         f"🔘 {sc('status')} · "
         f"{'🟢 RUNNING' if running else '🔴 STOPPED'}",
         f"🌐 {sc('languages')} · "
-        f"<code>{','.join(langs) or 'NONE'}</code>",
-        f"⏰ {sc('frequency')} · <code>{_freq_label(freq)}</code>",
-        "", DIV2,
-        f"📌 {sc('each channel sends independently')}",
+        f"<code>{_fmt_langs(cfg.get('languages') or [])}</code>",
+        f"⏰ {sc('frequency')} · "
+        f"<code>{_freq_label(cfg.get('frequency') or {})}</code>",
     ]
-    return "\n".join(lines), KB.kb_channel(cid, ch)
+    return "\n".join(lines), KB.kb_channel(cid, cfg, running)
 
 
 async def view_ch_langs(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    ch = await DB.get_channel(cid)
-    if not ch:
-        return (f"❌ {sc('not found')}", KB.kb_ch_list([]))
-    langs = ch.get("languages") or []
+    live = await DB.get_live_channels()
+    title = next((c["title"] for c in live
+                  if int(c["chat_id"]) == int(cid)), str(cid))
+    cfg = await DB.get_channel_config(cid)
+    langs = cfg.get("languages") or []
 
     lines = [
         _header("CHANNEL LANGUAGES"),
-        f"📢 <b>{_esc(ch.get('title') or cid)}</b>",
-        "",
-        f"📌 {sc('only these languages will be sent')}",
+        f"📢 <b>{_esc(title)}</b>",
         "", DIV2,
+        f"📌 {sc('only selected languages will be sent')}",
         "",
     ]
     if not langs:
@@ -408,216 +371,185 @@ async def view_ch_langs(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
     else:
         for code in langs:
             lines.append(
-                f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}"
-            )
-
+                f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}")
     return "\n".join(lines), KB.kb_ch_langs(cid, langs)
 
 
 async def view_ch_freq(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    ch = await DB.get_channel(cid)
-    if not ch:
-        return (f"❌ {sc('not found')}", KB.kb_ch_list([]))
-    freq = ch.get("frequency") or {}
+    live = await DB.get_live_channels()
+    title = next((c["title"] for c in live
+                  if int(c["chat_id"]) == int(cid)), str(cid))
+    cfg = await DB.get_channel_config(cid)
+    freq = cfg.get("frequency") or {}
     mode = freq.get("mode") or "off"
 
     lines = [
         _header("CHANNEL FREQUENCY"),
-        f"📢 <b>{_esc(ch.get('title') or cid)}</b>",
+        f"📢 <b>{_esc(title)}</b>",
         "", DIV2,
         f"⏰ {sc('current')} · <code>{_freq_label(freq)}</code>",
         "", DIV2,
-        f"📌 {sc('pick a mode below')}",
+        f"📌 {sc('pick a mode')}",
     ]
     return "\n".join(lines), KB.kb_ch_freq(cid, mode)
 
 
-async def view_ch_freq_hours(cid: int, mode: str
-                              ) -> Tuple[str, InlineKeyboardMarkup]:
-    ch = await DB.get_channel(cid)
-    if not ch:
-        return (f"❌ {sc('not found')}", KB.kb_ch_list([]))
-    freq = ch.get("frequency") or {}
-    hour = freq.get("hour") or 10
-
+async def view_ch_hours(cid: int, mode: str
+                         ) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await DB.get_channel_config(cid)
+    hour = int((cfg.get("frequency") or {}).get("hour") or 10)
     lines = [
         _header(f"{mode.upper()} · HOUR"),
-        f"📢 <b>{_esc(ch.get('title') or cid)}</b>",
-        "", DIV2,
-        f"⏰ {sc('pick hour (IST)')}",
-        "", f"📌 {sc('current')} · <code>{hour:02d}:00</code>",
+        f"📌 {sc('current')} · <code>{hour:02d}:00</code>",
+        "", f"📌 {sc('pick hour (IST)')}",
     ]
-    return "\n".join(lines), KB.kb_ch_freq_hours(cid, mode, hour)
+    return "\n".join(lines), KB.kb_hours(cid, hour, "ch")
 
 
-async def view_ch_freq_days(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    ch = await DB.get_channel(cid)
-    if not ch:
-        return (f"❌ {sc('not found')}", KB.kb_ch_list([]))
-    freq = ch.get("frequency") or {}
-    day = freq.get("day_of_week") or 0
-
+async def view_ch_days(cid: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await DB.get_channel_config(cid)
+    day = int((cfg.get("frequency") or {}).get("day_of_week") or 0)
     lines = [
         _header("WEEKLY · DAY"),
-        f"📢 <b>{_esc(ch.get('title') or cid)}</b>",
-        "", DIV2,
-        f"📅 {sc('pick day')}",
-        "", f"📌 {sc('current')} · <code>{FREQ_DAYS[day]}</code>",
+        f"📌 {sc('current')} · <code>{FREQ_DAYS[day]}</code>",
+        "", f"📌 {sc('pick day of week')}",
     ]
-    return "\n".join(lines), KB.kb_ch_freq_days(cid, day)
+    return "\n".join(lines), KB.kb_days(cid, day, "ch")
 
 
-async def view_ch_freq_month_days(cid: int
-                                    ) -> Tuple[str, InlineKeyboardMarkup]:
-    ch = await DB.get_channel(cid)
-    if not ch:
-        return (f"❌ {sc('not found')}", KB.kb_ch_list([]))
-    freq = ch.get("frequency") or {}
-    d = freq.get("day_of_month") or 1
-
+async def view_ch_month_days(cid: int
+                               ) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await DB.get_channel_config(cid)
+    d = int((cfg.get("frequency") or {}).get("day_of_month") or 1)
     lines = [
         _header("MONTHLY · DAY"),
-        f"📢 <b>{_esc(ch.get('title') or cid)}</b>",
-        "", DIV2,
-        f"📅 {sc('pick day of month')}",
-        "", f"📌 {sc('current')} · <code>{d}</code>",
+        f"📌 {sc('current')} · <code>{d}</code>",
+        "", f"📌 {sc('pick day of month')}",
     ]
-    return "\n".join(lines), KB.kb_ch_freq_month_days(cid, d)
+    return "\n".join(lines), KB.kb_month_days(cid, d, "ch")
 
 
 # ═══════════════════════════════════════════════════════════
-# GROUPS (parallel implementation)
+# GROUPS
 # ═══════════════════════════════════════════════════════════
 
 async def view_gr_list() -> Tuple[str, InlineKeyboardMarkup]:
-    grps = await DB.get_groups()
+    groups = await DB.get_live_groups()
+    enabled = await DB.get_enabled_groups()
 
-    lines = [_header("UPDATE GROUPS")]
-    running = sum(1 for g in grps if g.get("running"))
-    stopped = len(grps) - running
-    lines.append(f"🟢 {sc('running')} · <b>{running}</b>")
-    lines.append(f"🔴 {sc('stopped')} · <b>{stopped}</b>")
+    lines = [_header("OTT UPDATE GROUPS")]
+    lines.append(f"👥 {sc('total in bot')} · <b>{len(groups)}</b>")
+    lines.append(f"✅ {sc('enabled for OTT')} · <b>{len(enabled)}</b>")
     lines.append("")
     lines.append(DIV2)
     lines.append("")
 
-    if not grps:
-        lines.append(f"⚪ {sc('no groups yet')}")
-        lines.append("")
-        lines.append(f"📌 {sc('tap ADD GROUP to start')}")
+    if not groups:
+        lines.append(f"⚪ {sc('no groups in bot DB yet')}")
     else:
-        for i, g in enumerate(grps[:20], 1):
-            dot = "🟢" if g.get("running") else "🔴"
-            title = str(g.get("title") or g.get("chat_id"))[:40]
-            freq = _freq_label(g.get("frequency") or {})
-            langs = g.get("languages") or []
-            lines.append(f"{i}. {dot} <b>{_esc(title)}</b>")
-            lines.append(
-                f"   <code>{g.get('chat_id')}</code> · "
-                f"🌐 <code>{','.join(langs) or '—'}</code>"
-            )
-            lines.append(f"   ⏰ <code>{freq}</code>")
-            lines.append("")
+        for g in groups[:20]:
+            gid = int(g["chat_id"])
+            mark = "✅" if gid in enabled else "☐"
+            lines.append(f"{mark} 👥 <b>{_esc(g['title'])}</b>")
+            lines.append(f"   <code>{gid}</code>")
 
-    return "\n".join(lines)[:4000], KB.kb_gr_list(grps)
+    return "\n".join(lines)[:4000], KB.kb_gr_list(groups, enabled)
 
 
 async def view_group(gid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    gr = await DB.get_group(gid)
-    if not gr:
-        return (f"❌ {sc('group not found')}", KB.kb_gr_list([]))
-    running = bool(gr.get("running"))
-    freq = gr.get("frequency") or {}
-    langs = gr.get("languages") or []
+    live = await DB.get_live_groups()
+    title = next((g["title"] for g in live
+                  if int(g["chat_id"]) == int(gid)), None)
+    if title is None:
+        return (f"❌ {sc('group not found')}",
+                KB.kb_gr_list(live, []))
+
+    cfg = await DB.get_group_config(gid)
+    running = bool(cfg.get("running"))
 
     lines = [
         _header("GROUP CONFIG"),
-        f"👥 <b>{_esc(gr.get('title') or gid)}</b>",
+        f"👥 <b>{_esc(title)}</b>",
         f"🆔 <code>{gid}</code>",
         "", DIV2,
         f"🔘 {sc('status')} · "
         f"{'🟢 RUNNING' if running else '🔴 STOPPED'}",
         f"🌐 {sc('languages')} · "
-        f"<code>{','.join(langs) or 'NONE'}</code>",
-        f"⏰ {sc('frequency')} · <code>{_freq_label(freq)}</code>",
+        f"<code>{_fmt_langs(cfg.get('languages') or [])}</code>",
+        f"⏰ {sc('frequency')} · "
+        f"<code>{_freq_label(cfg.get('frequency') or {})}</code>",
     ]
-    return "\n".join(lines), KB.kb_group(gid, gr)
+    return "\n".join(lines), KB.kb_group(gid, cfg, running)
 
 
 async def view_gr_langs(gid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    gr = await DB.get_group(gid)
-    if not gr:
-        return (f"❌ {sc('not found')}", KB.kb_gr_list([]))
-    langs = gr.get("languages") or []
+    live = await DB.get_live_groups()
+    title = next((g["title"] for g in live
+                  if int(g["chat_id"]) == int(gid)), str(gid))
+    cfg = await DB.get_group_config(gid)
+    langs = cfg.get("languages") or []
+
     lines = [
         _header("GROUP LANGUAGES"),
-        f"👥 <b>{_esc(gr.get('title') or gid)}</b>",
+        f"👥 <b>{_esc(title)}</b>",
         "", DIV2,
-        f"📌 {sc('only these languages will be sent')}",
+        f"📌 {sc('only selected languages will be sent')}",
         "",
     ]
-    for code in langs or ["—"]:
-        if code == "—":
-            lines.append(f"⚪ {sc('none selected')}")
-        else:
-            lines.append(f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}")
+    for code in langs or []:
+        lines.append(
+            f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}")
+    if not langs:
+        lines.append(f"⚪ {sc('none selected')}")
     return "\n".join(lines), KB.kb_gr_langs(gid, langs)
 
 
 async def view_gr_freq(gid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    gr = await DB.get_group(gid)
-    if not gr:
-        return (f"❌ {sc('not found')}", KB.kb_gr_list([]))
-    freq = gr.get("frequency") or {}
+    live = await DB.get_live_groups()
+    title = next((g["title"] for g in live
+                  if int(g["chat_id"]) == int(gid)), str(gid))
+    cfg = await DB.get_group_config(gid)
+    freq = cfg.get("frequency") or {}
     mode = freq.get("mode") or "off"
     lines = [
         _header("GROUP FREQUENCY"),
-        f"👥 <b>{_esc(gr.get('title') or gid)}</b>",
+        f"👥 <b>{_esc(title)}</b>",
         "", DIV2,
         f"⏰ {sc('current')} · <code>{_freq_label(freq)}</code>",
     ]
     return "\n".join(lines), KB.kb_gr_freq(gid, mode)
 
 
-async def view_gr_freq_hours(gid: int, mode: str
-                              ) -> Tuple[str, InlineKeyboardMarkup]:
-    gr = await DB.get_group(gid)
-    if not gr:
-        return (f"❌ {sc('not found')}", KB.kb_gr_list([]))
-    freq = gr.get("frequency") or {}
-    hour = freq.get("hour") or 10
+async def view_gr_hours(gid: int, mode: str
+                         ) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await DB.get_group_config(gid)
+    hour = int((cfg.get("frequency") or {}).get("hour") or 10)
     lines = [
         _header(f"{mode.upper()} · HOUR"),
-        "", f"📌 {sc('current')} · <code>{hour:02d}:00</code>",
+        f"📌 {sc('current')} · <code>{hour:02d}:00</code>",
     ]
-    return "\n".join(lines), KB.kb_gr_freq_hours(gid, mode, hour)
+    return "\n".join(lines), KB.kb_hours_gr(gid, hour)
 
 
-async def view_gr_freq_days(gid: int) -> Tuple[str, InlineKeyboardMarkup]:
-    gr = await DB.get_group(gid)
-    if not gr:
-        return (f"❌ {sc('not found')}", KB.kb_gr_list([]))
-    freq = gr.get("frequency") or {}
-    day = freq.get("day_of_week") or 0
+async def view_gr_days(gid: int) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await DB.get_group_config(gid)
+    day = int((cfg.get("frequency") or {}).get("day_of_week") or 0)
     lines = [
         _header("WEEKLY · DAY"),
-        "", f"📌 {sc('current')} · <code>{FREQ_DAYS[day]}</code>",
+        f"📌 {sc('current')} · <code>{FREQ_DAYS[day]}</code>",
     ]
-    return "\n".join(lines), KB.kb_gr_freq_days(gid, day)
+    return "\n".join(lines), KB.kb_days_gr(gid, day)
 
 
-async def view_gr_freq_month_days(gid: int
-                                    ) -> Tuple[str, InlineKeyboardMarkup]:
-    gr = await DB.get_group(gid)
-    if not gr:
-        return (f"❌ {sc('not found')}", KB.kb_gr_list([]))
-    freq = gr.get("frequency") or {}
-    d = freq.get("day_of_month") or 1
+async def view_gr_month_days(gid: int
+                               ) -> Tuple[str, InlineKeyboardMarkup]:
+    cfg = await DB.get_group_config(gid)
+    d = int((cfg.get("frequency") or {}).get("day_of_month") or 1)
     lines = [
         _header("MONTHLY · DAY"),
-        "", f"📌 {sc('current')} · <code>{d}</code>",
+        f"📌 {sc('current')} · <code>{d}</code>",
     ]
-    return "\n".join(lines), KB.kb_gr_freq_month_days(gid, d)
+    return "\n".join(lines), KB.kb_month_days_gr(gid, d)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -626,54 +558,57 @@ async def view_gr_freq_month_days(gid: int
 
 async def view_users() -> Tuple[str, InlineKeyboardMarkup]:
     cfg = await DB.get_users()
+    total = await DB.count_live_users()
     running = bool(cfg.get("running"))
-    freq = cfg.get("frequency") or {}
-    langs = cfg.get("languages") or []
 
     lines = [
         _header("SEND TO ALL USERS"),
+        f"👥 {sc('total users in bot')} · <b>{_fmt_int(total)}</b>",
+        "", DIV2,
         f"🔘 {sc('status')} · "
         f"{'🟢 RUNNING' if running else '🔴 STOPPED'}",
         f"🌐 {sc('languages')} · "
-        f"<code>{','.join(langs) or 'NONE'}</code>",
-        f"⏰ {sc('frequency')} · <code>{_freq_label(freq)}</code>",
+        f"<code>{_fmt_langs(cfg.get('languages') or [])}</code>",
+        f"⏰ {sc('frequency')} · "
+        f"<code>{_freq_label(cfg.get('frequency') or {})}</code>",
         "", DIV2,
-        f"📌 {sc('when ON, DMs every user with updates')}",
+        f"📌 {sc('when ON, DMs every user')}",
     ]
-    return "\n".join(lines), KB.kb_users_cfg(cfg, "us")
+    return "\n".join(lines), KB.kb_kind_cfg(cfg, "us", total)
 
 
 async def view_premium() -> Tuple[str, InlineKeyboardMarkup]:
     cfg = await DB.get_premium()
+    total = await DB.count_live_premium()
     running = bool(cfg.get("running"))
-    freq = cfg.get("frequency") or {}
-    langs = cfg.get("languages") or []
 
     lines = [
         _header("SEND TO PREMIUM"),
+        f"💎 {sc('total premium users')} · <b>{_fmt_int(total)}</b>",
+        "", DIV2,
         f"🔘 {sc('status')} · "
         f"{'🟢 RUNNING' if running else '🔴 STOPPED'}",
         f"🌐 {sc('languages')} · "
-        f"<code>{','.join(langs) or 'NONE'}</code>",
-        f"⏰ {sc('frequency')} · <code>{_freq_label(freq)}</code>",
-        "", DIV2,
-        f"📌 {sc('only premium users receive updates')}",
+        f"<code>{_fmt_langs(cfg.get('languages') or [])}</code>",
+        f"⏰ {sc('frequency')} · "
+        f"<code>{_freq_label(cfg.get('frequency') or {})}</code>",
     ]
-    return "\n".join(lines), KB.kb_users_cfg(cfg, "pm")
+    return "\n".join(lines), KB.kb_kind_cfg(cfg, "pm", total)
 
 
-async def view_kind_langs(kind: str) -> Tuple[str, InlineKeyboardMarkup]:
+async def view_kind_langs(kind: str
+                           ) -> Tuple[str, InlineKeyboardMarkup]:
     cfg = (await DB.get_users() if kind == "us"
            else await DB.get_premium())
     langs = cfg.get("languages") or []
     title = "USERS LANGUAGES" if kind == "us" else "PREMIUM LANGUAGES"
 
     lines = [_header(title), DIV2, ""]
-    for code in langs or ["—"]:
-        if code == "—":
-            lines.append(f"⚪ {sc('none selected')}")
-        else:
-            lines.append(f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}")
+    for code in langs or []:
+        lines.append(
+            f"✅ {sc(LANGUAGE_LABELS.get(code, code.upper()))}")
+    if not langs:
+        lines.append(f"⚪ {sc('none selected')}")
     return "\n".join(lines), KB.kb_kind_langs(kind, langs)
 
 
@@ -689,52 +624,49 @@ async def view_kind_freq(kind: str) -> Tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), KB.kb_kind_freq(kind, mode)
 
 
-async def view_kind_freq_hours(kind: str, mode: str
-                                ) -> Tuple[str, InlineKeyboardMarkup]:
+async def view_kind_hours(kind: str, mode: str
+                           ) -> Tuple[str, InlineKeyboardMarkup]:
     cfg = (await DB.get_users() if kind == "us"
            else await DB.get_premium())
-    freq = cfg.get("frequency") or {}
-    hour = freq.get("hour") or 10
+    hour = int((cfg.get("frequency") or {}).get("hour") or 10)
     lines = [
         _header(f"{mode.upper()} · HOUR"),
         f"📌 {sc('current')} · <code>{hour:02d}:00</code>",
     ]
-    return "\n".join(lines), KB.kb_kind_freq_hours(kind, hour)
+    return "\n".join(lines), KB.kb_kind_hours(kind, hour)
 
 
-async def view_kind_freq_days(kind: str
-                               ) -> Tuple[str, InlineKeyboardMarkup]:
+async def view_kind_days(kind: str
+                          ) -> Tuple[str, InlineKeyboardMarkup]:
     cfg = (await DB.get_users() if kind == "us"
            else await DB.get_premium())
-    freq = cfg.get("frequency") or {}
-    day = freq.get("day_of_week") or 0
+    day = int((cfg.get("frequency") or {}).get("day_of_week") or 0)
     lines = [
         _header("WEEKLY · DAY"),
         f"📌 {sc('current')} · <code>{FREQ_DAYS[day]}</code>",
     ]
-    return "\n".join(lines), KB.kb_kind_freq_days(kind, day)
+    return "\n".join(lines), KB.kb_kind_days(kind, day)
 
 
-async def view_kind_freq_month_days(kind: str
-                                     ) -> Tuple[str, InlineKeyboardMarkup]:
+async def view_kind_month_days(kind: str
+                                 ) -> Tuple[str, InlineKeyboardMarkup]:
     cfg = (await DB.get_users() if kind == "us"
            else await DB.get_premium())
-    freq = cfg.get("frequency") or {}
-    d = freq.get("day_of_month") or 1
+    d = int((cfg.get("frequency") or {}).get("day_of_month") or 1)
     lines = [
         _header("MONTHLY · DAY"),
         f"📌 {sc('current')} · <code>{d}</code>",
     ]
-    return "\n".join(lines), KB.kb_kind_freq_month_days(kind, d)
+    return "\n".join(lines), KB.kb_kind_month_days(kind, d)
 
 
 # ═══════════════════════════════════════════════════════════
-# PREVIEW + TEXT BUILDER (used by worker too)
+# PREVIEW + TEXT BUILDER
 # ═══════════════════════════════════════════════════════════
 
 async def build_update_text(languages: List[str]) -> str:
-    """Build the text list for the given languages."""
-    from plugins.ott.tmdb import fetch_week_grouped_by_lang
+    """Build text list for a set of languages."""
+    from plugins.ott.tmdb import fetch_week_grouped_by_lang, enrich_movie
 
     mon, sun = _week_range()
     header = "\n".join([
@@ -744,7 +676,7 @@ async def build_update_text(languages: List[str]) -> str:
     ])
 
     if not languages:
-        languages = ["all"]
+        return header + f"⚪ {sc('no languages configured')}"
 
     sections: List[str] = []
     for code in languages:
@@ -770,14 +702,11 @@ async def build_update_text(languages: List[str]) -> str:
             block.append(f"• <b>{sc(title)}</b> ({year}){r_str}")
 
             imdb_id = m.get("imdb_id") or ""
+            provider = m.get("provider") or "—"
             if not imdb_id:
-                # enrich to fetch imdb
-                from plugins.ott.tmdb import enrich_movie
                 enriched = await enrich_movie(m)
                 imdb_id = enriched.get("imdb_id") or ""
-                provider = enriched.get("provider") or "—"
-            else:
-                provider = m.get("provider") or "—"
+                provider = enriched.get("provider") or provider
 
             if provider and provider != "—":
                 block.append(f"   📺 {sc(provider)}")
@@ -796,55 +725,17 @@ async def build_update_text(languages: List[str]) -> str:
     return header + "\n".join(sections)
 
 
-async def view_preview(languages: List[str]
+async def view_preview(languages: List[str], back_cb: str
                         ) -> Tuple[str, InlineKeyboardMarkup]:
     text = await build_update_text(languages)
     if len(text) > 4000:
         text = text[:3950] + "\n…truncated"
-    return text, InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ BACK", callback_data="ott:set"),
+    from pyrogram.types import InlineKeyboardButton
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⬅️ BACK", callback_data=back_cb),
         InlineKeyboardButton("❌ CLOSE", callback_data="ott:close"),
     ]])
-
-
-# ═══════════════════════════════════════════════════════════
-# TEXT INPUT PROMPTS
-# ═══════════════════════════════════════════════════════════
-
-def prompt_add_channel() -> Tuple[str, InlineKeyboardMarkup]:
-    text = "\n".join([
-        _header("ADD UPDATE CHANNEL"),
-        f"📝 {sc('send chat id or @username')}",
-        "",
-        f"📌 {sc('examples')}",
-        "• <code>-1001234567890</code>",
-        "• <code>@my_channel</code>",
-        "",
-        f"📌 {sc('bot must be admin in the channel')}",
-        "", DIV2,
-        f"📌 {sc('send')} <code>-</code> {sc('to cancel')}",
-    ])
-    return text, InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ CANCEL", callback_data="ott:ch_list"),
-    ]])
-
-
-def prompt_add_group() -> Tuple[str, InlineKeyboardMarkup]:
-    text = "\n".join([
-        _header("ADD UPDATE GROUP"),
-        f"📝 {sc('send chat id or @username')}",
-        "",
-        f"📌 {sc('examples')}",
-        "• <code>-1001234567890</code>",
-        "• <code>@my_group</code>",
-        "",
-        f"📌 {sc('bot must be in the group')}",
-        "", DIV2,
-        f"📌 {sc('send')} <code>-</code> {sc('to cancel')}",
-    ])
-    return text, InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ CANCEL", callback_data="ott:gr_list"),
-    ]])
+    return text, kb
 
 
 __all__ = [
@@ -852,15 +743,13 @@ __all__ = [
     "view_home", "view_lang", "view_day", "view_movie",
     "view_settings", "view_fav_langs",
     "view_ch_list", "view_channel", "view_ch_langs",
-    "view_ch_freq", "view_ch_freq_hours",
-    "view_ch_freq_days", "view_ch_freq_month_days",
+    "view_ch_freq", "view_ch_hours", "view_ch_days",
+    "view_ch_month_days",
     "view_gr_list", "view_group", "view_gr_langs",
-    "view_gr_freq", "view_gr_freq_hours",
-    "view_gr_freq_days", "view_gr_freq_month_days",
+    "view_gr_freq", "view_gr_hours", "view_gr_days",
+    "view_gr_month_days",
     "view_users", "view_premium",
     "view_kind_langs", "view_kind_freq",
-    "view_kind_freq_hours", "view_kind_freq_days",
-    "view_kind_freq_month_days",
+    "view_kind_hours", "view_kind_days", "view_kind_month_days",
     "view_preview", "build_update_text",
-    "prompt_add_channel", "prompt_add_group",
 ]
