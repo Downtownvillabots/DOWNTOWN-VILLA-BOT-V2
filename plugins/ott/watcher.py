@@ -92,14 +92,10 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
         if counts[i] > 3:
             lines.append(f"   <i>… +{counts[i] - 3} more</i>")
 
-    lines += [
-        "", DIV2,
-        f"📌 {sc('open /admin → 📅 OTT to broadcast')}",
-    ]
+    lines += ["", DIV2, f"📌 {sc('open /admin → 📅 OTT to broadcast')}"]
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "📅 OPEN OTT", callback_data="ott:home")],
+        [InlineKeyboardButton("📅 OPEN OTT", callback_data="ott:home")],
     ])
 
     target = int(cfg.get("weekly_target_admin") or 0)
@@ -221,10 +217,6 @@ async def _latest_files(limit: int = 100) -> List[Dict[str, Any]]:
     return []
 
 
-# ═══════════════════════════════════════════════════════════
-# NOTIFY SUBSCRIBERS (with live sync)
-# ═══════════════════════════════════════════════════════════
-
 async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
     subs = await DB.subs_for_movie(tmdb_id, only_pending=True, limit=5000)
     if not subs:
@@ -299,7 +291,7 @@ async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
 
     await DB.mark_subs_notified(tmdb_id)
 
-    # ── Live sync: event admin post + target posts ──
+    # ── Live sync on all event posts ──
     ev = await EVENTS.get_active_for_movie(tmdb_id)
     if not ev:
         ev = await EVENTS.get_any_for_movie(tmdb_id)
@@ -412,11 +404,10 @@ async def pending_loop(client: Client) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# RECOVERY LOOP — reconcile events after restart
+# RECOVERY LOOP
 # ═══════════════════════════════════════════════════════════
 
 async def recovery_loop(client: Client) -> None:
-    """On startup + every hour, verify active events still have valid messages."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -429,7 +420,6 @@ async def recovery_loop(client: Client) -> None:
 
 
 async def _reconcile_active_events(client: Client) -> None:
-    """For each active event, ensure its admin post is still reachable."""
     try:
         events = await EVENTS.list_active_events(limit=100)
     except Exception:
@@ -440,9 +430,7 @@ async def _reconcile_active_events(client: Client) -> None:
         chat_id = int(ev.get("admin_channel_id") or 0)
         if not msg_id or not chat_id:
             continue
-
         try:
-            # Cheap probe: try to fetch the message
             await client.get_messages(chat_id, msg_id)
         except Exception as e:
             msg = str(e).lower()
@@ -453,7 +441,6 @@ async def _reconcile_active_events(client: Client) -> None:
                     f"{chat_id}/{msg_id} — clearing pointer"
                 )
                 await EVENTS.update_event(ev["_id"], admin_msg_id=0)
-            # Else: ignore (transient error)
 
 
 # ═══════════════════════════════════════════════════════════
