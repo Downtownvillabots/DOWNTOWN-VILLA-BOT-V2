@@ -8,13 +8,10 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
-from plugins.ott.config import SESSION_TTL, CONFIRM_TTL, JOB_TTL, SETUP_TTL
+from plugins.ott.config import SESSION_TTL, CONFIRM_TTL, JOB_TTL
 
 
-# ═══════════════════════════════════════════════════════════
-# SESSIONS (text input)
-# ═══════════════════════════════════════════════════════════
-
+# ─── SESSIONS ───
 _SESSIONS: Dict[int, Dict[str, Any]] = {}
 
 
@@ -48,10 +45,7 @@ def cleanup_sessions() -> None:
             _SESSIONS.pop(uid, None)
 
 
-# ═══════════════════════════════════════════════════════════
-# JOBS
-# ═══════════════════════════════════════════════════════════
-
+# ─── JOBS ───
 _JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -88,10 +82,7 @@ def cleanup_jobs() -> None:
             _JOBS.pop(jid, None)
 
 
-# ═══════════════════════════════════════════════════════════
-# CONFIRM TOKENS
-# ═══════════════════════════════════════════════════════════
-
+# ─── CONFIRMS ───
 _CONFIRMS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -126,46 +117,9 @@ def cleanup_confirms() -> None:
             _CONFIRMS.pop(tok, None)
 
 
-# ═══════════════════════════════════════════════════════════
-# BROADCAST SETUP (per-admin before send)
-# ═══════════════════════════════════════════════════════════
-
-_SETUPS: Dict[int, Dict[str, Any]] = {}
-
-
-def setup_new(uid: int, tmdb_id: int, channel_id: int) -> None:
-    _SETUPS[int(uid)] = {
-        "tmdb_id": int(tmdb_id),
-        "channel_id": int(channel_id),
-        "notify": True,
-        "auto_delete_hours": 24,
-        "created": time.time(),
-    }
-
-
-def setup_get(uid: int) -> Optional[Dict[str, Any]]:
-    return _SETUPS.get(int(uid))
-
-
-def setup_drop(uid: int) -> None:
-    _SETUPS.pop(int(uid), None)
-
-
-def setup_cleanup() -> None:
-    now = time.time()
-    for uid in list(_SETUPS.keys()):
-        if now - _SETUPS[uid]["created"] > SETUP_TTL:
-            _SETUPS.pop(uid, None)
-
-
-# ═══════════════════════════════════════════════════════════
-# SNAPSHOT
-# ═══════════════════════════════════════════════════════════
-
 def snapshot() -> Dict[str, int]:
     return {
         "sessions": len(_SESSIONS),
         "jobs": len(_JOBS),
         "confirms": len(_CONFIRMS),
-        "setups": len(_SETUPS),
     }
