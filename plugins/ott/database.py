@@ -461,22 +461,6 @@ async def broadcast_count_for_movie(tmdb_id) -> int:
         return 0
 
 
-async def broadcast_total_delivered(days: int = 30) -> int:
-    c = broadcasts_coll()
-    if c is None:
-        return 0
-    try:
-        since = time.time() - days * 86400
-        pipeline = [
-            {"$match": {"sent_ts": {"$gte": since}}},
-            {"$group": {"_id": None, "total": {"$sum": "$delivered"}}},
-        ]
-        r = await c.aggregate(pipeline).to_list(length=1)
-        return r[0]["total"] if r else 0
-    except Exception:
-        return 0
-
-
 async def broadcast_recent_count(days: int = 7) -> int:
     c = broadcasts_coll()
     if c is None:
@@ -511,12 +495,29 @@ async def broadcast_get_latest(tmdb_id) -> Optional[Dict[str, Any]]:
             {"tmdb_id": int(tmdb_id)}, sort=[("sent_ts", -1)])
     except Exception:
         return None
+
+
+async def broadcast_update_msg_id(tmdb_id, msg_id: int, chat_id: int) -> None:
+    c = broadcasts_coll()
+    if c is None:
+        return
+    try:
+        await c.update_one(
+            {"tmdb_id": int(tmdb_id), "cancelled": False},
+            {"$set": {"channel_msg_id": int(msg_id),
+                       "channel_chat_id": int(chat_id)}},
+            sort=[("sent_ts", -1)],
+        )
+    except Exception:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════
-# MOVIE STATS + END EVENT
+# STATS + END
 # ═══════════════════════════════════════════════════════════
 
 async def movie_stats(tmdb_id: int) -> Dict[str, Any]:
-    """Live per-movie stats: subs, notified, broadcasts."""
+    total = pending = sent = 0
     try:
         total = await subs_coll().count_documents({"tmdb_id": int(tmdb_id)})
         pending = await subs_coll().count_documents(
@@ -524,7 +525,7 @@ async def movie_stats(tmdb_id: int) -> Dict[str, Any]:
         sent = await sent_coll().count_documents(
             {"tmdb_id": int(tmdb_id), "mode": "now_available"})
     except Exception:
-        total = pending = sent = 0
+        pass
 
     bc = await broadcast_get_latest(tmdb_id)
     return {
@@ -538,12 +539,6 @@ async def movie_stats(tmdb_id: int) -> Dict[str, Any]:
 
 
 async def end_movie(tmdb_id: int) -> Dict[str, int]:
-    """
-    Fully end a movie event:
-      • delete every pending sub (tokens)
-      • mark broadcasts cancelled
-    Returns counts.
-    """
     try:
         deleted = await cancel_all_subs(tmdb_id)
     except Exception:
@@ -558,6 +553,87 @@ async def end_movie(tmdb_id: int) -> Dict[str, int]:
 async def is_movie_ended(tmdb_id: int) -> bool:
     bc = await broadcast_get_latest(tmdb_id)
     return bool(bc and bc.get("cancelled"))
+
+
+# ═══════════════════════════════════════════════════════════
+# FILE LIST (media DB)
+# ═══════════════════════════════════════════════════════════
+
+async def find_files_for_movie(movie: Dict[str, Any],
+                                limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Search media DB for files matching a movie's title + year.
+    Tries media_search engine first, then falls back to direct query.
+    """
+    title = (movie.get("title") or "").strip()
+    if not title:
+        return []
+    year = (movie.get("release_date") or "")[:4]
+    tmdb_id = movie.get("tmdb_id")
+
+    # ── Try media_search engine ──
+    try:
+        from media_search import engine as MSE
+        results = await MSE.search(title, kind="movie", year=year or None)
+        if results:
+            return _normalize_files(results, limit)
+    except Exception as e:
+        logger.debug(f"[OTT-DB] media_search: {e}")
+
+    # ── Direct DB query ──
+    try:
+        from database import db_registry
+        db = db_registry.get_media_db(0) or db_registry.get_user_db()
+        if db is None:
+            return []
+        names = await db.list_collection_names()
+        for coll_name in ("media_files", "files", "catalog", "indexed_files"):
+            if coll_name not in names:
+                continue
+            coll = db[coll_name]
+            query = {"$or": [
+                {"title": {"$regex": f"^{title[:20]}", "$options": "i"}},
+                {"file_name": {"$regex": f"^{title[:20]}", "$options": "i"}},
+                {"normalized_title": {"$regex": f"^{title[:20]}", "$options": "i"}},
+            ]}
+            cur = coll.find(query).limit(int(limit))
+            docs = await cur.to_list(length=int(limit))
+            if docs:
+                return _normalize_files(docs, limit)
+    except Exception as e:
+        logger.debug(f"[OTT-DB] direct query: {e}")
+    return []
+
+
+def _normalize_files(docs: List[Dict[str, Any]],
+                     limit: int = 50) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        fid = (d.get("file_unique_id") or d.get("file_id")
+               or d.get("_id") or "")
+        key = str(fid)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "file_id": d.get("file_id"),
+            "file_unique_id": d.get("file_unique_id"),
+            "file_name": d.get("file_name") or d.get("title") or "?",
+            "file_size": d.get("file_size") or d.get("size") or 0,
+            "quality": d.get("quality") or d.get("res") or "HD",
+            "codec": d.get("codec") or "—",
+            "audio": d.get("audio") or d.get("language") or "—",
+            "source_chat_id": d.get("chat_id") or d.get("source_chat_id"),
+            "source_msg_id": d.get("message_id") or d.get("msg_id"),
+            "year": d.get("year"),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
 
 # ═══════════════════════════════════════════════════════════
 # INDEXES
