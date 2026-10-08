@@ -16,9 +16,7 @@ _loaded: List[str] = []
 _failed: List[str] = []
 
 
-# ── PRELOAD: modules that are imported by other submodules ──
-# Must load BEFORE discover() to avoid circular-import errors
-# (e.g. views.py does `from plugins.ott import progress`).
+# ── PRELOAD: loaded BEFORE discover() to avoid circular imports ──
 _PRELOAD = (
     "progress",   # used by views.py
     "config",     # used by nearly everything
@@ -45,7 +43,6 @@ def discover() -> None:
         if name.startswith("_"):
             continue
         if name in _PRELOAD:
-            # already loaded above
             _loaded.append(name)
             continue
         full = f"{__package__}.{name}"
