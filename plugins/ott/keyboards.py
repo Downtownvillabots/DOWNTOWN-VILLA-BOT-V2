@@ -86,8 +86,8 @@ def kb_movie(tmdb_id: int, sub_count: int, is_broadcasted: bool,
              back_cb: str = "ott:home") -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
-            f"📢 {'Re-post to channel' if is_broadcasted else 'Post to channel'}",
-            callback_data=cb(f"bc_mv:{tmdb_id}"))],
+            f"📢 Setup broadcast in channel",
+            callback_data=cb(f"csetup:{tmdb_id}"))],
     ]
     if sub_count > 0:
         rows.append([InlineKeyboardButton(
@@ -101,7 +101,6 @@ def kb_movie(tmdb_id: int, sub_count: int, is_broadcasted: bool,
         callback_data=cb(f"end_mv:{tmdb_id}"))])
     rows.extend(_back_close(back_cb))
     return InlineKeyboardMarkup(rows)
-
 
 # ═══════════════════════════════════════════════════════════
 # BROADCAST SETUP
