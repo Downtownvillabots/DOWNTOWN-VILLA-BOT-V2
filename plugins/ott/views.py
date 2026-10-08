@@ -308,9 +308,19 @@ def _setup_text_sync(movie: Dict[str, Any], stats: Dict[str, Any],
 
 
 async def view_setup(movie: Dict[str, Any], notify: bool,
-                     show_file: bool, hours: int
+                     show_file: bool, hours: int,
+                     ev: Optional[Dict[str, Any]] = None
                      ) -> Tuple[str, InlineKeyboardMarkup]:
-    stats = await DB.movie_stats(movie.get("tmdb_id"))
+    if ev is not None:
+        stats = {
+            "total_subs": int(ev.get("subs_total") or 0),
+            "notified":   int(ev.get("notified") or 0),
+            "pending":    int(ev.get("pending") or 0),
+            "files_sent": int(ev.get("files_count") or 0),
+        }
+    else:
+        stats = await DB.movie_stats(movie.get("tmdb_id"))
+
     text = _setup_text_sync(movie, stats, notify, show_file, hours)
     kb = KB.kb_setup(movie.get("tmdb_id"), notify, show_file, hours)
     return text, kb
@@ -362,14 +372,23 @@ def _live_text_sync(movie: Dict[str, Any], stats: Dict[str, Any],
 
 async def view_live(movie: Dict[str, Any], notify: bool = True,
                      show_file: bool = True, is_admin_view: bool = False,
-                     ended: bool = False
+                     ended: bool = False,
+                     ev: Optional[Dict[str, Any]] = None
                      ) -> Tuple[str, InlineKeyboardMarkup]:
-    stats = await DB.movie_stats(movie.get("tmdb_id"))
+    if ev is not None:
+        stats = {
+            "total_subs": int(ev.get("subs_total") or 0),
+            "notified":   int(ev.get("notified") or 0),
+            "pending":    int(ev.get("pending") or 0),
+            "files_sent": int(ev.get("files_count") or 0),
+        }
+    else:
+        stats = await DB.movie_stats(movie.get("tmdb_id"))
+
     text = _live_text_sync(movie, stats, ended=ended)
     kb = KB.kb_live(movie.get("tmdb_id"), notify, show_file,
                     is_admin_view=is_admin_view, ended=ended)
     return text, kb
-
 
 # ═══════════════════════════════════════════════════════════
 # STATS / END
