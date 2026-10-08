@@ -20,6 +20,7 @@ async def _loop():
             ST.cleanup_sessions()
             ST.cleanup_jobs()
             ST.cleanup_confirms()
+            ST.setup_cleanup()
         except asyncio.CancelledError:
             break
         except Exception:
