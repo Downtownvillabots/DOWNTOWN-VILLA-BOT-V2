@@ -29,6 +29,8 @@ LANGUAGE_LABELS = {
 
 INDIAN_OTTS = "8|9|119|122|220|232|237|2336|11|10|15|18"
 
+PRIORITY_LANGS = ["ml", "ta", "en", "hi"]   # ← ADD THIS LINE
+
 FREQ_MODES = ["off", "daily", "weekly", "monthly"]
 FREQ_HOURS = [6, 9, 12, 15, 18, 21]
 FREQ_DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
@@ -38,6 +40,7 @@ DEFAULT_FAV_LANGS = ["ml", "ta", "en", "hi"]
 
 __all__ = [
     "PREFIX", "PRIMARY_LANGS", "LANGUAGE_LABELS", "INDIAN_OTTS",
+    "PRIORITY_LANGS",   # ← ADD THIS
     "FREQ_MODES", "FREQ_HOURS", "FREQ_DAYS", "FREQ_MONTH_DAYS",
     "DEFAULT_FAV_LANGS",
     "fb", "sc", "_esc", "_fmt_int", "_fmt_size", "_fmt_duration",
