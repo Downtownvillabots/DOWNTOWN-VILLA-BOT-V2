@@ -28,7 +28,7 @@ async def _loop():
 
 
 async def _recount_loop():
-    """Hourly recount of active events (stats drift protection)."""
+    """Hourly recount of active events (drift protection)."""
     while True:
         try:
             await asyncio.sleep(3600)
