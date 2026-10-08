@@ -1,5 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT TEXT INPUT
+# 🏨 DOWNTOWN VILLA — OTT TEXT INPUT (v3)
 # ============================================================
 
 from __future__ import annotations
@@ -30,36 +30,38 @@ async def ott_input(client: Client, message):
     action = sess["action"]
     text = (message.text or "").strip()
 
+    # Only handle "set_ott_channel" here.
+    # "manual_target" is handled by panel.py's ott_manual_input.
+    if action != "set_ott_channel":
+        return
+
     try:
         message.stop_propagation()
     except Exception:
         pass
 
-    # ── SET OTT BROADCAST CHANNEL ──
-    if action == "set_ott_channel":
-        if text == "-":
-            ST.clear_session(message.from_user.id)
-            return await message.reply_text("❌ Cancelled")
-        try:
-            cid = int(text) if text.lstrip("-").isdigit() else None
-            if cid is None and text.startswith("@"):
-                chat = await client.get_chat(text)
-                cid = chat.id
-            if not cid:
-                raise ValueError
-        except Exception:
-            return await message.reply_text(
-                "❌ Send a numeric chat id or @username",
-                parse_mode=ParseMode.HTML)
-        await DB.save_cfg(ott_broadcast_channel=int(cid))
+    if text == "-":
         ST.clear_session(message.from_user.id)
-        t, k = await V.view_settings()
-        await message.reply_text(t, reply_markup=k,
-                                 parse_mode=ParseMode.HTML,
-                                 disable_web_page_preview=True)
-        return
+        return await message.reply_text("❌ Cancelled")
 
+    try:
+        cid = int(text) if text.lstrip("-").isdigit() else None
+        if cid is None and text.startswith("@"):
+            chat = await client.get_chat(text)
+            cid = chat.id
+        if not cid:
+            raise ValueError
+    except Exception:
+        return await message.reply_text(
+            "❌ Send a numeric chat id or @username",
+            parse_mode=ParseMode.HTML)
+
+    await DB.save_cfg(ott_broadcast_channel=int(cid))
     ST.clear_session(message.from_user.id)
+    t, k = await V.view_settings()
+    await message.reply_text(t, reply_markup=k,
+                             parse_mode=ParseMode.HTML,
+                             disable_web_page_preview=True)
 
 
 __all__ = []
