@@ -515,7 +515,49 @@ def kb_diag() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Recheck", callback_data=cb("diag"))],
         *_back_close("ott:home"),
     ])
+# ═══════════════════════════════════════════════════════════
+# DAY PICKER (this week)
+# ═══════════════════════════════════════════════════════════
 
+def kb_lang_days(lang: str, counts: List[int],
+                  movie_counts: Dict[int, int] = None) -> InlineKeyboardMarkup:
+    """Show Mon..Sun buttons with movie counts per day."""
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+
+    for i in range(7):
+        c = counts[i] if i < len(counts) else 0
+        lbl = days[i] + (f" ({c})" if c else "")
+        row.append(InlineKeyboardButton(
+            lbl, callback_data=cb(f"lang_day:{lang}:{i}")))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(
+        "🌐 Show All This Week",
+        callback_data=cb(f"lang_all:{lang}"))])
+    rows.append(_row(("🔄 Refetch", cb(f"refetch_lang:{lang}")),
+                     ("⬅️ Back", cb("home"))))
+    rows.append([InlineKeyboardButton(
+        "❌ Close", callback_data=cb("close"))])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_lang_day(lang: str, day_idx: int,
+                 movies: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for m in movies[:20]:
+        title = str(m.get("title", "?"))[:28]
+        rows.append([InlineKeyboardButton(
+            f"🎬 {title}",
+            callback_data=cb(f"mv:{m.get('tmdb_id')}:{lang}"),
+        )])
+    rows.append(_row(("⬅️ Back", cb(f"lang:{lang}")),
+                     ("❌ Close", cb("close"))))
+    return InlineKeyboardMarkup(rows)
 
 __all__ = [
     "cb",
@@ -529,4 +571,5 @@ __all__ = [
     "kb_settings", "kb_region", "kb_langs", "kb_minvote",
     "kb_notifttl", "kb_bcttl",
     "kb_dashboard", "kb_diag",
+    "kb_lang_days", "kb_lang_day"
 ]
