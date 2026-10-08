@@ -1,5 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT WATCHER (weekly + file check + hype)
+# 🏨 DOWNTOWN VILLA — OTT WATCHER (loops + notify)
 # ============================================================
 
 from __future__ import annotations
@@ -13,11 +13,8 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait, UserIsBlocked
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from plugins.broadcast.config import (
-    fb, sc, _fmt_int, DIV, DIV2, ADMINS,
-)
+from plugins.broadcast.config import fb, sc, DIV, DIV2, ADMINS
 from plugins.ott import database as DB
-from plugins.ott import state as ST
 from plugins.ott.tmdb import fetch_weekly_multi_lang, poster_url
 from plugins.ott.config import (
     CHECK_WINDOWS, CHECK_INTERVAL_SEC, FILE_CHECK_LIMIT,
@@ -29,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
-# WEEKLY LOOP → sends to ADMIN PM
+# WEEKLY LOOP → admin PM
 # ═══════════════════════════════════════════════════════════
 
 _last_weekly: Optional[str] = None
@@ -47,7 +44,7 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     by_day = await fetch_weekly_multi_lang(
         region=cfg.get("region", "IN"),
         languages=cfg.get("languages") or [],
-        min_vote=int(cfg.get("min_vote_count", 5)),
+        min_vote=int(cfg.get("min_vote_count", 0)),
     )
     days = [[dict(m) for m in by_day.get(i, [])] for i in range(7)]
     await DB.save_week(DB.week_key(), days, posted=True)
@@ -57,21 +54,35 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     mon = DB.day_date(0).strftime("%d %b")
     sun = DB.day_date(6).strftime("%d %b %Y")
 
-    text = "\n".join([
+    lang_counts: Dict[str, int] = {}
+    for d in days:
+        for m in d:
+            code = (m.get("original_language") or "").upper()
+            if code:
+                lang_counts[code] = lang_counts.get(code, 0) + 1
+
+    lines = [
         f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
         f"📅 <b>{fb('WEEKLY OTT UPDATE')}</b>",
         DIV, "",
         f"🗓️ <code>{mon} → {sun}</code>",
         f"🎬 {sc('total releases')} · <b>{total}</b>",
         "", DIV2,
-        f"📌 {sc('open /admin → 📅 OTT to broadcast')}",
-        "", DIV2,
-    ])
+        f"🌐 <b>{sc('BY LANGUAGE')}</b>",
+    ]
+    for code, n in sorted(lang_counts.items(), key=lambda x: -x[1])[:8]:
+        lines.append(f"• <code>{code}</code> · <b>{n}</b>")
+
+    lines += ["", DIV2, f"📌 {sc('by day')}"]
     for i in range(7):
         d = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][i]
-        text += f"\n📅 <b>{d}</b> · <code>{counts[i]}</code>"
+        lines.append(f"📅 <b>{d}</b> · <code>{counts[i]}</code>")
 
-    # Send to primary admin only (or first in ADMINS)
+    lines += [
+        "", DIV2,
+        f"📌 {sc('open /admin → 📅 OTT to broadcast')}",
+    ]
+
     target = int(cfg.get("weekly_target_admin") or 0)
     if not target:
         target = int(ADMINS[0]) if ADMINS else 0
@@ -81,7 +92,7 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
 
     try:
         await client.send_message(
-            chat_id=target, text=text,
+            chat_id=target, text="\n".join(lines),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -114,13 +125,13 @@ async def weekly_loop(client: Client) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# FILE CHECKER — windows 23-06 & 12-18, hourly, last 100
+# FILE CHECKER
 # ═══════════════════════════════════════════════════════════
 
 def _in_window() -> bool:
     h = datetime.now(DB.IST).hour
     for start, end in CHECK_WINDOWS:
-        if start > end:  # wraps midnight (23 → 6)
+        if start > end:
             if h >= start or h < end:
                 return True
         else:
@@ -136,7 +147,6 @@ async def file_checker(client: Client) -> None:
             if not _in_window():
                 await asyncio.sleep(CHECK_INTERVAL_SEC)
                 continue
-
             await _scan_latest_files(client)
         except asyncio.CancelledError:
             return
@@ -146,7 +156,6 @@ async def file_checker(client: Client) -> None:
 
 
 async def _scan_latest_files(client: Client) -> None:
-    """Fetch last FILE_CHECK_LIMIT files, match against pending subs."""
     pending = await DB.pending_movies_to_notify(limit=100)
     if not pending:
         return
@@ -155,14 +164,12 @@ async def _scan_latest_files(client: Client) -> None:
     if not files:
         return
 
-    # Index pending titles
     pending_map: Dict[str, Dict[str, Any]] = {}
     for p in pending:
         t = (p.get("title") or "").lower().strip()
         if t:
             pending_map[t] = p
 
-    # Match
     for f in files:
         name = (f.get("title") or f.get("file_name") or "").lower()
         if not name:
@@ -198,6 +205,7 @@ async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
     subs = await DB.subs_for_movie(tmdb_id, only_pending=True, limit=5000)
     if not subs:
         return
+
     movie = await DB.get_movie(tmdb_id)
     if not movie:
         return
@@ -209,22 +217,22 @@ async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
     year = (movie.get("release_date") or "")[:4]
     rating = movie.get("vote_average") or 0
     lang = (movie.get("original_language") or "").upper()
+    provider = movie.get("provider") or "—"
 
     caption = "\n".join([
         f"🎉 <b>{fb('NOW AVAILABLE!')}</b>",
         DIV, "",
         f"🎬 <b>{sc(str(title)[:60])}</b> ({year})",
         f"⭐ <code>{rating:.1f}/10</code> · 🌐 <code>{lang or '—'}</code>",
+        f"📺 <code>{sc(provider)}</code>",
         "", DIV2,
-        f"⬇️ {sc('tap below to get the file')}",
+        f"✅ {sc('the file is now available')}",
+        f"📌 {sc('tap Get Files to choose quality')}",
     ])
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"📥 {sc('Get File')}",
-            callback_data=f"ott:getfile:{tmdb_id}")],
-        [InlineKeyboardButton(
-            f"📤 {sc('Share')}",
-            callback_data=f"ott:share:{tmdb_id}")],
+            f"📥 {sc('Get Files')}",
+            callback_data=f"ott:files:{tmdb_id}:0")],
         [InlineKeyboardButton(
             f"❌ {sc('Close')}",
             callback_data="ott:close")],
@@ -266,7 +274,15 @@ async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
             failed += 1
 
     await DB.mark_subs_notified(tmdb_id)
-    logger.info(f"[OTT-FC] notified {sent} for '{title}'")
+
+    # Refresh admin channel post
+    try:
+        from plugins.ott.channel_flow import refresh_admin_post
+        await refresh_admin_post(client, tmdb_id)
+    except Exception:
+        pass
+
+    logger.info(f"[OTT-FC] now-available sent {sent} for '{title}'")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -368,7 +384,7 @@ async def pending_loop(client: Client) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# PUBLIC ENTRY
+# BOOT
 # ═══════════════════════════════════════════════════════════
 
 _loops_started = False
