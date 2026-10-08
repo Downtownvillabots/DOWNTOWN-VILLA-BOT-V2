@@ -9,7 +9,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from plugins.broadcast.config import sc
 from plugins.ott.config import (
-    REGIONS, LANGUAGE_LABELS, MIN_VOTE_PRESETS,
+    REGIONS, LANGUAGE_LABELS, PRIMARY_LANGS, MIN_VOTE_PRESETS,
     NOTIFY_TTL_PRESETS, BROADCAST_TTL_PRESETS, BC_DELETE_HOURS,
 )
 
@@ -28,62 +28,53 @@ def _back_close(back_cb: str = "ott:home"):
 
 
 # ═══════════════════════════════════════════════════════════
-# HOME
+# HOME — language-first
 # ═══════════════════════════════════════════════════════════
 
 def kb_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        _row(("📊 Dashboard", cb("dash")),
-             ("📅 This Week", cb("week"))),
-        _row(("📢 Broadcast", cb("bc")),
-             ("👥 Subscribers", cb("subs"))),
-        _row(("🔔 Notifications", cb("notif")),
-             ("🎬 Movie Cache", cb("cache"))),
-        _row(("⚙️ Settings", cb("set")),
-             ("🧪 Diagnostics", cb("diag"))),
-        _row(("🔄 Refetch Week", cb("refetch")),
-             ("❌ Close", cb("close"))),
-    ])
-
-
-# ═══════════════════════════════════════════════════════════
-# DASHBOARD / WEEK / DAY
-# ═══════════════════════════════════════════════════════════
-
-def kb_dashboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        _row(("🔄 Refresh", cb("dash")),
-             ("📢 Broadcast", cb("bc"))),
-        *_back_close("ott:home"),
-    ])
-
-
-def kb_week(counts: List[int]) -> InlineKeyboardMarkup:
-    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    rows = []
+    rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
-    for i in range(7):
-        lbl = days[i] + (f" ({counts[i]})" if counts[i] else "")
-        row.append(InlineKeyboardButton(lbl, callback_data=cb(f"day:{i}")))
+    for code, label in PRIMARY_LANGS:
+        row.append(InlineKeyboardButton(
+            f"🎬 {label}",
+            callback_data=cb(f"lang:{code}"),
+        ))
         if len(row) == 2:
             rows.append(row); row = []
     if row:
         rows.append(row)
-    rows.append(_row(("🔄 Refetch", cb("refetch")),
-                     ("📢 Broadcast", cb("bc"))))
-    rows.extend(_back_close("ott:home"))
+
+    rows.append(_row(("🌐 All Languages", cb("lang:all")),
+                     ("🔥 Trending", cb("trending"))))
+    rows.append(_row(("📊 Dashboard", cb("dash")),
+                     ("📢 Broadcasts", cb("bc"))))
+    rows.append(_row(("⚙️ Settings", cb("set")),
+                     ("🧪 Diagnostics", cb("diag"))))
+    rows.append(_row(("🔄 Refetch Week", cb("refetch")),
+                     ("❌ Close", cb("close"))))
     return InlineKeyboardMarkup(rows)
 
 
-def kb_day(movies: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+# ═══════════════════════════════════════════════════════════
+# LANGUAGE VIEW
+# ═══════════════════════════════════════════════════════════
+
+def kb_lang_movies(lang: str, movies: List[Dict[str, Any]]
+                   ) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    for m in movies[:12]:
+    for m in movies[:20]:
         title = str(m.get("title", "?"))[:32]
+        year = (m.get("release_date") or "")[:4]
         rows.append([InlineKeyboardButton(
-            f"🎬 {title}",
-            callback_data=cb(f"mv:{m.get('tmdb_id')}"),
+            f"🎬 {title} ({year})",
+            callback_data=cb(f"mv:{m.get('tmdb_id')}:{lang}"),
         )])
-    rows.extend(_back_close("ott:week"))
+    if not movies:
+        rows.append([InlineKeyboardButton(
+            "🔄 Refetch", callback_data=cb(f"lang:{lang}"))])
+    rows.append(_row(("🔄 Refresh", cb(f"lang:{lang}")),
+                     ("🌐 All Languages", cb("lang:all"))))
+    rows.extend(_back_close("ott:home"))
     return InlineKeyboardMarkup(rows)
 
 
@@ -91,54 +82,49 @@ def kb_day(movies: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
 # MOVIE CARD
 # ═══════════════════════════════════════════════════════════
 
-def kb_movie(tmdb_id: int, sub_count: int, back_cb: str = "ott:week"
-             ) -> InlineKeyboardMarkup:
+def kb_movie(tmdb_id: int, sub_count: int, is_broadcasted: bool,
+             back_cb: str = "ott:home") -> InlineKeyboardMarkup:
     rows = [
-        _row((f"📢 Broadcast this", cb(f"bc_mv:{tmdb_id}")),
-             (f"🔔 Notify Now", cb(f"notify_go:{tmdb_id}"))),
         [InlineKeyboardButton(
-            f"👥 Subscribers ({sub_count})",
-            callback_data=cb(f"subs_mv:{tmdb_id}"))],
-        [InlineKeyboardButton(
-            f"💥 Cancel & Purge tokens",
-            callback_data=cb(f"cancel_mv:{tmdb_id}"))],
-        _row((f"🔄 Re-enrich", cb(f"enrich:{tmdb_id}")),),
+            f"📢 {'Re-post to channel' if is_broadcasted else 'Post to channel'}",
+            callback_data=cb(f"bc_mv:{tmdb_id}"))],
     ]
+    if sub_count > 0:
+        rows.append([InlineKeyboardButton(
+            f"🔔 Notify {sub_count} subscribers now",
+            callback_data=cb(f"notify_go:{tmdb_id}"))])
+    rows.append([InlineKeyboardButton(
+        f"📊 Statistics",
+        callback_data=cb(f"stats:{tmdb_id}"))])
+    rows.append([InlineKeyboardButton(
+        f"💥 END EVENT · delete all tokens",
+        callback_data=cb(f"end_mv:{tmdb_id}"))])
     rows.extend(_back_close(back_cb))
     return InlineKeyboardMarkup(rows)
 
 
 # ═══════════════════════════════════════════════════════════
-# BROADCAST
+# BROADCAST SETUP
 # ═══════════════════════════════════════════════════════════
 
-def kb_bc_center(movies: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for m in movies[:12]:
-        title = str(m.get("title", "?"))[:32]
-        rows.append([InlineKeyboardButton(
-            f"🎬 {title}",
-            callback_data=cb(f"bc_mv:{m.get('tmdb_id')}"),
-        )])
-    rows.append(_row(("📜 History", cb("bc_hist")),
-                     ("🔄 Refresh", cb("bc"))))
-    rows.extend(_back_close("ott:home"))
-    return InlineKeyboardMarkup(rows)
-
-
 def kb_bc_setup(tmdb_id: int, channel: int, notify: bool,
-                 hours: int) -> InlineKeyboardMarkup:
+                 hours: int, show_file: bool = True
+                 ) -> InlineKeyboardMarkup:
     notify_lbl = "🟢 on" if notify else "🔴 off"
+    file_lbl = "🟢 on" if show_file else "🔴 off"
     timer_lbl = ("♾️ never" if hours <= 0 else f"⏱️ {hours}h")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"🔔 Notify button · {notify_lbl}",
             callback_data="ott:bcsetup_tog_notify")],
         [InlineKeyboardButton(
+            f"📥 Get File button · {file_lbl}",
+            callback_data="ott:bcsetup_tog_file")],
+        [InlineKeyboardButton(
             f"🗑️ Auto-delete · {timer_lbl}",
             callback_data="ott:bcsetup_timer")],
         [InlineKeyboardButton(
-            f"🚀 {sc('SEND TO CHANNEL NOW')}",
+            f"🚀 {sc('POST TO CHANNEL NOW')}",
             callback_data="ott:bcsetup_send")],
         [InlineKeyboardButton("⬅️ Back",
                               callback_data=f"ott:bc_mv:{tmdb_id}"),
@@ -164,20 +150,66 @@ def kb_bcsetup_timer(tmdb_id: int, current: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def ott_channel_kb(tmdb_id: int, notify: bool = True) -> InlineKeyboardMarkup:
+# ═══════════════════════════════════════════════════════════
+# CHANNEL POST KB (buttons UNDER the poster)
+# ═══════════════════════════════════════════════════════════
+
+def kb_channel_post(tmdb_id: int, notify: bool = True,
+                    show_file: bool = True) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     if notify:
         rows.append([InlineKeyboardButton(
-            f"🔔 {sc('Get Notified')}",
+            f"🔔 Get Notified",
             callback_data=f"ott:sub:{tmdb_id}")])
+    if show_file:
         rows.append([InlineKeyboardButton(
-            f"🎁 {sc('Add to watchlist')}",
-            callback_data=f"ott:wl_add:{tmdb_id}")])
+            f"📥 Get File",
+            callback_data=f"ott:getfile:{tmdb_id}")])
     rows.append([InlineKeyboardButton(
-        f"📤 {sc('Share')}",
-        callback_data=f"ott:share:{tmdb_id}")])
+        f"🎁 Add to Watchlist",
+        callback_data=f"ott:wl_add:{tmdb_id}")])
+    rows.append([InlineKeyboardButton(
+        f"📊 Live Stats",
+        callback_data=f"ott:stats_pub:{tmdb_id}")])
     return InlineKeyboardMarkup(rows)
 
+
+# ═══════════════════════════════════════════════════════════
+# STATS + END CONFIRM
+# ═══════════════════════════════════════════════════════════
+
+def kb_stats(tmdb_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🔄 Refresh",
+            callback_data=cb(f"stats:{tmdb_id}"))],
+        [InlineKeyboardButton(
+            f"🔔 Notify pending now",
+            callback_data=cb(f"notify_go:{tmdb_id}"))],
+        [InlineKeyboardButton(
+            f"👥 View subscribers",
+            callback_data=cb(f"subs_mv:{tmdb_id}"))],
+        [InlineKeyboardButton(
+            f"💥 END EVENT",
+            callback_data=cb(f"end_mv:{tmdb_id}"))],
+        *_back_close("ott:home"),
+    ])
+
+
+def kb_end_confirm(tmdb_id: int, tok: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💥 YES, END EVERYTHING",
+            callback_data=cb(f"end_do:{tmdb_id}:{tok}"))],
+        [InlineKeyboardButton(
+            f"⬅️ No, keep it",
+            callback_data=cb(f"stats:{tmdb_id}"))],
+    ])
+
+
+# ═══════════════════════════════════════════════════════════
+# BROADCAST HISTORY
+# ═══════════════════════════════════════════════════════════
 
 def kb_bc_history() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -185,6 +217,20 @@ def kb_bc_history() -> InlineKeyboardMarkup:
              ("📢 Center", cb("bc"))),
         *_back_close("ott:home"),
     ])
+
+
+def kb_bc_center(movies: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for m in movies[:20]:
+        title = str(m.get("title", "?"))[:32]
+        rows.append([InlineKeyboardButton(
+            f"🎬 {title}",
+            callback_data=cb(f"bc_mv:{m.get('tmdb_id')}"),
+        )])
+    rows.append(_row(("📜 History", cb("bc_hist")),
+                     ("🔄 Refresh", cb("bc"))))
+    rows.extend(_back_close("ott:home"))
+    return InlineKeyboardMarkup(rows)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -210,25 +256,17 @@ def kb_subs_movie(tmdb_id: int) -> InlineKeyboardMarkup:
             "🔔 Notify now",
             callback_data=cb(f"notify_go:{tmdb_id}"))],
         [InlineKeyboardButton(
+            "📊 Statistics",
+            callback_data=cb(f"stats:{tmdb_id}"))],
+        [InlineKeyboardButton(
             "💥 Cancel ALL pending subs",
-            callback_data=cb(f"cancel_subs:{tmdb_id}"))],
+            callback_data=cb(f"end_mv:{tmdb_id}"))],
         *_back_close("ott:subs"),
     ])
 
 
-def kb_cancel_confirm(tmdb_id: int, tok: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "💥 YES, FULL CANCEL",
-            callback_data=cb(f"cancel_do:{tmdb_id}:{tok}"))],
-        [InlineKeyboardButton(
-            "⬅️ No, keep it",
-            callback_data=cb(f"subs_mv:{tmdb_id}"))],
-    ])
-
-
 # ═══════════════════════════════════════════════════════════
-# NOTIFICATIONS / CACHE
+# NOTIFICATIONS / CACHE / SETTINGS / DIAG
 # ═══════════════════════════════════════════════════════════
 
 def kb_notif() -> InlineKeyboardMarkup:
@@ -246,10 +284,6 @@ def kb_cache() -> InlineKeyboardMarkup:
         *_back_close("ott:home"),
     ])
 
-
-# ═══════════════════════════════════════════════════════════
-# SETTINGS
-# ═══════════════════════════════════════════════════════════
 
 def kb_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -329,10 +363,6 @@ def kb_bcttl(current: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ═══════════════════════════════════════════════════════════
-# DIAGNOSTICS
-# ═══════════════════════════════════════════════════════════
-
 def kb_diag() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Recheck", callback_data=cb("diag"))],
@@ -342,10 +372,11 @@ def kb_diag() -> InlineKeyboardMarkup:
 
 __all__ = [
     "cb",
-    "kb_home", "kb_dashboard", "kb_week", "kb_day", "kb_movie",
-    "kb_bc_center", "kb_bc_setup", "kb_bcsetup_timer",
-    "kb_bc_history", "ott_channel_kb",
-    "kb_subs_overview", "kb_subs_movie", "kb_cancel_confirm",
+    "kb_home", "kb_lang_movies", "kb_movie",
+    "kb_bc_setup", "kb_bcsetup_timer", "kb_channel_post",
+    "kb_stats", "kb_end_confirm",
+    "kb_bc_history", "kb_bc_center",
+    "kb_subs_overview", "kb_subs_movie",
     "kb_notif", "kb_cache",
     "kb_settings", "kb_region", "kb_langs", "kb_minvote",
     "kb_notifttl", "kb_bcttl", "kb_diag",
