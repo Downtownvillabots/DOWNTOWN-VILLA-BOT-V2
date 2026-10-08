@@ -3,26 +3,15 @@
 # ============================================================
 
 from __future__ import annotations
-import asyncio
 import logging
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
-from pyrogram.errors import (
-    FloodWait, UserIsBlocked, InputUserDeactivated,
-    ChatWriteForbidden, ChatAdminRequired, ChannelPrivate,
-    PeerIdInvalid, UserNotParticipant, UserDeactivated,
-    UserDeactivatedBan, MessageNotModified,
-)
-from pyrogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-)
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from plugins.broadcast.config import (
-    fb, sc, _fmt_int, _fmt_duration, _progress_colored,
-    DIV, DIV2, DEFAULT_DELAY,
+    fb, sc, _fmt_int, _fmt_duration, DIV, DIV2,
 )
 from plugins.ott import database as DB
 from plugins.ott import state as ST
@@ -33,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
-# OTT BROADCAST CHANNEL RESOLVER
+# RESOLVE THE OTT BROADCAST CHANNEL
 # ═══════════════════════════════════════════════════════════
 
 async def get_ott_channel() -> int:
@@ -51,7 +40,7 @@ async def get_ott_channel() -> int:
 
 
 # ═══════════════════════════════════════════════════════════
-# CAPTION + KB
+# CAPTION BUILDER
 # ═══════════════════════════════════════════════════════════
 
 def build_caption(movie: Dict[str, Any]) -> str:
@@ -86,27 +75,8 @@ def build_caption(movie: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_kb(movie: Dict[str, Any], notify: bool = True) -> InlineKeyboardMarkup:
-    tid = movie.get("tmdb_id")
-    rows: List[List[InlineKeyboardButton]] = []
-    if notify:
-        rows.append([InlineKeyboardButton(
-            f"🔔 {sc('Get Notified')}",
-            callback_data=f"ott:sub:{tid}",
-        )])
-        rows.append([InlineKeyboardButton(
-            f"🎁 {sc('Add to watchlist')}",
-            callback_data=f"ott:wl_add:{tid}",
-        )])
-    rows.append([InlineKeyboardButton(
-        f"📤 {sc('Share')}",
-        callback_data=f"ott:share:{tid}",
-    )])
-    return InlineKeyboardMarkup(rows)
-
-
 # ═══════════════════════════════════════════════════════════
-# SEND ONE BROADCAST (setup-driven)
+# SEND BROADCAST (setup-driven)
 # ═══════════════════════════════════════════════════════════
 
 async def send_channel_broadcast(
@@ -114,7 +84,6 @@ async def send_channel_broadcast(
     q: CallbackQuery,
     setup: Dict[str, Any],
 ) -> None:
-    """Post the movie to the OTT broadcast channel with the setup options."""
     tmdb_id = setup.get("tmdb_id")
     ch = int(setup.get("channel_id") or 0)
     if not ch:
@@ -128,11 +97,10 @@ async def send_channel_broadcast(
     hours = int(setup.get("auto_delete_hours", 0))
     ttl = hours * 3600 if hours > 0 else 0
 
-    caption = setup.get("caption") or build_caption(movie)
+    caption = build_caption(movie)
     kb = KB.ott_channel_kb(tmdb_id, notify=notify)
     poster = poster_url(movie.get("poster_path"), "w500")
 
-    # Notify "sending"
     await q.answer("📤 Sending…")
     try:
         await q.message.edit_text(
@@ -148,7 +116,6 @@ async def send_channel_broadcast(
     except Exception:
         pass
 
-    # Send
     sent = None
     try:
         if poster:
@@ -169,21 +136,20 @@ async def send_channel_broadcast(
         logger.exception(f"[OTT-ENGINE] send: {e}")
         try:
             await q.message.edit_text(
-                f"❌ <b>{fb('FAILED')}</b>\n{DIV}\n<code>{type(e).__name__}</code>",
+                f"❌ <b>{fb('FAILED')}</b>\n{DIV}\n"
+                f"<code>{type(e).__name__}: {str(e)[:120]}</code>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
         return
 
-    # Schedule auto-delete of the CHANNEL POST
     if ttl > 0 and sent:
         try:
             await DB.pending_add(ch, sent.id, ttl)
         except Exception:
             pass
 
-    # Log broadcast
     try:
         await DB.broadcast_log(
             tmdb_id=tmdb_id, target="ott_channel",
@@ -194,7 +160,6 @@ async def send_channel_broadcast(
     except Exception:
         pass
 
-    # Update the message with done card
     movie_title = (movie.get("title") or "?")[:50]
     ttl_line = (f"🗑️ {sc('auto-delete')} · {_fmt_duration(ttl)}"
                 if ttl else f"🗑️ {sc('auto-delete')} · ♾️ off")
@@ -209,7 +174,7 @@ async def send_channel_broadcast(
         f"{'🟢 on' if notify else '🔴 off'}",
         ttl_line,
         "", DIV2,
-        f"📌 {sc('users who tap Notify will be DM\\'d when file lands')}",
+        f"📌 {sc('users who tap Notify will be DM-ed when file lands')}",
         f"📌 {sc('view subscribers from the movie card')}",
     ])
     kb2 = InlineKeyboardMarkup([
@@ -237,6 +202,6 @@ async def send_channel_broadcast(
 
 __all__ = [
     "get_ott_channel",
-    "build_caption", "build_kb",
+    "build_caption",
     "send_channel_broadcast",
 ]
