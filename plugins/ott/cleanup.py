@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 from plugins.ott import state as ST
+from plugins.ott import events as EVENTS
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,26 @@ async def _loop():
             ST.cleanup_sessions()
             ST.cleanup_jobs()
             ST.cleanup_confirms()
-            ST.setup_cleanup()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+async def _recount_loop():
+    """Hourly recount of active events (stats drift protection)."""
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            try:
+                active = await EVENTS.list_active_events(limit=100)
+            except Exception:
+                continue
+            for ev in active:
+                try:
+                    await EVENTS.recount(ev["_id"])
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             break
         except Exception:
@@ -33,7 +53,8 @@ def start() -> None:
         return
     try:
         loop = asyncio.get_event_loop()
-        _TASK = loop.create_task(_loop())
+        loop.create_task(_loop())
+        loop.create_task(_recount_loop())
     except Exception:
         pass
 
