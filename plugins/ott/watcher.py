@@ -1,5 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT WATCHER (loops + notify)
+# 🏨 DOWNTOWN VILLA — OTT WATCHER (v3 — event-aware)
 # ============================================================
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from plugins.broadcast.config import fb, sc, DIV, DIV2, ADMINS
 from plugins.ott import database as DB
+from plugins.ott import events as EVENTS
+from plugins.ott import stats_sync as SYNC
 from plugins.ott.tmdb import fetch_weekly_multi_lang, poster_url
 from plugins.ott.config import (
     CHECK_WINDOWS, CHECK_INTERVAL_SEC, FILE_CHECK_LIMIT,
@@ -54,7 +56,6 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     mon = DB.day_date(0).strftime("%d %b")
     sun = DB.day_date(6).strftime("%d %b %Y")
 
-    # Group language counts
     lang_counts: Dict[str, int] = {}
     for d in days:
         for m in d:
@@ -85,7 +86,6 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
             f"<code>{day_date.strftime('%d %b')}</code> · "
             f"<b>{counts[i]}</b>"
         )
-        # Show top 3 per day
         for m in (days[i][:3] if i < len(days) else []):
             title = str(m.get("title", "?"))[:40]
             lines.append(f"   🎬 {sc(title)}")
@@ -97,6 +97,11 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
         f"📌 {sc('open /admin → 📅 OTT to broadcast')}",
     ]
 
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "📅 OPEN OTT", callback_data="ott:home")],
+    ])
+
     target = int(cfg.get("weekly_target_admin") or 0)
     if not target:
         target = int(ADMINS[0]) if ADMINS else 0
@@ -107,6 +112,7 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     try:
         await client.send_message(
             chat_id=target, text="\n".join(lines),
+            reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -116,6 +122,7 @@ async def _do_weekly_post(client: Client, force: bool = False) -> bool:
     except Exception as e:
         logger.warning(f"[OTT-WK] send: {e}")
         return False
+
 
 async def weekly_loop(client: Client) -> None:
     await asyncio.sleep(30)
@@ -214,6 +221,10 @@ async def _latest_files(limit: int = 100) -> List[Dict[str, Any]]:
     return []
 
 
+# ═══════════════════════════════════════════════════════════
+# NOTIFY SUBSCRIBERS (with live sync)
+# ═══════════════════════════════════════════════════════════
+
 async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
     subs = await DB.subs_for_movie(tmdb_id, only_pending=True, limit=5000)
     if not subs:
@@ -288,12 +299,16 @@ async def _notify_subscribers(client: Client, tmdb_id: int) -> None:
 
     await DB.mark_subs_notified(tmdb_id)
 
-    # Refresh admin channel post
-    try:
-        from plugins.ott.channel_flow import refresh_admin_post
-        await refresh_admin_post(client, tmdb_id)
-    except Exception:
-        pass
+    # ── Live sync: event admin post + target posts ──
+    ev = await EVENTS.get_active_for_movie(tmdb_id)
+    if not ev:
+        ev = await EVENTS.get_any_for_movie(tmdb_id)
+    if ev:
+        try:
+            await EVENTS.recount(ev["_id"])
+            asyncio.create_task(SYNC.sync_all(client, ev["_id"]))
+        except Exception as e:
+            logger.debug(f"[OTT-FC] sync: {e}")
 
     logger.info(f"[OTT-FC] now-available sent {sent} for '{title}'")
 
@@ -397,6 +412,51 @@ async def pending_loop(client: Client) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
+# RECOVERY LOOP — reconcile events after restart
+# ═══════════════════════════════════════════════════════════
+
+async def recovery_loop(client: Client) -> None:
+    """On startup + every hour, verify active events still have valid messages."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await _reconcile_active_events(client)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug(f"[OTT-REC] {e}")
+        await asyncio.sleep(3600)
+
+
+async def _reconcile_active_events(client: Client) -> None:
+    """For each active event, ensure its admin post is still reachable."""
+    try:
+        events = await EVENTS.list_active_events(limit=100)
+    except Exception:
+        return
+
+    for ev in events:
+        msg_id = int(ev.get("admin_msg_id") or 0)
+        chat_id = int(ev.get("admin_channel_id") or 0)
+        if not msg_id or not chat_id:
+            continue
+
+        try:
+            # Cheap probe: try to fetch the message
+            await client.get_messages(chat_id, msg_id)
+        except Exception as e:
+            msg = str(e).lower()
+            if ("message not found" in msg or "message_id_invalid" in msg
+                    or "not found" in msg):
+                logger.warning(
+                    f"[OTT-REC] event {ev['_id']} lost msg "
+                    f"{chat_id}/{msg_id} — clearing pointer"
+                )
+                await EVENTS.update_event(ev["_id"], admin_msg_id=0)
+            # Else: ignore (transient error)
+
+
+# ═══════════════════════════════════════════════════════════
 # BOOT
 # ═══════════════════════════════════════════════════════════
 
@@ -414,6 +474,7 @@ def ensure_loops(client: Client) -> None:
         loop.create_task(file_checker(client))
         loop.create_task(hype_loop(client))
         loop.create_task(pending_loop(client))
+        loop.create_task(recovery_loop(client))
         logger.info("[OTT] all loops started")
     except RuntimeError:
         pass
@@ -426,4 +487,5 @@ async def force_weekly(client: Client) -> bool:
 __all__ = [
     "ensure_loops", "force_weekly",
     "_do_weekly_post", "_notify_subscribers",
+    "_reconcile_active_events",
 ]
