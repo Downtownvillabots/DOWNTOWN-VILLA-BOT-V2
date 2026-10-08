@@ -572,17 +572,19 @@ def kb_cache() -> InlineKeyboardMarkup:
 
 def kb_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        _row(("🌍 Region", cb("set_region")),
-             ("🌐 Languages", cb("set_langs"))),
-        _row(("📢 OTT Channel", cb("set_ott_channel")),
-             ("⭐ Min Votes", cb("set_minvote"))),
-        _row(("🔔 Notify TTL", cb("set_notifttl")),
-             ("📢 Broadcast TTL", cb("set_bcttl"))),
-        _row(("🔄 Hype Loop", cb("set_tog:hype")),
-             ("📅 Weekly Loop", cb("set_tog:weekly"))),
-        _row(("🔄 Refresh", cb("set")),
-             ("⬅️ Back", cb("home"))),
-        [InlineKeyboardButton("❌ Close", callback_data=cb("close"))],
+        _row(("🌍 REGION", cb("set_region")),
+             ("🌐 LANGUAGES", cb("set_langs"))),
+        _row(("📢 OTT CHANNEL", cb("set_ott_channel")),
+             ("⭐ MIN VOTES", cb("set_minvote"))),
+        _row(("🔔 NOTIFY TTL", cb("set_notifttl")),
+             ("📢 BROADCAST TTL", cb("set_bcttl"))),
+        _row(("📝 CAPTION", cb("cap_settings")),
+             ("🔘 BUTTONS", cb("btn_settings"))),
+        _row(("🔄 HYPE LOOP", cb("set_tog:hype")),
+             ("📅 WEEKLY LOOP", cb("set_tog:weekly"))),
+        _row(("🔄 REFRESH", cb("set")),
+             ("⬅️ BACK", cb("home"))),
+        [InlineKeyboardButton("❌ CLOSE", callback_data=cb("close"))],
     ])
 
 
