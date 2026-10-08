@@ -11,25 +11,21 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery
 
-from plugins.broadcast.config import _is_admin
+from plugins.broadcast.config import _is_admin, _esc
 from plugins.ott import views as V
-from plugins.ott import keyboards as KB
 from plugins.ott import database as DB
-from plugins.ott.config import PREFIX, FREQ_MODES
+from plugins.ott.config import PREFIX, FREQ_MODES, LANG_CODES
 
 logger = logging.getLogger(__name__)
 PFX = PREFIX
 
-# In-memory text-input sessions
 _SESS: Dict[int, Dict[str, Any]] = {}
 _SESS_TTL = 600
 
 
 def _sess_set(uid: int, kind: str, **data) -> None:
-    _SESS[int(uid)] = {
-        "kind": kind, "data": data,
-        "expires": time.time() + _SESS_TTL,
-    }
+    _SESS[int(uid)] = {"kind": kind, "data": data,
+                        "expires": time.time() + _SESS_TTL}
 
 
 def _sess_get(uid: int) -> Optional[Dict[str, Any]]:
@@ -78,19 +74,6 @@ async def open_panel_for_admin(client: Client, q: CallbackQuery) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════
-
-async def _recount_channel(cid: int) -> bool:
-    """Return True if channel exists."""
-    return await DB.get_channel(cid) is not None
-
-
-async def _recount_group(gid: int) -> bool:
-    return await DB.get_group(gid) is not None
-
-
-# ═══════════════════════════════════════════════════════════
 # ROUTER
 # ═══════════════════════════════════════════════════════════
 
@@ -105,7 +88,6 @@ async def ott_router(client: Client, q: CallbackQuery):
     args = parts[2:]
 
     try:
-        # ── CLOSE ──
         if action == "close":
             try:
                 await q.message.delete()
@@ -149,9 +131,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                 day_idx = int(args[2]) if len(args) > 2 else 0
             except (ValueError, IndexError):
                 return await q.answer("❌")
-
             text, kb, poster = await V.view_movie(tmdb_id, lang, day_idx)
-
             if poster:
                 try:
                     await q.message.delete()
@@ -167,7 +147,6 @@ async def ott_router(client: Client, q: CallbackQuery):
                     return await q.answer()
                 except Exception:
                     pass
-
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -199,8 +178,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             return await q.answer()
 
         if action == "fav_all":
-            from plugins.ott.config import PRIMARY_LANGS
-            await DB.set_fav_languages([c for c, _ in PRIMARY_LANGS])
+            await DB.set_fav_languages(list(LANG_CODES))
             text, kb = await V.view_fav_langs()
             await V.safe_edit(q, text, kb)
             return await q.answer("✅")
@@ -222,9 +200,29 @@ async def ott_router(client: Client, q: CallbackQuery):
 
         if action == "ch_add":
             _sess_set(q.from_user.id, "add_channel")
-            text, kb = V.prompt_add_channel()
-            await V.safe_edit(q, text, kb)
+            from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+            txt = "\n".join([
+                f"🏨 <b>ADD OTT CHANNEL</b>",
+                "────────────────────",
+                f"📝 Send chat id or @username",
+                "",
+                "📌 Examples",
+                "• <code>-1001234567890</code>",
+                "• <code>@my_channel</code>",
+                "",
+                "📌 Bot must be admin",
+                "────────────────────",
+                "📌 Send <code>-</code> to cancel",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ CANCEL",
+                    callback_data="ott:ch_list"),
+            ]])
+            await V.safe_edit(q, txt, kb)
             return await q.answer()
+
+        if action == "ch_open_broadcast":
+            return await q.answer("Use /broadcast in PM", show_alert=True)
 
         if action == "ch":
             try:
@@ -240,13 +238,22 @@ async def ott_router(client: Client, q: CallbackQuery):
                 cid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            new_val = not bool(ch.get("running"))
-            await DB.update_channel(cid, running=new_val)
+            cfg = await DB.get_channel_config(cid)
+            new_val = not bool(cfg.get("running"))
+            await DB.update_channel_config(cid, running=new_val)
             await q.answer("🟢 STARTED" if new_val else "🔴 STOPPED")
             text, kb = await V.view_channel(cid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "ch_off":
+            try:
+                cid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await DB.toggle_channel(cid)  # now disabled
+            await q.answer("☐ Disabled for OTT")
+            text, kb = await V.view_ch_list()
             await V.safe_edit(q, text, kb)
             return
 
@@ -265,15 +272,14 @@ async def ott_router(client: Client, q: CallbackQuery):
                 code = args[1]
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            langs = list(ch.get("languages") or [])
+            cfg = await DB.get_channel_config(cid)
+            langs = list(cfg.get("languages") or [])
             if code in langs:
                 langs.remove(code)
             else:
                 langs.append(code)
-            await DB.update_channel(cid, languages=langs)
+            await DB.update_channel_config(cid, languages=langs,
+                                            last_sent_key="")
             text, kb = await V.view_ch_langs(cid)
             await V.safe_edit(q, text, kb)
             return await q.answer()
@@ -283,9 +289,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                 cid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            from plugins.ott.config import PRIMARY_LANGS
-            await DB.update_channel(cid,
-                languages=[c for c, _ in PRIMARY_LANGS])
+            await DB.update_channel_config(cid,
+                languages=list(LANG_CODES), last_sent_key="")
             text, kb = await V.view_ch_langs(cid)
             await V.safe_edit(q, text, kb)
             return await q.answer("✅")
@@ -295,7 +300,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                 cid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            await DB.update_channel(cid, languages=[])
+            await DB.update_channel_config(cid, languages=[],
+                                            last_sent_key="")
             text, kb = await V.view_ch_langs(cid)
             await V.safe_edit(q, text, kb)
             return await q.answer("☐")
@@ -317,25 +323,20 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌")
             if mode not in FREQ_MODES:
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            freq = dict(ch.get("frequency") or {})
+            cfg = await DB.get_channel_config(cid)
+            freq = dict(cfg.get("frequency") or {})
             freq["mode"] = mode
-            await DB.update_channel(cid, frequency=freq, last_sent_key="")
+            await DB.update_channel_config(cid, frequency=freq,
+                                            last_sent_key="")
             await q.answer(f"✅ {mode.upper()}")
-
-            # Route to next step
             if mode == "off":
                 text, kb = await V.view_channel(cid)
             elif mode == "daily":
-                text, kb = await V.view_ch_freq_hours(cid, "daily")
+                text, kb = await V.view_ch_hours(cid, "daily")
             elif mode == "weekly":
-                text, kb = await V.view_ch_freq_days(cid)
-            elif mode == "monthly":
-                text, kb = await V.view_ch_freq_month_days(cid)
+                text, kb = await V.view_ch_days(cid)
             else:
-                text, kb = await V.view_channel(cid)
+                text, kb = await V.view_ch_month_days(cid)
             await V.safe_edit(q, text, kb)
             return
 
@@ -345,12 +346,11 @@ async def ott_router(client: Client, q: CallbackQuery):
                 h = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            freq = dict(ch.get("frequency") or {})
+            cfg = await DB.get_channel_config(cid)
+            freq = dict(cfg.get("frequency") or {})
             freq["hour"] = h
-            await DB.update_channel(cid, frequency=freq, last_sent_key="")
+            await DB.update_channel_config(cid, frequency=freq,
+                                            last_sent_key="")
             await q.answer(f"✅ {h:02d}:00")
             text, kb = await V.view_channel(cid)
             await V.safe_edit(q, text, kb)
@@ -362,15 +362,13 @@ async def ott_router(client: Client, q: CallbackQuery):
                 d = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            freq = dict(ch.get("frequency") or {})
+            cfg = await DB.get_channel_config(cid)
+            freq = dict(cfg.get("frequency") or {})
             freq["day_of_week"] = d
-            await DB.update_channel(cid, frequency=freq, last_sent_key="")
-            await q.answer(f"✅ {['MON','TUE','WED','THU','FRI','SAT','SUN'][d]}")
-            # Move to hour picker
-            text, kb = await V.view_ch_freq_hours(cid, "weekly")
+            await DB.update_channel_config(cid, frequency=freq,
+                                            last_sent_key="")
+            await q.answer("✅")
+            text, kb = await V.view_ch_hours(cid, "weekly")
             await V.safe_edit(q, text, kb)
             return
 
@@ -380,14 +378,13 @@ async def ott_router(client: Client, q: CallbackQuery):
                 d = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            freq = dict(ch.get("frequency") or {})
+            cfg = await DB.get_channel_config(cid)
+            freq = dict(cfg.get("frequency") or {})
             freq["day_of_month"] = d
-            await DB.update_channel(cid, frequency=freq, last_sent_key="")
-            await q.answer(f"✅ day {d}")
-            text, kb = await V.view_ch_freq_hours(cid, "monthly")
+            await DB.update_channel_config(cid, frequency=freq,
+                                            last_sent_key="")
+            await q.answer("✅")
+            text, kb = await V.view_ch_hours(cid, "monthly")
             await V.safe_edit(q, text, kb)
             return
 
@@ -396,45 +393,11 @@ async def ott_router(client: Client, q: CallbackQuery):
                 cid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            ch = await DB.get_channel(cid)
-            if not ch:
-                return await q.answer("❌")
-            text, kb = await V.view_preview(ch.get("languages") or [])
-            # override back button
-            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ BACK",
-                    callback_data=f"ott:ch:{cid}")],
-            ])
+            cfg = await DB.get_channel_config(cid)
+            text, kb = await V.view_preview(
+                cfg.get("languages") or [], back_cb=f"ott:ch:{cid}")
             await V.safe_edit(q, text, kb)
             return await q.answer()
-
-        if action == "ch_rm":
-            try:
-                cid = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            await DB.remove_channel(cid)
-            await q.answer("🗑️ Removed")
-            text, kb = await V.view_ch_list()
-            await V.safe_edit(q, text, kb)
-            return
-
-        if action == "ch_start_all":
-            for c in await DB.get_channels():
-                await DB.update_channel(int(c["chat_id"]), running=True)
-            await q.answer("▶️ STARTED ALL")
-            text, kb = await V.view_ch_list()
-            await V.safe_edit(q, text, kb)
-            return
-
-        if action == "ch_stop_all":
-            for c in await DB.get_channels():
-                await DB.update_channel(int(c["chat_id"]), running=False)
-            await q.answer("⏹ STOPPED ALL")
-            text, kb = await V.view_ch_list()
-            await V.safe_edit(q, text, kb)
-            return
 
         # ═══════════════════════════════════════════════════
         # GROUPS
@@ -447,8 +410,25 @@ async def ott_router(client: Client, q: CallbackQuery):
 
         if action == "gr_add":
             _sess_set(q.from_user.id, "add_group")
-            text, kb = V.prompt_add_group()
-            await V.safe_edit(q, text, kb)
+            from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+            txt = "\n".join([
+                f"🏨 <b>ADD OTT GROUP</b>",
+                "────────────────────",
+                f"📝 Send chat id or @username",
+                "",
+                "📌 Examples",
+                "• <code>-1001234567890</code>",
+                "• <code>@my_group</code>",
+                "",
+                "📌 Bot must be in the group",
+                "────────────────────",
+                "📌 Send <code>-</code> to cancel",
+            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ CANCEL",
+                    callback_data="ott:gr_list"),
+            ]])
+            await V.safe_edit(q, txt, kb)
             return await q.answer()
 
         if action == "gr":
@@ -465,13 +445,22 @@ async def ott_router(client: Client, q: CallbackQuery):
                 gid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            new_val = not bool(gr.get("running"))
-            await DB.update_group(gid, running=new_val)
+            cfg = await DB.get_group_config(gid)
+            new_val = not bool(cfg.get("running"))
+            await DB.update_group_config(gid, running=new_val)
             await q.answer("🟢 STARTED" if new_val else "🔴 STOPPED")
             text, kb = await V.view_group(gid)
+            await V.safe_edit(q, text, kb)
+            return
+
+        if action == "gr_off":
+            try:
+                gid = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await DB.toggle_group(gid)
+            await q.answer("☐ Disabled for OTT")
+            text, kb = await V.view_gr_list()
             await V.safe_edit(q, text, kb)
             return
 
@@ -490,15 +479,14 @@ async def ott_router(client: Client, q: CallbackQuery):
                 code = args[1]
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            langs = list(gr.get("languages") or [])
+            cfg = await DB.get_group_config(gid)
+            langs = list(cfg.get("languages") or [])
             if code in langs:
                 langs.remove(code)
             else:
                 langs.append(code)
-            await DB.update_group(gid, languages=langs)
+            await DB.update_group_config(gid, languages=langs,
+                                          last_sent_key="")
             text, kb = await V.view_gr_langs(gid)
             await V.safe_edit(q, text, kb)
             return await q.answer()
@@ -508,9 +496,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                 gid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            from plugins.ott.config import PRIMARY_LANGS
-            await DB.update_group(gid,
-                languages=[c for c, _ in PRIMARY_LANGS])
+            await DB.update_group_config(gid,
+                languages=list(LANG_CODES), last_sent_key="")
             text, kb = await V.view_gr_langs(gid)
             await V.safe_edit(q, text, kb)
             return await q.answer("✅")
@@ -520,7 +507,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                 gid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            await DB.update_group(gid, languages=[])
+            await DB.update_group_config(gid, languages=[],
+                                          last_sent_key="")
             text, kb = await V.view_gr_langs(gid)
             await V.safe_edit(q, text, kb)
             return await q.answer("☐")
@@ -542,24 +530,20 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌")
             if mode not in FREQ_MODES:
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            freq = dict(gr.get("frequency") or {})
+            cfg = await DB.get_group_config(gid)
+            freq = dict(cfg.get("frequency") or {})
             freq["mode"] = mode
-            await DB.update_group(gid, frequency=freq, last_sent_key="")
+            await DB.update_group_config(gid, frequency=freq,
+                                          last_sent_key="")
             await q.answer(f"✅ {mode.upper()}")
-
             if mode == "off":
                 text, kb = await V.view_group(gid)
             elif mode == "daily":
-                text, kb = await V.view_gr_freq_hours(gid, "daily")
+                text, kb = await V.view_gr_hours(gid, "daily")
             elif mode == "weekly":
-                text, kb = await V.view_gr_freq_days(gid)
-            elif mode == "monthly":
-                text, kb = await V.view_gr_freq_month_days(gid)
+                text, kb = await V.view_gr_days(gid)
             else:
-                text, kb = await V.view_group(gid)
+                text, kb = await V.view_gr_month_days(gid)
             await V.safe_edit(q, text, kb)
             return
 
@@ -569,12 +553,11 @@ async def ott_router(client: Client, q: CallbackQuery):
                 h = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            freq = dict(gr.get("frequency") or {})
+            cfg = await DB.get_group_config(gid)
+            freq = dict(cfg.get("frequency") or {})
             freq["hour"] = h
-            await DB.update_group(gid, frequency=freq, last_sent_key="")
+            await DB.update_group_config(gid, frequency=freq,
+                                          last_sent_key="")
             await q.answer(f"✅ {h:02d}:00")
             text, kb = await V.view_group(gid)
             await V.safe_edit(q, text, kb)
@@ -586,14 +569,13 @@ async def ott_router(client: Client, q: CallbackQuery):
                 d = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            freq = dict(gr.get("frequency") or {})
+            cfg = await DB.get_group_config(gid)
+            freq = dict(cfg.get("frequency") or {})
             freq["day_of_week"] = d
-            await DB.update_group(gid, frequency=freq, last_sent_key="")
+            await DB.update_group_config(gid, frequency=freq,
+                                          last_sent_key="")
             await q.answer("✅")
-            text, kb = await V.view_gr_freq_hours(gid, "weekly")
+            text, kb = await V.view_gr_hours(gid, "weekly")
             await V.safe_edit(q, text, kb)
             return
 
@@ -603,14 +585,13 @@ async def ott_router(client: Client, q: CallbackQuery):
                 d = int(args[1])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            freq = dict(gr.get("frequency") or {})
+            cfg = await DB.get_group_config(gid)
+            freq = dict(cfg.get("frequency") or {})
             freq["day_of_month"] = d
-            await DB.update_group(gid, frequency=freq, last_sent_key="")
+            await DB.update_group_config(gid, frequency=freq,
+                                          last_sent_key="")
             await q.answer("✅")
-            text, kb = await V.view_gr_freq_hours(gid, "monthly")
+            text, kb = await V.view_gr_hours(gid, "monthly")
             await V.safe_edit(q, text, kb)
             return
 
@@ -619,44 +600,11 @@ async def ott_router(client: Client, q: CallbackQuery):
                 gid = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            gr = await DB.get_group(gid)
-            if not gr:
-                return await q.answer("❌")
-            text, _ = await V.view_preview(gr.get("languages") or [])
-            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ BACK",
-                    callback_data=f"ott:gr:{gid}")],
-            ])
+            cfg = await DB.get_group_config(gid)
+            text, kb = await V.view_preview(
+                cfg.get("languages") or [], back_cb=f"ott:gr:{gid}")
             await V.safe_edit(q, text, kb)
             return await q.answer()
-
-        if action == "gr_rm":
-            try:
-                gid = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            await DB.remove_group(gid)
-            await q.answer("🗑️ Removed")
-            text, kb = await V.view_gr_list()
-            await V.safe_edit(q, text, kb)
-            return
-
-        if action == "gr_start_all":
-            for g in await DB.get_groups():
-                await DB.update_group(int(g["chat_id"]), running=True)
-            await q.answer("▶️ STARTED ALL")
-            text, kb = await V.view_gr_list()
-            await V.safe_edit(q, text, kb)
-            return
-
-        if action == "gr_stop_all":
-            for g in await DB.get_groups():
-                await DB.update_group(int(g["chat_id"]), running=False)
-            await q.answer("⏹ STOPPED ALL")
-            text, kb = await V.view_gr_list()
-            await V.safe_edit(q, text, kb)
-            return
 
         # ═══════════════════════════════════════════════════
         # USERS
@@ -695,9 +643,8 @@ async def ott_router(client: Client, q: CallbackQuery):
             return await q.answer()
 
         if action == "us_lang_all":
-            from plugins.ott.config import PRIMARY_LANGS
-            await DB.update_users(
-                languages=[c for c, _ in PRIMARY_LANGS], last_sent_key="")
+            await DB.update_users(languages=list(LANG_CODES),
+                                    last_sent_key="")
             text, kb = await V.view_kind_langs("us")
             await V.safe_edit(q, text, kb)
             return await q.answer("✅")
@@ -725,11 +672,11 @@ async def ott_router(client: Client, q: CallbackQuery):
             if mode == "off":
                 text, kb = await V.view_users()
             elif mode == "daily":
-                text, kb = await V.view_kind_freq_hours("us", "daily")
+                text, kb = await V.view_kind_hours("us", "daily")
             elif mode == "weekly":
-                text, kb = await V.view_kind_freq_days("us")
+                text, kb = await V.view_kind_days("us")
             else:
-                text, kb = await V.view_kind_freq_month_days("us")
+                text, kb = await V.view_kind_month_days("us")
             await V.safe_edit(q, text, kb)
             return
 
@@ -757,7 +704,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             freq["day_of_week"] = d
             await DB.update_users(frequency=freq, last_sent_key="")
             await q.answer("✅")
-            text, kb = await V.view_kind_freq_hours("us", "weekly")
+            text, kb = await V.view_kind_hours("us", "weekly")
             await V.safe_edit(q, text, kb)
             return
 
@@ -771,18 +718,14 @@ async def ott_router(client: Client, q: CallbackQuery):
             freq["day_of_month"] = d
             await DB.update_users(frequency=freq, last_sent_key="")
             await q.answer("✅")
-            text, kb = await V.view_kind_freq_hours("us", "monthly")
+            text, kb = await V.view_kind_hours("us", "monthly")
             await V.safe_edit(q, text, kb)
             return
 
         if action == "us_prev":
             cfg = await DB.get_users()
-            text, _ = await V.view_preview(cfg.get("languages") or [])
-            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ BACK",
-                    callback_data="ott:us"),
-            ]])
+            text, kb = await V.view_preview(
+                cfg.get("languages") or [], back_cb="ott:us")
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -823,9 +766,8 @@ async def ott_router(client: Client, q: CallbackQuery):
             return await q.answer()
 
         if action == "pm_lang_all":
-            from plugins.ott.config import PRIMARY_LANGS
-            await DB.update_premium(
-                languages=[c for c, _ in PRIMARY_LANGS], last_sent_key="")
+            await DB.update_premium(languages=list(LANG_CODES),
+                                     last_sent_key="")
             text, kb = await V.view_kind_langs("pm")
             await V.safe_edit(q, text, kb)
             return await q.answer("✅")
@@ -853,11 +795,11 @@ async def ott_router(client: Client, q: CallbackQuery):
             if mode == "off":
                 text, kb = await V.view_premium()
             elif mode == "daily":
-                text, kb = await V.view_kind_freq_hours("pm", "daily")
+                text, kb = await V.view_kind_hours("pm", "daily")
             elif mode == "weekly":
-                text, kb = await V.view_kind_freq_days("pm")
+                text, kb = await V.view_kind_days("pm")
             else:
-                text, kb = await V.view_kind_freq_month_days("pm")
+                text, kb = await V.view_kind_month_days("pm")
             await V.safe_edit(q, text, kb)
             return
 
@@ -885,7 +827,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             freq["day_of_week"] = d
             await DB.update_premium(frequency=freq, last_sent_key="")
             await q.answer("✅")
-            text, kb = await V.view_kind_freq_hours("pm", "weekly")
+            text, kb = await V.view_kind_hours("pm", "weekly")
             await V.safe_edit(q, text, kb)
             return
 
@@ -899,18 +841,14 @@ async def ott_router(client: Client, q: CallbackQuery):
             freq["day_of_month"] = d
             await DB.update_premium(frequency=freq, last_sent_key="")
             await q.answer("✅")
-            text, kb = await V.view_kind_freq_hours("pm", "monthly")
+            text, kb = await V.view_kind_hours("pm", "monthly")
             await V.safe_edit(q, text, kb)
             return
 
         if action == "pm_prev":
             cfg = await DB.get_premium()
-            text, _ = await V.view_preview(cfg.get("languages") or [])
-            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ BACK",
-                    callback_data="ott:pm"),
-            ]])
+            text, kb = await V.view_preview(
+                cfg.get("languages") or [], back_cb="ott:pm")
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -925,7 +863,7 @@ async def ott_router(client: Client, q: CallbackQuery):
 
 
 # ═══════════════════════════════════════════════════════════
-# TEXT INPUT (add channel / add group)
+# TEXT INPUT (add channel / group)
 # ═══════════════════════════════════════════════════════════
 
 @Client.on_message(
@@ -940,7 +878,6 @@ async def ott_text_input(client: Client, message):
         return
 
     text = (message.text or "").strip()
-
     try:
         message.stop_propagation()
     except Exception:
@@ -951,12 +888,11 @@ async def ott_text_input(client: Client, message):
         return await message.reply_text("❌ Cancelled")
 
     kind = sess["kind"]
-
     if kind not in ("add_channel", "add_group"):
         _sess_drop(message.from_user.id)
         return
 
-    # Resolve chat
+    # Resolve
     try:
         if text.startswith("@"):
             chat = await client.get_chat(text)
@@ -992,7 +928,15 @@ async def ott_text_input(client: Client, message):
         return await message.reply_text(f"❌ Check failed: {e}")
 
     if kind == "add_channel":
-        await DB.add_channel(cid, title)
+        # Save to broadcast module's DB
+        try:
+            from plugins.broadcast import database as BDB
+            await BDB.save_channel(int(cid), title)
+        except Exception as e:
+            return await message.reply_text(f"❌ DB save failed: {e}")
+        # Auto-enable in OTT
+        if not await DB.is_channel_enabled(cid):
+            await DB.toggle_channel(cid)
         _sess_drop(message.from_user.id)
         text_out, kb = await V.view_channel(cid)
         await message.reply_text(
@@ -1003,7 +947,13 @@ async def ott_text_input(client: Client, message):
         return
 
     if kind == "add_group":
-        await DB.add_group(cid, title)
+        try:
+            from plugins.broadcast import database as BDB
+            await BDB.save_group_manual(int(cid), title)
+        except Exception as e:
+            return await message.reply_text(f"❌ DB save failed: {e}")
+        if not await DB.is_group_enabled(cid):
+            await DB.toggle_group(cid)
         _sess_drop(message.from_user.id)
         text_out, kb = await V.view_group(cid)
         await message.reply_text(
