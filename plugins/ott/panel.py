@@ -7,9 +7,7 @@ import logging
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
-from pyrogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-)
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from plugins.broadcast.config import fb, sc, DIV, _is_admin
 from plugins.ott import database as DB
@@ -24,25 +22,18 @@ logger = logging.getLogger(__name__)
 PFX = PREFIX
 
 
-# ═══════════════════════════════════════════════════════════
-# /admin ENTRY
-# ═══════════════════════════════════════════════════════════
-
 async def open_panel_for_admin(client: Client, q: CallbackQuery) -> None:
     if not q.from_user or not _is_admin(q.from_user.id):
         return await q.answer("⛔ admins only", show_alert=True)
-
     try:
         await DB.ensure_indexes()
         W.ensure_loops(client)
     except Exception:
         pass
-
     try:
         text, kb = await V.view_home()
         await client.send_message(
-            chat_id=q.from_user.id,
-            text=text, reply_markup=kb,
+            chat_id=q.from_user.id, text=text, reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -55,29 +46,103 @@ async def open_panel_for_admin(client: Client, q: CallbackQuery) -> None:
             pass
 
 
-# ═══════════════════════════════════════════════════════════
-# MAIN ROUTER
-# ═══════════════════════════════════════════════════════════
-
 @Client.on_callback_query(filters.regex(rf"^{PFX}:"), group=-499)
 async def ott_router(client: Client, q: CallbackQuery):
-    if not q.from_user or not _is_admin(q.from_user.id):
-        return await q.answer("⛔", show_alert=True)
-
+    # Admins + end-users both hit this router.
     data = str(q.data)
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
     args = parts[2:]
 
+    is_admin = bool(q.from_user and _is_admin(q.from_user.id))
+
     try:
-        # ── CLOSE ──
+        # ═══════════════════════════════════════════════════
+        # PUBLIC (any user)
+        # ═══════════════════════════════════════════════════
+
         if action == "close":
-            ST.clear_session(q.from_user.id)
+            if is_admin:
+                ST.clear_session(q.from_user.id)
             try:
                 await q.message.delete()
             except Exception:
                 pass
             return await q.answer("Closed")
+
+        if action == "sub":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            uid = q.from_user.id
+            # Check if event ended
+            if await DB.is_movie_ended(tmdb_id):
+                return await q.answer(
+                    "💥 This event has ended.", show_alert=True)
+            if await DB.sub_exists(uid, tmdb_id):
+                await DB.sub_remove(uid, tmdb_id)
+                return await q.answer("🔕 Unsubscribed")
+            movie = await DB.get_movie(tmdb_id) or {}
+            title = movie.get("title") or "?"
+            year = (movie.get("release_date") or "")[:4]
+            rel = movie.get("release_date") or ""
+            await DB.sub_add(uid, tmdb_id, title, year, rel)
+            return await q.answer(
+                f"✅ You will be notified when '{title}' is uploaded")
+
+        if action == "wl_add":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            movie = await DB.get_movie(tmdb_id) or {}
+            c = DB.prefs_coll()
+            if c is not None:
+                try:
+                    import time as _t
+                    await c.update_one(
+                        {"user_id": int(q.from_user.id)},
+                        {"$addToSet": {"watchlist": {
+                            "tmdb_id": int(tmdb_id),
+                            "title": movie.get("title") or "?",
+                            "added_at": _t.time(),
+                        }}},
+                        upsert=True,
+                    )
+                except Exception:
+                    pass
+            return await q.answer("🎁 Added to watchlist")
+
+        if action == "getfile":
+            return await q.answer(
+                "📥 Search in the group to get the file",
+                show_alert=True)
+
+        if action == "share":
+            return await q.answer("📤 Share this post", show_alert=True)
+
+        if action == "stats_pub":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            stats = await DB.movie_stats(tmdb_id)
+            movie = await DB.get_movie(tmdb_id) or {}
+            title = (movie.get("title") or "?")[:40]
+            await q.answer(
+                f"🎬 {title}\n"
+                f"🔔 {stats['total_subs']} subscribed\n"
+                f"✅ {stats['notified']} notified\n"
+                f"⏳ {stats['pending']} pending",
+                show_alert=True)
+            return
+
+        # ═══════════════════════════════════════════════════
+        # ADMIN ONLY BELOW
+        # ═══════════════════════════════════════════════════
+        if not is_admin:
+            return await q.answer("⛔ admins only", show_alert=True)
 
         # ── HOME ──
         if action == "home":
@@ -85,49 +150,31 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
+        # ── LANGUAGE MENU ──
+        if action == "lang":
+            lang = args[0] if args else "all"
+            await q.answer("🎬 Loading…")
+            text, kb = await V.view_lang(lang)
+            await V.safe_edit(q, text, kb)
+            return
+
         # ── DASHBOARD ──
         if action == "dash":
-            text, kb = await V.view_dashboard()
-            await V.safe_edit(q, text, kb)
-            return await q.answer()
-
-        # ── WEEK ──
-        if action == "week":
-            text, kb = await V.view_week()
-            await V.safe_edit(q, text, kb)
-            return await q.answer()
-
-        if action == "day":
-            try:
-                idx = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            text, kb = await V.view_day(idx)
-            await V.safe_edit(q, text, kb)
-            return await q.answer()
-
-        # ── MOVIE CARD ──
-        if action == "mv":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            text, kb, poster = await V.view_movie(tmdb_id, "ott:week")
-            if poster:
-                try:
-                    await q.message.delete()
-                except Exception:
-                    pass
-                try:
-                    await client.send_photo(
-                        chat_id=q.message.chat.id,
-                        photo=poster, caption=text,
-                        reply_markup=kb,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return await q.answer()
-                except Exception:
-                    pass
+            text = "\n".join([
+                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                f"📊 <b>{fb('OTT DASHBOARD')}</b>",
+                DIV, "",
+                f"🔔 {sc('pending subs')} · <b>{await DB.pending_subs_total()}</b>",
+                f"📢 {sc('broadcasts 7d')} · <b>{await DB.broadcast_recent_count(7)}</b>",
+                f"📨 {sc('sent 7d')} · <b>{await DB.sent_count_last(7)}</b>",
+                f"🎬 {sc('cache')} · <b>{await DB.cache_count()}</b>",
+            ])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🔄 Refresh", callback_data="ott:dash")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="ott:home"),
+                 InlineKeyboardButton("❌ Close", callback_data="ott:close")],
+            ])
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -146,16 +193,45 @@ async def ott_router(client: Client, q: CallbackQuery):
                 await DB.save_week(DB.week_key(), days, posted=True)
             except Exception as e:
                 logger.exception(f"[OTT] refetch: {e}")
-            text, kb = await V.view_week()
+            text, kb = await V.view_home()
             await V.safe_edit(q, text, kb)
             return
 
-        # ── BROADCAST CENTER ──
-        if action == "bc":
-            text, kb = await V.view_bc_center()
+        # ── TRENDING ──
+        if action == "trending":
+            await q.answer("🔥 Loading…")
+            text, kb = await V.view_lang("all")
+            await V.safe_edit(q, text, kb)
+            return
+
+        # ── MOVIE ──
+        if action == "mv":
+            try:
+                tmdb_id = int(args[0])
+                back = args[1] if len(args) > 1 else None
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            back_cb = f"ott:lang:{back}" if back else "ott:home"
+            text, kb, poster = await V.view_movie(tmdb_id, back_cb)
+            if poster:
+                try:
+                    await q.message.delete()
+                except Exception:
+                    pass
+                try:
+                    await client.send_photo(
+                        chat_id=q.message.chat.id,
+                        photo=poster, caption=text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return await q.answer()
+                except Exception:
+                    pass
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
+        # ── BROADCAST SETUP ──
         if action == "bc_mv":
             try:
                 tmdb_id = int(args[0])
@@ -164,12 +240,15 @@ async def ott_router(client: Client, q: CallbackQuery):
             ch = await EG.get_ott_channel()
             if not ch:
                 return await q.answer(
-                    "⚠️ Set the OTT broadcast channel in Settings first",
+                    "⚠️ Set OTT channel first (Settings → 📢 OTT Channel)",
                     show_alert=True)
             ST.setup_new(q.from_user.id, tmdb_id, ch)
             s = ST.setup_get(q.from_user.id)
+            if s is not None:
+                s["show_file"] = True
             text, kb = await V.view_bc_setup(
-                tmdb_id, ch, s["notify"], s["auto_delete_hours"])
+                tmdb_id, ch, s["notify"], s["auto_delete_hours"],
+                s.get("show_file", True))
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -183,9 +262,10 @@ async def ott_router(client: Client, q: CallbackQuery):
                 ch = await EG.get_ott_channel()
                 ST.setup_new(q.from_user.id, tmdb_id, ch)
                 s = ST.setup_get(q.from_user.id)
+                s["show_file"] = True
             text, kb = await V.view_bc_setup(
                 tmdb_id, s["channel_id"], s["notify"],
-                s["auto_delete_hours"])
+                s["auto_delete_hours"], s.get("show_file", True))
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -196,9 +276,20 @@ async def ott_router(client: Client, q: CallbackQuery):
             s["notify"] = not s["notify"]
             text, kb = await V.view_bc_setup(
                 s["tmdb_id"], s["channel_id"], s["notify"],
-                s["auto_delete_hours"])
+                s["auto_delete_hours"], s.get("show_file", True))
             await V.safe_edit(q, text, kb)
             return await q.answer("🟢 on" if s["notify"] else "🔴 off")
+
+        if action == "bcsetup_tog_file":
+            s = ST.setup_get(q.from_user.id)
+            if not s:
+                return await q.answer("⏱️ expired", show_alert=True)
+            s["show_file"] = not s.get("show_file", True)
+            text, kb = await V.view_bc_setup(
+                s["tmdb_id"], s["channel_id"], s["notify"],
+                s["auto_delete_hours"], s["show_file"])
+            await V.safe_edit(q, text, kb)
+            return await q.answer("🟢 on" if s["show_file"] else "🔴 off")
 
         if action == "bcsetup_timer":
             s = ST.setup_get(q.from_user.id)
@@ -220,7 +311,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             s["auto_delete_hours"] = h
             text, kb = await V.view_bc_setup(
                 s["tmdb_id"], s["channel_id"], s["notify"],
-                s["auto_delete_hours"])
+                s["auto_delete_hours"], s.get("show_file", True))
             await V.safe_edit(q, text, kb)
             return await q.answer("✅" if h else "♾️")
 
@@ -230,10 +321,81 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("⏱️ expired", show_alert=True)
             return await EG.send_channel_broadcast(client, q, s)
 
-        if action == "bc_hist":
-            text, kb = await V.view_bc_history()
+        # ── STATS ──
+        if action == "stats":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await V.view_stats(tmdb_id)
             await V.safe_edit(q, text, kb)
             return await q.answer()
+
+        # ── END EVENT ──
+        if action == "end_mv":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            tok = ST.new_confirm("end_movie", tmdb_id=tmdb_id)
+            text, kb = await V.view_end_confirm(tmdb_id, tok)
+            await V.safe_edit(q, text, kb)
+            return await q.answer("⚠️")
+
+        if action == "end_do":
+            try:
+                tmdb_id = int(args[0])
+                tok = args[1]
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            c = ST.get_confirm(tok)
+            if not c or c.get("kind") != "end_movie":
+                return await q.answer("⏱️ expired", show_alert=True)
+            ST.drop_confirm(tok)
+
+            res = await DB.end_movie(tmdb_id)
+            await q.answer(f"💥 {res['deleted']} tokens deleted")
+
+            movie = await DB.get_movie(tmdb_id) or {}
+            title = (movie.get("title") or "?")[:50]
+            text = "\n".join([
+                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+                f"💥 <b>{fb('EVENT ENDED')}</b>",
+                DIV, "",
+                f"🎬 <b>{sc(title)}</b>",
+                "", DIV2,
+                f"🗑️ {sc('pending tokens deleted')} · <b>{res['deleted']}</b>",
+                f"🏷️ {sc('broadcasts ended')} · <b>{res['broadcasts_cancelled']}</b>",
+                "", DIV2,
+                f"📌 {sc('new Notify taps will be refused')}",
+                f"📌 {sc('already-notified users are unaffected')}",
+            ])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "📊 Statistics",
+                    callback_data=f"ott:stats:{tmdb_id}")],
+                [InlineKeyboardButton("🏠 Home",
+                                      callback_data="ott:home"),
+                 InlineKeyboardButton("❌ Close",
+                                      callback_data="ott:close")],
+            ])
+            await V.safe_edit(q, text, kb)
+            return
+
+        # ── NOTIFY NOW ──
+        if action == "notify_go":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            await q.answer("📤 Notifying…")
+            try:
+                await W._notify_subscribers(client, tmdb_id)
+            except Exception as e:
+                logger.exception(f"[OTT] notify_go: {e}")
+            text, kb = await V.view_stats(tmdb_id)
+            await V.safe_edit(q, text, kb)
+            return
 
         # ── SUBSCRIBERS ──
         if action == "subs":
@@ -250,100 +412,18 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
-        if action == "notify_go":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            await q.answer("📤 Notifying…")
-            try:
-                await W._notify_subscribers(client, tmdb_id)
-            except Exception as e:
-                logger.exception(f"[OTT] notify_go: {e}")
-            text, kb = await V.view_subs_movie(tmdb_id)
+        # ── BROADCASTS ──
+        if action == "bc":
+            text, kb = await V.view_bc_center()
             await V.safe_edit(q, text, kb)
-            return
+            return await q.answer()
 
-        if action == "cancel_mv":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            tok = ST.new_confirm("cancel_movie", tmdb_id=tmdb_id)
-            text, kb = await V.view_cancel_confirm(tmdb_id, tok)
+        if action == "bc_hist":
+            text, kb = await V.view_bc_history()
             await V.safe_edit(q, text, kb)
-            return await q.answer("⚠️")
+            return await q.answer()
 
-        if action == "cancel_subs":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            tok = ST.new_confirm("cancel_movie", tmdb_id=tmdb_id)
-            text, kb = await V.view_cancel_confirm(tmdb_id, tok)
-            await V.safe_edit(q, text, kb)
-            return await q.answer("⚠️")
-
-        if action == "cancel_do":
-            try:
-                tmdb_id = int(args[0])
-                tok = args[1]
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            c = ST.get_confirm(tok)
-            if not c or c.get("kind") != "cancel_movie":
-                return await q.answer("⏱️ expired", show_alert=True)
-            ST.drop_confirm(tok)
-
-            n = await DB.cancel_all_subs(tmdb_id)
-            await DB.broadcast_mark_cancelled(tmdb_id)
-            await q.answer(f"💥 {n} tokens deleted", show_alert=False)
-
-            movie = await DB.get_movie(tmdb_id) or {}
-            title = (movie.get("title") or "?")[:50]
-            text = "\n".join([
-                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"💥 <b>{fb('CANCELLED')}</b>",
-                DIV, "",
-                f"🎬 <b>{sc(title)}</b>",
-                "", DIV2,
-                f"🗑️ {sc('pending subs deleted')} · <b>{n}</b>",
-                f"🏷️ {sc('broadcast flagged')}",
-                "", f"📌 {sc('channel post NOT touched')}",
-            ])
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data=f"ott:subs_mv:{tmdb_id}")],
-                [InlineKeyboardButton(
-                    "❌ Close", callback_data="ott:close")],
-            ])
-            await V.safe_edit(q, text, kb)
-            return
-
-        if action == "enrich":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            await q.answer("🔄 Re-enriching…")
-            try:
-                from plugins.ott.tmdb import enrich_movie, fetch_details
-                raw = await DB.get_movie(tmdb_id)
-                if raw:
-                    details = await fetch_details(tmdb_id)
-                    if details:
-                        raw["overview"] = ""
-                        fresh = await enrich_movie(raw)
-                        if fresh:
-                            await DB.save_movie(fresh)
-            except Exception as e:
-                logger.exception(f"[OTT] enrich: {e}")
-            text, kb, poster = await V.view_movie(tmdb_id, "ott:week")
-            await V.safe_edit(q, text, kb)
-            return
-
-        # ── NOTIFICATIONS ──
+        # ── NOTIFICATIONS / CACHE ──
         if action == "notif":
             text, kb = await V.view_notif()
             await V.safe_edit(q, text, kb)
@@ -356,7 +436,6 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return
 
-        # ── CACHE ──
         if action == "cache":
             text, kb = await V.view_cache()
             await V.safe_edit(q, text, kb)
@@ -364,7 +443,7 @@ async def ott_router(client: Client, q: CallbackQuery):
 
         if action == "cache_clear":
             n = await DB.cache_clear()
-            await q.answer(f"🧹 Cleared {n} cached movies")
+            await q.answer(f"🧹 Cleared {n}")
             text, kb = await V.view_cache()
             await V.safe_edit(q, text, kb)
             return
@@ -437,8 +516,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                 f"📢 <b>{fb('SET OTT BROADCAST CHANNEL')}</b>",
                 DIV, "",
                 f"📝 {sc('send a chat id or @username')}",
-                f"📌 {sc('this is where movie announcements go')}",
-                f"📌 {sc('users will tap Notify from there')}",
+                f"📌 {sc('all OTT movie posts go here')}",
                 "", f"📌 {sc('send')} <code>-</code> {sc('to cancel')}",
             ])
             kb = InlineKeyboardMarkup([[
@@ -490,74 +568,15 @@ async def ott_router(client: Client, q: CallbackQuery):
             field = field_map.get(key, key)
             cur = bool(cfg.get(field))
             await DB.save_cfg(**{field: not cur})
-            await q.answer(f"🟢 on" if not cur else f"🔴 off")
+            await q.answer("🟢 on" if not cur else "🔴 off")
             text, kb = await V.view_settings()
             await V.safe_edit(q, text, kb)
             return
 
-        # ── DIAGNOSTICS ──
         if action == "diag":
             text, kb = await V.view_diag()
             await V.safe_edit(q, text, kb)
             return await q.answer()
-
-        # ── USER SIDE ──
-        if action == "sub":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            uid = q.from_user.id
-            if await DB.sub_exists(uid, tmdb_id):
-                await DB.sub_remove(uid, tmdb_id)
-                return await q.answer("🔕 Unsubscribed")
-            movie = await DB.get_movie(tmdb_id) or {}
-            title = movie.get("title") or "?"
-            year = (movie.get("release_date") or "")[:4]
-            rel = movie.get("release_date") or ""
-            await DB.sub_add(uid, tmdb_id, title, year, rel)
-            return await q.answer(
-                f"✅ You will be notified when '{title}' is uploaded")
-
-        if action == "wl_add":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            movie = await DB.get_movie(tmdb_id) or {}
-            c = DB.prefs_coll()
-            if c is not None:
-                try:
-                    import time as _t
-                    await c.update_one(
-                        {"user_id": int(q.from_user.id)},
-                        {"$addToSet": {"watchlist": {
-                            "tmdb_id": int(tmdb_id),
-                            "title": movie.get("title") or "?",
-                            "added_at": _t.time(),
-                        }}},
-                        upsert=True,
-                    )
-                except Exception:
-                    pass
-            return await q.answer("🎁 Added to watchlist")
-
-        if action == "getfile":
-            return await q.answer(
-                "📥 Search in the group to get the file",
-                show_alert=True)
-
-        if action == "share":
-            try:
-                tmdb_id = int(args[0])
-            except (ValueError, IndexError):
-                return await q.answer("❌")
-            movie = await DB.get_movie(tmdb_id) or {}
-            title = movie.get("title") or "?"
-            await q.answer(
-                f"📤 Share: {title}",
-                show_alert=True)
-            return
 
         return await q.answer("❓ Unknown")
 
