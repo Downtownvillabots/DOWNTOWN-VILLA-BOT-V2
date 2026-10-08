@@ -129,20 +129,29 @@ async def view_movie(tmdb_id: int, back_cb: str = "ott:home"
     overview = (movie.get("overview") or "")[:400]
     provider = movie.get("provider") or "—"
     lang = (movie.get("original_language") or "").upper()
+    release_date = movie.get("release_date") or "—"
+
+    rr = movie.get("region_release") or {}
+    rel_date = rr.get("date") or release_date
+    rel_type = rr.get("type") or "—"
+    cert = rr.get("certification") or ""
     ended = stats.get("ended")
 
     lines = [
         f"🎬 <b>{sc(str(title)[:60])}</b> ({year})",
         DIV, "",
+        # ── DATE + PLATFORM block (the important one) ──
+        f"📅 <b>{sc('RELEASES')}</b> · <code>{rel_date}</code>",
+        f"📺 <b>{sc('PLATFORM')}</b> · <b>{sc(provider)}</b>",
+        f"🏷️ {sc('type')} · <code>{rel_type}</code>"
+        + (f" · 🔒 <code>{cert}</code>" if cert else ""),
+        f"🌐 {sc('language')} · <code>{lang or '—'}</code>",
+        "",
+        DIV2,
         f"⭐ {sc('rating')} · <code>{rating:.1f}/10</code> "
         f"(<code>{_fmt_int(votes)}</code>)",
         f"🎭 {sc('genres')} · <code>{sc(genres)}</code>",
         f"⏱️ {sc('runtime')} · <code>{runtime} min</code>",
-        f"🌐 {sc('lang')} · <code>{lang or '—'}</code>",
-        f"📺 {sc('streaming')} · <b>{sc(provider)}</b>",
-        "", DIV2,
-        f"📅 {sc('release')} · "
-        f"<code>{(movie.get('region_release') or {}).get('date') or movie.get('release_date') or '—'}</code>",
         "", DIV2,
         f"🔔 {sc('subscribers')} · <b>{stats['total_subs']}</b>",
         f"✅ {sc('notified')} · <b>{stats['notified']}</b>",
@@ -158,7 +167,6 @@ async def view_movie(tmdb_id: int, back_cb: str = "ott:home"
     is_bc = bool(stats.get("broadcast"))
     kb = KB.kb_movie(tmdb_id, stats["total_subs"], is_bc, back_cb)
     return "\n".join(lines)[:4000], kb, poster
-
 
 # ═══════════════════════════════════════════════════════════
 # BROADCAST SETUP
