@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from plugins.ott.config import DEFAULT_SETTINGS
 
 logger = logging.getLogger(__name__)
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
 SUB_TTL_DAYS = 60
@@ -125,7 +126,7 @@ async def get_week(wk: str) -> Optional[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════
-# MOVIES CACHE
+# MOVIE CACHE
 # ═══════════════════════════════════════════════════════════
 
 async def save_movie(movie: Dict[str, Any]) -> None:
@@ -282,7 +283,6 @@ async def mark_subs_notified(tmdb_id) -> None:
 
 
 async def cancel_all_subs(tmdb_id) -> int:
-    """Delete every pending subscription for this movie. Returns count."""
     c = subs_coll()
     if c is None:
         return 0
