@@ -1,25 +1,36 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT ENGINE
+# 🏨 DOWNTOWN VILLA — OTT ENGINE (broadcast + targets)
 # ============================================================
 
 from __future__ import annotations
+import asyncio
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from pyrogram import Client
 from pyrogram.enums import ParseMode
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.errors import (
+    FloodWait, UserIsBlocked, InputUserDeactivated,
+    ChatWriteForbidden, ChatAdminRequired, ChannelPrivate,
+    PeerIdInvalid, UserNotParticipant, UserDeactivated,
+    UserDeactivatedBan, MessageNotModified,
+)
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from plugins.broadcast.config import (
     fb, sc, _fmt_int, _fmt_duration, DIV, DIV2,
+    DEFAULT_DELAY, BROADCAST_CONCURRENCY, BROADCAST_BATCH_SIZE,
 )
 from plugins.ott import database as DB
-from plugins.ott import state as ST
 from plugins.ott import keyboards as KB
 from plugins.ott.tmdb import poster_url
 
 logger = logging.getLogger(__name__)
 
+
+# ═══════════════════════════════════════════════════════════
+# RESOLVE ADMIN CHANNEL
+# ═══════════════════════════════════════════════════════════
 
 async def get_ott_channel() -> int:
     cfg = await DB.get_cfg()
@@ -35,6 +46,10 @@ async def get_ott_channel() -> int:
     return 0
 
 
+# ═══════════════════════════════════════════════════════════
+# CAPTION BUILDER
+# ═══════════════════════════════════════════════════════════
+
 def build_caption(movie: Dict[str, Any]) -> str:
     title = movie.get("title") or "?"
     year = (movie.get("release_date") or "")[:4]
@@ -43,11 +58,12 @@ def build_caption(movie: Dict[str, Any]) -> str:
     lang = (movie.get("original_language") or "").upper()
     genres = (movie.get("genres") or "—")[:70]
     overview = (movie.get("overview") or "")[:280]
-    rel = movie.get("release_date") or "—"
+    rel = (movie.get("region_release") or {}).get("date") \
+        or movie.get("release_date") or "—"
     provider = movie.get("provider") or "—"
 
     lines = [
-        f"🎬 <b>{fb('NOW STREAMING')}</b>",
+        f"🎬 <b>{fb('COMING SOON')}</b>",
         DIV, "",
         f"🎥 <b>{sc(str(title)[:60])}</b> ({year})",
         f"⭐ <code>{rating:.1f}/10</code> "
@@ -61,138 +77,196 @@ def build_caption(movie: Dict[str, Any]) -> str:
     lines += [
         "",
         DIV2,
-        f"🔔 {sc('tap below to get notified when file is uploaded')}",
-        f"📥 {sc('or tap Get File if already available')}",
+        f"🔔 {sc('tap Get Notified to be DM-ed when the file lands')}",
     ]
     return "\n".join(lines)
 
 
-async def send_channel_broadcast(
-    client: Client,
-    q: CallbackQuery,
-    setup: Dict[str, Any],
-) -> None:
-    tmdb_id = setup.get("tmdb_id")
-    ch = int(setup.get("channel_id") or 0)
-    if not ch:
-        return await q.answer("⚠️ no OTT channel set", show_alert=True)
+# ═══════════════════════════════════════════════════════════
+# SINGLE-CHANNEL POST (used by POST NOW in channel_flow)
+# ═══════════════════════════════════════════════════════════
 
+async def post_to_single_channel(client: Client, tmdb_id: int,
+                                    chat_id: int,
+                                    notify: bool = True,
+                                    show_file: bool = True
+                                    ) -> int:
+    """Post live post to a single channel. Returns message id or 0."""
     movie = await DB.get_movie(tmdb_id)
     if not movie:
-        return await q.answer("⚠️ movie missing", show_alert=True)
+        return 0
 
-    notify = bool(setup.get("notify", True))
-    show_file = bool(setup.get("show_file", True))
-    hours = int(setup.get("auto_delete_hours", 0))
-    ttl = hours * 3600 if hours > 0 else 0
+    from plugins.ott.tmdb import enrich_movie
+    movie = await enrich_movie(movie)
 
     caption = build_caption(movie)
-    kb = KB.kb_channel_post(tmdb_id, notify=notify, show_file=show_file)
+    kb = KB.kb_live(tmdb_id, notify, show_file, is_admin_view=False)
     poster = poster_url(movie.get("poster_path"), "w500")
 
-    await q.answer("📤 Sending…")
-    try:
-        await q.message.edit_text(
-            "\n".join([
-                f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-                f"📤 <b>{fb('POSTING TO CHANNEL…')}</b>",
-                DIV, "",
-                f"🎬 <code>{(movie.get('title') or '?')[:50]}</code>",
-                f"📢 <code>{ch}</code>",
-            ]),
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        pass
-
-    sent = None
     try:
         if poster:
             try:
-                sent = await client.send_photo(
-                    chat_id=ch, photo=poster, caption=caption,
+                m = await client.send_photo(
+                    chat_id=chat_id, photo=poster, caption=caption,
                     reply_markup=kb, parse_mode=ParseMode.HTML,
                 )
+                return m.id
             except Exception:
                 pass
-        if sent is None:
-            sent = await client.send_message(
-                chat_id=ch, text=caption, reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-    except Exception as e:
-        logger.exception(f"[OTT-ENGINE] send: {e}")
-        try:
-            await q.message.edit_text(
-                f"❌ <b>{fb('FAILED')}</b>\n{DIV}\n"
-                f"<code>{type(e).__name__}: {str(e)[:120]}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        return
-
-    if ttl > 0 and sent:
-        try:
-            await DB.pending_add(ch, sent.id, ttl)
-        except Exception:
-            pass
-
-    try:
-        await DB.broadcast_log(
-            tmdb_id=tmdb_id, target="ott_channel",
-            delivered=1, failed=0, total=1,
-            admin_id=q.from_user.id,
-            channel_msg_id=sent.id if sent else 0,
-        )
-    except Exception:
-        pass
-
-    movie_title = (movie.get("title") or "?")[:50]
-    ttl_line = (f"🗑️ {sc('auto-delete')} · {_fmt_duration(ttl)}"
-                if ttl else f"🗑️ {sc('auto-delete')} · ♾️ off")
-
-    text = "\n".join([
-        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
-        f"✅ <b>{fb('POSTED TO CHANNEL')}</b>",
-        DIV, "",
-        f"🎬 <b>{sc(movie_title)}</b>",
-        f"📢 <code>{ch}</code>",
-        f"🔔 {sc('notify')} · {'🟢' if notify else '🔴'} · "
-        f"📥 {sc('file')} · {'🟢' if show_file else '🔴'}",
-        ttl_line,
-        "", DIV2,
-        f"📌 {sc('users who tap Notify are saved')}",
-    ])
-    kb2 = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"📊 {sc('Statistics')}",
-            callback_data=f"ott:stats:{tmdb_id}")],
-        [InlineKeyboardButton(
-            f"👥 {sc('Subscribers')}",
-            callback_data=f"ott:subs_mv:{tmdb_id}")],
-        [InlineKeyboardButton(
-            f"📢 {sc('Broadcast center')}",
-            callback_data="ott:bc")],
-        [InlineKeyboardButton(
-            f"❌ {sc('Close')}",
-            callback_data="ott:close")],
-    ])
-    try:
-        await q.message.edit_text(
-            text, reply_markup=kb2,
+        m = await client.send_message(
+            chat_id=chat_id, text=caption, reply_markup=kb,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        return m.id
+    except Exception as e:
+        logger.debug(f"[OTT-ENGINE] post_to_channel {chat_id}: {e}")
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════
+# SEND TO TARGETS (channels / groups / users / premium)
+# ═══════════════════════════════════════════════════════════
+
+async def send_to_targets(
+    client: Client,
+    tmdb_id: int,
+    notify: bool,
+    show_file: bool,
+    kind: str,
+    target_id: int = 0,
+    admin_id: int = 0,
+) -> Tuple[int, int, int]:
+    """
+    Returns (delivered, failed, total).
+    kind: ch | chall | gr | us | pm
+    """
+    movie = await DB.get_movie(tmdb_id)
+    if not movie:
+        return 0, 0, 0
+    from plugins.ott.tmdb import enrich_movie
+    movie = await enrich_movie(movie)
+
+    caption = build_caption(movie)
+    kb = KB.kb_live(tmdb_id, notify, show_file, is_admin_view=False)
+    poster = poster_url(movie.get("poster_path"), "w500")
+
+    # Resolve targets
+    targets: List[int] = []
+    if kind == "ch":
+        targets = [int(target_id)]
+    elif kind == "chall":
+        try:
+            from plugins.broadcast import database as BDB
+            chans = await BDB.get_saved_channels()
+            targets = [int(c["chat_id"]) for c in chans
+                       if c.get("enabled", True)]
+        except Exception:
+            pass
+    elif kind == "gr":
+        try:
+            from plugins.broadcast import database as BDB
+            targets = await BDB.get_all_groups()
+        except Exception:
+            pass
+    elif kind == "us":
+        try:
+            from plugins.broadcast import database as BDB
+            targets = await BDB.get_all_users()
+        except Exception:
+            pass
+    elif kind == "pm":
+        try:
+            from plugins.premium import state as PS
+            users = await PS.list_users(limit=50000)
+            targets = [int(u["user_id"]) for u in users if u.get("user_id")]
+        except Exception:
+            pass
+
+    targets = [t for t in targets if t]
+    if not targets:
+        return 0, 0, 0
+
+    total = len(targets)
+    sent = failed = 0
+    sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    lock = asyncio.Lock()
+
+    async def _one(tid: int) -> str:
+        async with sem:
+            try:
+                m = None
+                if poster:
+                    try:
+                        m = await client.send_photo(
+                            chat_id=tid, photo=poster,
+                            caption=caption, reply_markup=kb,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                if m is None:
+                    m = await client.send_message(
+                        chat_id=tid, text=caption, reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                await asyncio.sleep(DEFAULT_DELAY)
+                return "sent"
+            except FloodWait as e:
+                await asyncio.sleep(int(e.value) + 2)
+                try:
+                    await client.send_message(
+                        chat_id=tid, text=caption, reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    return "sent"
+                except Exception:
+                    return "fail"
+            except (UserIsBlocked, InputUserDeactivated,
+                    UserDeactivated, UserDeactivatedBan):
+                return "block"
+            except (ChatWriteForbidden, ChatAdminRequired,
+                    ChannelPrivate, PeerIdInvalid,
+                    UserNotParticipant):
+                return "fail"
+            except Exception:
+                return "fail"
+
+    async def _wrap(tid: int):
+        r = await _one(tid)
+        async with lock:
+            nonlocal sent, failed
+            if r == "sent":
+                sent += 1
+            else:
+                failed += 1
+
+    # Run in batches
+    try:
+        for i in range(0, total, BROADCAST_BATCH_SIZE):
+            batch = targets[i:i + BROADCAST_BATCH_SIZE]
+            await asyncio.gather(*[_wrap(t) for t in batch])
+    except Exception as e:
+        logger.exception(f"[OTT-ENGINE] broadcast batch: {e}")
+
+    # Log
+    try:
+        await DB.broadcast_log(
+            tmdb_id=tmdb_id, target=kind,
+            delivered=sent, failed=failed, total=total,
+            admin_id=admin_id,
+        )
     except Exception:
         pass
 
-    ST.setup_drop(q.from_user.id)
+    return sent, failed, total
 
 
 __all__ = [
     "get_ott_channel",
     "build_caption",
-    "send_channel_broadcast",
+    "post_to_single_channel",
+    "send_to_targets",
 ]
