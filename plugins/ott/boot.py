@@ -11,6 +11,7 @@ from pyrogram.types import Message
 from plugins.broadcast.config import _is_admin
 from plugins.ott import watcher as W
 from plugins.ott import database as DB
+from plugins.ott import events as EVENTS
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ async def _ott_boot(client: Client, message: Message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return
     await DB.ensure_indexes()
+    await EVENTS.ensure_indexes()
     W.ensure_loops(client)
     try:
         await message.delete()
@@ -38,6 +40,7 @@ async def _ott_lazy(client: Client, message: Message):
     if not message.from_user or not _is_admin(message.from_user.id):
         return
     await DB.ensure_indexes()
+    await EVENTS.ensure_indexes()
     W.ensure_loops(client)
     try:
         message.stop_propagation()
