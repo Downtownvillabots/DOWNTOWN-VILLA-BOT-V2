@@ -1,5 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT TMDB (multi-strategy weekly)
+# 🏨 DOWNTOWN VILLA — OTT TMDB (strict weekly)
 # ============================================================
 
 from __future__ import annotations
@@ -62,27 +62,32 @@ def _mk(item: Dict[str, Any], region: str) -> Optional[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════
-# FETCH BY LANGUAGE — THIS WEEK ONLY
+# STRICT WEEKLY FETCH
 # ═══════════════════════════════════════════════════════════
+
+def _week_bounds() -> tuple:
+    """Return (monday_iso, sunday_iso) for the current week."""
+    monday, next_mon = DB.week_range()
+    sunday = next_mon - timedelta(days=1)
+    return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+
 
 async def fetch_week_by_lang(lang: str, region: str = None,
                               min_vote: int = 0) -> List[Dict[str, Any]]:
     """
-    THIS WEEK ONLY (Mon–Sun). Multi-strategy fetch.
+    THIS WEEK ONLY. Every strategy uses strict Mon–Sun bounds.
+    Nothing outside this week can slip through.
     """
     if region is None:
         cfg = await DB.get_cfg()
         region = cfg.get("region", "IN")
 
-    monday, next_mon = DB.week_range()
-    gte = monday.strftime("%Y-%m-%d")
-    lte = (next_mon - timedelta(days=1)).strftime("%Y-%m-%d")
-
+    gte, lte = _week_bounds()
     lang_filter = lang if lang and lang != "all" else None
 
     tasks: List = []
 
-    # ── Strategy 1: primary_release_date within week ──
+    # ── Strategy 1: primary_release_date within this week ──
     p1: Dict[str, Any] = {
         "region": region,
         "primary_release_date.gte": gte,
@@ -96,7 +101,7 @@ async def fetch_week_by_lang(lang: str, region: str = None,
         p1["vote_count.gte"] = int(min_vote)
     tasks.append(_get("discover/movie", p1))
 
-    # ── Strategy 2: digital release (release_date + type 4) ──
+    # ── Strategy 2: digital release type 4 within this week ──
     p2: Dict[str, Any] = {
         "region": region,
         "with_release_type": "4",
@@ -111,34 +116,8 @@ async def fetch_week_by_lang(lang: str, region: str = None,
         p2["vote_count.gte"] = int(min_vote)
     tasks.append(_get("discover/movie", p2))
 
-    # ── Strategy 3: watch providers (Indian OTTs) ──
+    # ── Strategy 3: recent theatrical + digital (still this week) ──
     p3: Dict[str, Any] = {
-        "watch_region": region,
-        "with_watch_providers": INDIAN_OTTS,
-        "sort_by": "popularity.desc",
-        "page": 1,
-    }
-    if lang_filter:
-        p3["with_original_language"] = lang_filter
-    if min_vote > 0:
-        p3["vote_count.gte"] = int(min_vote)
-    tasks.append(_get("discover/movie", p3))
-
-    # ── Strategy 4: primary_release_date 3 months back (still OTT this week) ──
-    p4: Dict[str, Any] = {
-        "region": region,
-        "with_release_type": "4",
-        "release_date.gte": (monday - timedelta(days=90)).strftime("%Y-%m-%d"),
-        "release_date.lte": lte,
-        "sort_by": "primary_release_date.desc",
-        "page": 1,
-    }
-    if lang_filter:
-        p4["with_original_language"] = lang_filter
-    tasks.append(_get("discover/movie", p4))
-
-    # ── Strategy 5: upcoming primary releases this week ──
-    p5: Dict[str, Any] = {
         "region": region,
         "primary_release_date.gte": gte,
         "primary_release_date.lte": lte,
@@ -146,8 +125,8 @@ async def fetch_week_by_lang(lang: str, region: str = None,
         "page": 1,
     }
     if lang_filter:
-        p5["with_original_language"] = lang_filter
-    tasks.append(_get("discover/movie", p5))
+        p3["with_original_language"] = lang_filter
+    tasks.append(_get("discover/movie", p3))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -162,26 +141,37 @@ async def fetch_week_by_lang(lang: str, region: str = None,
             if not m or m["tmdb_id"] in seen:
                 continue
             rd = m.get("release_date") or ""
-            # Filter: within this week (Mon–Sun) OR earlier (recent digital)
-            if rd:
-                try:
-                    d = datetime.strptime(rd, "%Y-%m-%d").date()
-                except Exception:
-                    d = None
-                if d:
-                    # If AFTER this week's Sunday → skip
-                    if d > next_mon.date():
-                        continue
+            if not rd:
+                continue
+            # HARD FILTER: only this week
+            if not (gte <= rd <= lte):
+                continue
             seen.add(m["tmdb_id"])
             out.append(m)
 
-    # Sort: upcoming first
+    # Sort by release date
     out.sort(key=lambda x: x.get("release_date") or "9999-99-99")
     return out
 
 
+async def fetch_week_grouped_by_lang(lang: str, region: str = None,
+                                      min_vote: int = 0
+                                      ) -> Dict[int, List[Dict[str, Any]]]:
+    """Same as above but returns {weekday_index: [movies]} 0=Mon..6=Sun."""
+    movies = await fetch_week_by_lang(lang, region, min_vote)
+    out: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(7)}
+    for m in movies:
+        rd = m.get("release_date") or ""
+        try:
+            d = datetime.strptime(rd, "%Y-%m-%d")
+            out[d.weekday()].append(m)
+        except Exception:
+            continue
+    return out
+
+
 # ═══════════════════════════════════════════════════════════
-# WEEKLY (multi-language) — admin PM
+# WEEKLY (multi-lang) — same strict bounds
 # ═══════════════════════════════════════════════════════════
 
 async def fetch_weekly_multi_lang(
@@ -200,9 +190,7 @@ async def fetch_weekly_multi_lang(
         if code and code not in all_langs:
             all_langs.append(code)
 
-    monday, next_mon = DB.week_range()
-    gte = monday.strftime("%Y-%m-%d")
-    lte = (next_mon - timedelta(days=1)).strftime("%Y-%m-%d")
+    gte, lte = _week_bounds()
 
     tasks = []
     tasks.append(("__world__", _get("discover/movie", {
@@ -227,7 +215,7 @@ async def fetch_weekly_multi_lang(
     seen: set = set()
     out: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(7)}
 
-    for (src, _), data in zip(tasks, results):
+    for data in results:
         if not isinstance(data, dict):
             continue
         for item in (data.get("results") or []):
@@ -235,7 +223,7 @@ async def fetch_weekly_multi_lang(
             if not m or m["tmdb_id"] in seen:
                 continue
             rd = m.get("release_date") or ""
-            if not rd:
+            if not (gte <= rd <= lte):
                 continue
             try:
                 d = datetime.strptime(rd, "%Y-%m-%d")
@@ -264,12 +252,12 @@ async def fetch_weekly(region: str = None) -> Dict[int, List[Dict[str, Any]]]:
 
 
 # ═══════════════════════════════════════════════════════════
-# DETAILS / ENRICH
+# DETAILS / ENRICH (with IMDb ID)
 # ═══════════════════════════════════════════════════════════
 
 async def fetch_details(tmdb_id: int) -> Optional[Dict[str, Any]]:
     return await _get(f"movie/{tmdb_id}", {
-        "append_to_response": "watch/providers,credits,release_dates",
+        "append_to_response": "watch/providers,credits,release_dates,external_ids",
     })
 
 
@@ -296,6 +284,14 @@ def _extract_provider(details: Dict, region: str) -> str:
     except Exception:
         pass
     return "—"
+
+
+def _extract_imdb_id(details: Dict) -> str:
+    try:
+        ext = details.get("external_ids") or {}
+        return ext.get("imdb_id") or ""
+    except Exception:
+        return ""
 
 
 def _extract_director(details: Dict) -> str:
@@ -358,7 +354,7 @@ async def enrich_movie(movie: Dict[str, Any], region: str = None) -> Dict[str, A
         return movie
 
     cached = await DB.get_movie(tmdb_id)
-    if cached and cached.get("overview"):
+    if cached and cached.get("overview") and cached.get("imdb_id"):
         return cached
 
     details = await fetch_details(tmdb_id)
@@ -388,6 +384,7 @@ async def enrich_movie(movie: Dict[str, Any], region: str = None) -> Dict[str, A
         "provider": _extract_provider(details, region),
         "region": region,
         "region_release": _extract_release_info(details, region),
+        "imdb_id": _extract_imdb_id(details),
     }
 
     await DB.save_movie(enriched)
@@ -400,8 +397,15 @@ def poster_url(path: Optional[str], size: str = "w500") -> Optional[str]:
     return f"{TMDB_IMG}/{size}{path}"
 
 
+def imdb_url(imdb_id: str) -> Optional[str]:
+    if not imdb_id:
+        return None
+    return f"https://www.imdb.com/title/{imdb_id}/"
+
+
 __all__ = [
     "PRIORITY_LANGS",
-    "fetch_weekly", "fetch_weekly_multi_lang", "fetch_week_by_lang",
-    "fetch_details", "enrich_movie", "poster_url",
+    "fetch_weekly", "fetch_weekly_multi_lang",
+    "fetch_week_by_lang", "fetch_week_grouped_by_lang",
+    "fetch_details", "enrich_movie", "poster_url", "imdb_url",
 ]
