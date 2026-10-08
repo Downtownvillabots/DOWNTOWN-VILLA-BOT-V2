@@ -435,10 +435,130 @@ async def _edit_msg(client: Client, ev: Dict[str, Any],
             logger.debug(f"[OTT-CF] edit: {e}")
 
 
+# ═══════════════════════════════════════════════════════════
+# GROUP LIST PICKER
+# ═══════════════════════════════════════════════════════════
+
+async def show_group_list(client: Client, q: CallbackQuery, tmdb_id: int):
+    ev = await find_by_msg(q.message.id)
+    if not ev:
+        return await q.answer("⏱️ Expired", show_alert=True)
+    try:
+        from plugins.broadcast import database as BDB
+        groups = await BDB.get_all_groups_full()
+    except Exception:
+        groups = []
+
+    if not groups:
+        return await q.answer("⚠️ No groups registered", show_alert=True)
+
+    kb = KB.kb_bc_groups(tmdb_id, groups)
+    movie = await DB.get_movie(tmdb_id) or {}
+    title = (movie.get("title") or "?")[:50]
+
+    text = "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"👥 <b>{fb('PICK A GROUP')}</b>",
+        DIV, "",
+        f"🎬 <b>{sc(title)}</b>",
+        "", DIV2,
+        f"📌 {sc('tap a group, or ALL GROUPS')}",
+    ])
+    await _edit_msg(client, ev, text, kb)
+    return await q.answer()
+
+
+# ═══════════════════════════════════════════════════════════
+# MANUAL TARGET — START
+# ═══════════════════════════════════════════════════════════
+
+async def start_manual_target(client: Client, q: CallbackQuery, tmdb_id: int):
+    ev = await find_by_msg(q.message.id)
+    if not ev:
+        return await q.answer("⏱️ Expired", show_alert=True)
+
+    from plugins.ott import state as ST
+    ST.new_session(q.from_user.id, "manual_target", tmdb_id=tmdb_id)
+
+    text = "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"✏️ <b>{fb('MANUAL TARGET')}</b>",
+        DIV, "",
+        f"📝 {sc('send a chat id or @username in the next message')}",
+        "",
+        f"📌 {sc('examples')}:",
+        f"• <code>-1001234567890</code>",
+        f"• <code>@mychannel</code>",
+        "", DIV2,
+        f"📌 {sc('send')} <code>-</code> {sc('to cancel')}",
+    ])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "❌ Cancel",
+            callback_data=cb(f"csetup_bc:{tmdb_id}")),
+        ],
+    ])
+    await _edit_msg(client, ev, text, kb)
+    return await q.answer("✏️ Send target now")
+
+
+async def handle_manual_target_input(
+    client: Client,
+    message,
+    tmdb_id: int,
+    text: str,
+):
+    """Called from panel.py when admin sends the manual target text."""
+    try:
+        if text.startswith("@"):
+            chat = await client.get_chat(text)
+            cid = chat.id
+            title = chat.title or text
+        else:
+            cid = int(text)
+            try:
+                chat = await client.get_chat(cid)
+                title = chat.title or str(cid)
+            except Exception:
+                title = str(cid)
+    except Exception as e:
+        return await message.reply_text(f"❌ Could not resolve: {e}")
+
+    # Find active event for this movie
+    ev = await EVENTS.get_active_for_movie(tmdb_id)
+    if not ev:
+        return await message.reply_text("⚠️ No active event")
+
+    # Confirm
+    kb = KB.kb_bc_confirm(tmdb_id, "ch", cid, f"{title} ({cid})")
+
+    text_out = "\n".join([
+        f"🏨 <b>{fb('DOWNTOWN VILLA')}</b>",
+        f"⚠️ <b>{fb('CONFIRM BROADCAST')}</b>",
+        DIV, "",
+        f"🎬 <b>{sc(title)[:60]}</b>",
+        f"🎯 <code>{cid}</code>",
+        "", DIV2,
+        f"📌 {sc('live post will be sent to this target')}",
+        "", f"❓ {sc('proceed?')}",
+    ])
+
+    try:
+        await client.send_message(
+            chat_id=message.chat.id,
+            text=text_out, reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        await message.reply_text(f"❌ {type(e).__name__}")
+
+
 __all__ = [
     "find_by_msg",
     "open_setup", "toggle_notify", "toggle_file",
     "show_timer", "set_timer", "cancel_setup",
     "open_bc_picker", "show_channel_list",
     "confirm_bc", "do_broadcast", "post_now",
+    "show_group_list", "start_manual_target", "handle_manual_target_input",
 ]
