@@ -511,4 +511,54 @@ async def ott_router(client: Client, q: CallbackQuery):
             return await q.answer(
                 f"✅ You will be notified when '{title}' is uploaded")
 
-        if
+        if action == "wl_add":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            movie = await DB.get_movie(tmdb_id) or {}
+            from plugins.ott.database import _c as _coll
+            c = _coll("ott_prefs")
+            if c is not None:
+                try:
+                    await c.update_one(
+                        {"user_id": int(q.from_user.id)},
+                        {"$addToSet": {"watchlist": {
+                            "tmdb_id": int(tmdb_id),
+                            "title": movie.get("title") or "?",
+                            "added_at": __import__("time").time(),
+                        }}},
+                        upsert=True,
+                    )
+                except Exception:
+                    pass
+            return await q.answer("🎁 Added to watchlist")
+
+        if action == "getfile":
+            return await q.answer(
+                "📥 Search in the group to get the file",
+                show_alert=True)
+
+        if action == "share":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            movie = await DB.get_movie(tmdb_id) or {}
+            title = movie.get("title") or "?"
+            await q.answer(
+                f"📤 Share this: https://t.me/{q.message.chat.username or ''}",
+                show_alert=True)
+            return
+
+        return await q.answer("❓ Unknown")
+
+    except Exception as e:
+        logger.exception(f"[OTT] router: {e}")
+        try:
+            await q.answer(f"❌ {type(e).__name__}", show_alert=True)
+        except Exception:
+            pass
+
+
+__all__ = ["open_panel_for_admin"]
