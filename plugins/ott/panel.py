@@ -285,6 +285,23 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return
 
+        if action == "lang_day":
+            try:
+                lang = args[0]
+                day_idx = int(args[1])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            text, kb = await V.view_lang_day(lang, day_idx)
+            await V.safe_edit(q, text, kb)
+            return await q.answer()
+
+        if action == "lang_all":
+            lang = args[0] if args else "all"
+            await q.answer("🌐 Loading…")
+            text, kb = await V.view_lang(lang)
+            await V.safe_edit(q, text, kb)
+            return
+
         if action == "week_all":
             await q.answer("🌐 Loading…")
             text, kb = await V.view_lang("all")
