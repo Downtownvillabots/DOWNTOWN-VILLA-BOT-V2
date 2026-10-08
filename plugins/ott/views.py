@@ -287,7 +287,7 @@ async def view_bc_setup(tmdb_id: int, channel: int, notify: bool,
         f"🗑️ {sc('auto-delete')} · <b>{timer_lbl}</b>",
         "", DIV2,
         f"📌 {sc('poster + caption + buttons will be sent')}",
-        f"📌 {sc('users who tap Notify get DM\\'d when file lands')}",
+        f"📌 {sc('users who tap Notify will be notified when file lands')}",
     ])
     return text, KB.kb_bc_setup(tmdb_id, channel, notify, hours)
 
