@@ -91,17 +91,88 @@ async def view_home() -> Tuple[str, InlineKeyboardMarkup]:
 # ═══════════════════════════════════════════════════════════
 
 async def view_lang(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
-    from plugins.ott.tmdb import fetch_week_by_lang
+    """Language → this week grouped by day of week."""
+    from plugins.ott.tmdb import fetch_week_grouped_by_lang
+    import datetime as _dt
 
     cfg = await DB.get_cfg()
-    movies = await fetch_week_by_lang(
+    grouped = await fetch_week_grouped_by_lang(
         lang=lang,
         region=cfg.get("region", "IN"),
         min_vote=int(cfg.get("min_vote_count", 0)),
     )
 
     mon, nxt = DB.week_range()
-    sun = nxt - __import__("datetime").timedelta(days=1)
+    sun = nxt - _dt.timedelta(days=1)
+    counts = [len(grouped.get(i, [])) for i in range(7)]
+    total = sum(counts)
+
+    if lang == "all":
+        label = "🌐 All Languages"
+    else:
+        label = f"🎬 {LANGUAGE_LABELS.get(lang, lang.upper())}"
+
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
+
+    lines = [
+        _header("THIS WEEK"),
+        f"{label}",
+        f"🗓️ <code>{mon.strftime('%d %b')} → {sun.strftime('%d %b %Y')}</code>",
+        f"📊 {sc('total')} · <b>{total}</b>",
+        "", DIV2,
+        "",
+    ]
+
+    if total == 0:
+        lines.append(f"⚪ {sc('no releases this week')}")
+        lines.append("")
+        lines.append(f"📌 {sc('try again later or refetch')}")
+    else:
+        for i in range(7):
+            day_date = mon + _dt.timedelta(days=i)
+            c = counts[i]
+            lines.append(
+                f"📅 <b>{day_names[i]}</b> · "
+                f"<code>{day_date.strftime('%d %b')}</code> · "
+                f"<b>{c}</b>"
+            )
+            for m in grouped.get(i, [])[:5]:
+                title = str(m.get("title", "?"))[:42]
+                rating = m.get("vote_average", 0) or 0
+                r_str = f" ⭐{rating:.1f}" if rating else ""
+                lines.append(f"   🎬 {sc(title)}{r_str}")
+            if c > 5:
+                lines.append(f"   <i>… +{c - 5} more</i>")
+            lines.append("")
+
+    lines += [
+        DIV2,
+        f"📌 {sc('tap a day button below to see all its movies')}",
+    ]
+
+    return "\n".join(lines)[:4000], KB.kb_lang_days(lang, counts)
+
+
+async def view_lang_day(lang: str, day_idx: int
+                         ) -> Tuple[str, InlineKeyboardMarkup]:
+    """Show movies for one weekday of this week."""
+    from plugins.ott.tmdb import fetch_week_grouped_by_lang
+    import datetime as _dt
+
+    cfg = await DB.get_cfg()
+    grouped = await fetch_week_grouped_by_lang(
+        lang=lang,
+        region=cfg.get("region", "IN"),
+        min_vote=int(cfg.get("min_vote_count", 0)),
+    )
+    movies = grouped.get(day_idx, [])
+
+    mon, nxt = DB.week_range()
+    day_date = mon + _dt.timedelta(days=day_idx)
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                 "Friday", "Saturday", "Sunday"]
+    day_name = day_names[day_idx] if 0 <= day_idx <= 6 else "?"
 
     if lang == "all":
         label = "🌐 All Languages"
@@ -109,34 +180,32 @@ async def view_lang(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
         label = f"🎬 {LANGUAGE_LABELS.get(lang, lang.upper())}"
 
     lines = [
-        _header("THIS WEEK"),
+        _header(f"{day_name.upper()} · THIS WEEK"),
         f"{label}",
-        f"🗓️ <code>{mon.strftime('%d %b')} → {sun.strftime('%d %b %Y')}</code>",
+        f"🗓️ <code>{day_date.strftime('%d %b %Y')}</code>",
         f"📊 {sc('movies')} · <b>{len(movies)}</b>",
         "", DIV2,
         "",
     ]
-    for m in movies[:15]:
-        title = str(m.get("title", "?"))[:45]
-        rd = (m.get("release_date") or "")[5:10]
-        rating = m.get("vote_average", 0)
-        lang_ = (m.get("original_language") or "").upper()
-        lines.append(f"🎬 <b>{sc(title)}</b>")
-        meta = []
-        if rd:
-            meta.append(f"📅 {rd}")
-        if lang_:
-            meta.append(f"🌐 {lang_}")
-        if rating:
-            meta.append(f"⭐ {rating:.1f}")
-        if meta:
-            lines.append(f"   <code>{' · '.join(meta)}</code>")
-    if not movies:
-        lines.append(f"⚪ {sc('no releases found for this week')}")
-        lines.append("")
-        lines.append(f"📌 {sc('try again later or refetch')}")
 
-    return "\n".join(lines)[:4000], KB.kb_movie_list(lang, movies)
+    if not movies:
+        lines.append(f"⚪ {sc('no releases on this day')}")
+    else:
+        for i, m in enumerate(movies[:25], 1):
+            title = str(m.get("title", "?"))[:50]
+            year = (m.get("release_date") or "")[:4]
+            rating = m.get("vote_average", 0) or 0
+            lang_ = (m.get("original_language") or "").upper()
+            lines.append(f"<b>{i:02d}.</b> 🎬 <b>{sc(title)}</b> ({year})")
+            meta = []
+            if rating:
+                meta.append(f"⭐ {rating:.1f}")
+            if lang_:
+                meta.append(f"🌐 {lang_}")
+            if meta:
+                lines.append(f"   <code>{' · '.join(meta)}</code>")
+
+    return "\n".join(lines)[:4000], KB.kb_lang_day(lang, day_idx, movies)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -652,4 +721,5 @@ __all__ = [
     "view_settings", "view_region", "view_langs", "view_minvote",
     "view_notifttl", "view_bcttl",
     "view_dashboard", "view_diag",
+    "view_lang_day",
 ]
