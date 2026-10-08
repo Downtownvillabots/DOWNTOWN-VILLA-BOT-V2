@@ -1,5 +1,5 @@
 # ============================================================
-# 🏨 DOWNTOWN VILLA — OTT PANEL + ROUTER (v3 — event-driven)
+# 🏨 DOWNTOWN VILLA — OTT PANEL + ROUTER (v3 — final)
 # ============================================================
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ async def open_panel_for_admin(client: Client, q: CallbackQuery) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# BACKGROUND SYNC HELPER (fire-and-forget)
+# BACKGROUND SYNC (fire-and-forget)
 # ═══════════════════════════════════════════════════════════
 
 async def _bg_sync(client: Client, eid: str) -> None:
@@ -124,7 +124,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("ℹ️ You are already subscribed.",
                                       show_alert=True)
 
-            # Fire-and-forget sync (admin post + target posts)
+            # Fire-and-forget live sync
             asyncio.create_task(_bg_sync(client, ev["_id"]))
 
             return await q.answer(
@@ -154,7 +154,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                     pass
             return await q.answer("🎁 Added to watchlist")
 
-        # ── USER: files list ──
+        # ── USER: file list ──
         if action == "files":
             try:
                 tmdb_id = int(args[0])
@@ -178,7 +178,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                     pass
             return await q.answer()
 
-        # ── USER: get a specific file ──
+        # ── USER: get a file ──
         if action == "file_get":
             try:
                 tmdb_id = int(args[0])
@@ -222,7 +222,6 @@ async def ott_router(client: Client, q: CallbackQuery):
                 except Exception:
                     pass
 
-                # Sync event (files_requested not tracked yet, but re-count)
                 ev = await EVENTS.get_any_for_movie(tmdb_id)
                 if ev:
                     asyncio.create_task(_bg_sync(client, ev["_id"]))
@@ -269,7 +268,7 @@ async def ott_router(client: Client, q: CallbackQuery):
         if not is_admin:
             return await q.answer("⛔ admins only", show_alert=True)
 
-        # ── HOME ──
+        # ── HOME / DASH ──
         if action == "home":
             text, kb = await V.view_home()
             await V.safe_edit(q, text, kb)
@@ -321,7 +320,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                     languages=cfg.get("languages") or [],
                     min_vote=int(cfg.get("min_vote_count", 0)),
                 )
-                days = [[dict(m) for m in by_day.get(i, [])] for i in range(7)]
+                days = [[dict(m) for m in by_day.get(i, [])]
+                        for i in range(7)]
                 await DB.save_week(DB.week_key(), days, posted=True)
             except Exception as e:
                 logger.exception(f"[OTT] refetch: {e}")
@@ -336,7 +336,7 @@ async def ott_router(client: Client, q: CallbackQuery):
             await V.safe_edit(q, text, kb)
             return
 
-        # ── MOVIE CARD ──
+        # ── MOVIE CARD (PM) ──
         if action == "mv":
             try:
                 tmdb_id = int(args[0])
@@ -407,7 +407,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌")
             return await CF.cancel_setup(client, q, tmdb_id)
 
-        # ── BROADCAST PICKER ──
+        # ── BROADCAST TARGET PICKER ──
         if action == "csetup_bc":
             try:
                 tmdb_id = int(args[0])
@@ -427,7 +427,7 @@ async def ott_router(client: Client, q: CallbackQuery):
                 tmdb_id = int(args[0])
             except (ValueError, IndexError):
                 return await q.answer("❌")
-            return await CF.confirm_bc(client, q, tmdb_id, "gr", 0)
+            return await CF.show_group_list(client, q, tmdb_id)
 
         if action == "csetup_bc_us":
             try:
@@ -443,17 +443,29 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("❌")
             return await CF.confirm_bc(client, q, tmdb_id, "pm", 0)
 
+        if action == "csetup_bc_manual":
+            try:
+                tmdb_id = int(args[0])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            return await CF.start_manual_target(client, q, tmdb_id)
+
         if action == "csetup_bc_send":
             try:
                 tmdb_id = int(args[0])
                 kind = args[1]
-                tid = int(args[2])
+                tid = int(args[2]) if len(args) > 2 else 0
             except (ValueError, IndexError):
                 return await q.answer("❌")
             if kind == "ch":
                 return await CF.confirm_bc(client, q, tmdb_id, "ch", tid)
             if kind == "chall":
                 return await CF.confirm_bc(client, q, tmdb_id, "chall", 0)
+            if kind == "gr":
+                return await CF.confirm_bc(client, q, tmdb_id, "gr_single",
+                                            tid)
+            if kind == "grall":
+                return await CF.confirm_bc(client, q, tmdb_id, "gr", 0)
             return await q.answer("❓")
 
         if action == "csetup_bc_do":
@@ -471,6 +483,15 @@ async def ott_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             return await CF.post_now(client, q, tmdb_id)
+
+        # ── BROADCAST STOP ──
+        if action == "bc_stop":
+            eid = args[0] if args else ""
+            if eid:
+                ev = await EVENTS.get_event(eid)
+                if ev:
+                    await EVENTS.update_event(eid, state="live")
+            return await q.answer("⏹ Stopped")
 
         # ── STATS ──
         if action == "stats":
@@ -520,14 +541,12 @@ async def ott_router(client: Client, q: CallbackQuery):
                 return await q.answer("⏱️ expired", show_alert=True)
             ST.drop_confirm(tok)
 
-            # Wipe pending subs + mark broadcast cancelled
             res = await DB.end_movie(tmdb_id)
-
-            # Mark event ended
             ev = await EVENTS.get_active_for_movie(tmdb_id)
+            if not ev:
+                ev = await EVENTS.get_any_for_movie(tmdb_id)
             if ev:
                 await EVENTS.mark_ended(ev["_id"])
-                # Force sync → transforms to ended state
                 asyncio.create_task(_bg_sync(client, ev["_id"]))
 
             await q.answer(f"💥 {res['deleted']} tokens deleted")
@@ -661,7 +680,8 @@ async def ott_router(client: Client, q: CallbackQuery):
                 "", f"📌 {sc('send')} <code>-</code> {sc('to cancel')}",
             ])
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data="ott:set")]])
+                InlineKeyboardButton("❌ Cancel",
+                                     callback_data="ott:set")]])
             await V.safe_edit(q, text, kb)
             return await q.answer()
 
@@ -727,6 +747,44 @@ async def ott_router(client: Client, q: CallbackQuery):
             await q.answer(f"❌ {type(e).__name__}", show_alert=True)
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════
+# MANUAL TARGET TEXT INPUT
+# ═══════════════════════════════════════════════════════════
+
+@Client.on_message(
+    filters.private & filters.text & ~filters.regex(r"^/"),
+    group=-441,
+)
+async def ott_manual_input(client: Client, message):
+    if not message.from_user or not _is_admin(message.from_user.id):
+        return
+    sess = ST.get_session(message.from_user.id)
+    if not sess or sess["action"] != "manual_target":
+        return
+
+    text = (message.text or "").strip()
+    try:
+        message.stop_propagation()
+    except Exception:
+        pass
+
+    tmdb_id = sess["data"].get("tmdb_id")
+
+    if text == "-":
+        ST.clear_session(message.from_user.id)
+        return await message.reply_text("❌ Cancelled")
+
+    try:
+        from plugins.ott import channel_flow as CF
+        await CF.handle_manual_target_input(
+            client, message, tmdb_id, text)
+    except Exception as e:
+        logger.exception(f"[OTT] manual: {e}")
+        await message.reply_text(f"❌ {type(e).__name__}")
+
+    ST.clear_session(message.from_user.id)
 
 
 __all__ = ["open_panel_for_admin"]
