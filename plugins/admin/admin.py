@@ -1134,12 +1134,12 @@ async def _open_module(client: Client, q: CallbackQuery, module: str) -> None:
             return
 
         if module == "ott":
-            from plugins.ott import ott as OTT
+            from plugins.ott import panel as OTT
             fn = getattr(OTT, "open_panel_for_admin", None)
             if fn is not None:
-                await fn(client, q.message)
+                await fn(client, q)
             else:
-                await q.answer("Use /ott", show_alert=True)
+                await q.answer("OTT panel unavailable", show_alert=True)
             return
 
         if module == "missing":
