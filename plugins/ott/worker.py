@@ -18,14 +18,9 @@ from plugins.ott import views as V
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
-
-_CHECK_INTERVAL = 60   # every minute
+_CHECK_INTERVAL = 60
 _TASK: Optional[asyncio.Task] = None
 
-
-# ═══════════════════════════════════════════════════════════
-# KEY COMPUTATION
-# ═══════════════════════════════════════════════════════════
 
 def _expected_key(freq: Dict[str, Any], now: datetime) -> Optional[str]:
     mode = freq.get("mode") or "off"
@@ -37,29 +32,21 @@ def _expected_key(freq: Dict[str, Any], now: datetime) -> Optional[str]:
 
     if mode == "daily":
         return f"daily:{now.strftime('%Y-%m-%d')}:{hour}"
-
     if mode == "weekly":
         want_day = int(freq.get("day_of_week") or 0)
         if now.weekday() != want_day:
             return None
         iso = now.isocalendar()
         return f"weekly:{iso[0]}-W{iso[1]:02d}:{want_day}:{hour}"
-
     if mode == "monthly":
         want_day = int(freq.get("day_of_month") or 1)
         if now.day != want_day:
             return None
         return f"monthly:{now.strftime('%Y-%m')}:{want_day}:{hour}"
-
     return None
 
 
-# ═══════════════════════════════════════════════════════════
-# SEND HELPERS
-# ═══════════════════════════════════════════════════════════
-
-async def _send_to_chat(client: Client, chat_id: int,
-                         text: str) -> bool:
+async def _send_chat(client: Client, chat_id: int, text: str) -> bool:
     try:
         await client.send_message(
             chat_id=int(chat_id), text=text,
@@ -71,12 +58,12 @@ async def _send_to_chat(client: Client, chat_id: int,
         await asyncio.sleep(int(e.value) + 2)
         return False
     except Exception as e:
-        logger.debug(f"[OTT-WRK] send {chat_id}: {e}")
+        logger.debug(f"[OTT-WRK] chat {chat_id}: {e}")
         return False
 
 
-async def _send_to_users(client: Client, text: str,
-                          premium_only: bool = False) -> int:
+async def _send_users(client: Client, text: str,
+                       premium_only: bool = False) -> int:
     try:
         from plugins.broadcast import database as BDB
         if premium_only:
@@ -85,8 +72,7 @@ async def _send_to_users(client: Client, text: str,
             ids = [int(u["user_id"]) for u in users if u.get("user_id")]
         else:
             ids = await BDB.get_all_users()
-    except Exception as e:
-        logger.debug(f"[OTT-WRK] list users: {e}")
+    except Exception:
         return 0
 
     sent = 0
@@ -106,57 +92,57 @@ async def _send_to_users(client: Client, text: str,
     return sent
 
 
-# ═══════════════════════════════════════════════════════════
-# MAIN CHECK
-# ═══════════════════════════════════════════════════════════
-
-async def _check_once(client: Client) -> None:
+async def _check(client: Client) -> None:
     now = datetime.now(IST)
 
     # ── CHANNELS ──
-    for c in await DB.get_channels():
-        if not c.get("running"):
+    live_ch = {int(c["chat_id"]) for c in await DB.get_live_channels()}
+    for cid in await DB.get_enabled_channels():
+        if cid not in live_ch:
+            continue  # removed from bot DB
+        cfg = await DB.get_channel_config(cid)
+        if not cfg.get("running"):
             continue
-        freq = c.get("frequency") or {}
+        freq = cfg.get("frequency") or {}
         key = _expected_key(freq, now)
-        if not key or key == c.get("last_sent_key"):
+        if not key or key == cfg.get("last_sent_key"):
             continue
-        langs = c.get("languages") or []
+        langs = cfg.get("languages") or []
         if not langs:
             continue
         try:
             text = await V.build_update_text(langs)
-            ok = await _send_to_chat(client, int(c["chat_id"]), text)
+            ok = await _send_chat(client, cid, text)
             if ok:
-                await DB.update_channel(int(c["chat_id"]),
-                                         last_sent_key=key)
-                logger.info(
-                    f"[OTT-WRK] sent to channel {c['chat_id']} key={key}")
+                await DB.update_channel_config(cid, last_sent_key=key)
+                logger.info(f"[OTT-WRK] sent to ch {cid} key={key}")
         except Exception as e:
-            logger.debug(f"[OTT-WRK] ch {c.get('chat_id')}: {e}")
+            logger.debug(f"[OTT-WRK] ch {cid}: {e}")
         await asyncio.sleep(0.5)
 
     # ── GROUPS ──
-    for g in await DB.get_groups():
-        if not g.get("running"):
+    live_gr = {int(g["chat_id"]) for g in await DB.get_live_groups()}
+    for gid in await DB.get_enabled_groups():
+        if gid not in live_gr:
             continue
-        freq = g.get("frequency") or {}
+        cfg = await DB.get_group_config(gid)
+        if not cfg.get("running"):
+            continue
+        freq = cfg.get("frequency") or {}
         key = _expected_key(freq, now)
-        if not key or key == g.get("last_sent_key"):
+        if not key or key == cfg.get("last_sent_key"):
             continue
-        langs = g.get("languages") or []
+        langs = cfg.get("languages") or []
         if not langs:
             continue
         try:
             text = await V.build_update_text(langs)
-            ok = await _send_to_chat(client, int(g["chat_id"]), text)
+            ok = await _send_chat(client, gid, text)
             if ok:
-                await DB.update_group(int(g["chat_id"]),
-                                       last_sent_key=key)
-                logger.info(
-                    f"[OTT-WRK] sent to group {g['chat_id']} key={key}")
+                await DB.update_group_config(gid, last_sent_key=key)
+                logger.info(f"[OTT-WRK] sent to gr {gid} key={key}")
         except Exception as e:
-            logger.debug(f"[OTT-WRK] gr {g.get('chat_id')}: {e}")
+            logger.debug(f"[OTT-WRK] gr {gid}: {e}")
         await asyncio.sleep(0.5)
 
     # ── USERS ──
@@ -169,8 +155,8 @@ async def _check_once(client: Client) -> None:
             if langs:
                 try:
                     text = await V.build_update_text(langs)
-                    n = await _send_to_users(client, text,
-                                              premium_only=False)
+                    n = await _send_users(client, text,
+                                           premium_only=False)
                     if n > 0:
                         await DB.update_users(last_sent_key=key)
                         logger.info(f"[OTT-WRK] users sent n={n} key={key}")
@@ -187,8 +173,8 @@ async def _check_once(client: Client) -> None:
             if langs:
                 try:
                     text = await V.build_update_text(langs)
-                    n = await _send_to_users(client, text,
-                                              premium_only=True)
+                    n = await _send_users(client, text,
+                                           premium_only=True)
                     if n > 0:
                         await DB.update_premium(last_sent_key=key)
                         logger.info(f"[OTT-WRK] prem sent n={n} key={key}")
@@ -196,15 +182,11 @@ async def _check_once(client: Client) -> None:
                     logger.debug(f"[OTT-WRK] pm: {e}")
 
 
-# ═══════════════════════════════════════════════════════════
-# LOOP
-# ═══════════════════════════════════════════════════════════
-
 async def _loop(client: Client) -> None:
     await asyncio.sleep(30)
     while True:
         try:
-            await _check_once(client)
+            await _check(client)
         except asyncio.CancelledError:
             return
         except Exception as e:
