@@ -511,7 +511,53 @@ async def broadcast_get_latest(tmdb_id) -> Optional[Dict[str, Any]]:
             {"tmdb_id": int(tmdb_id)}, sort=[("sent_ts", -1)])
     except Exception:
         return None
+# ═══════════════════════════════════════════════════════════
+# MOVIE STATS + END EVENT
+# ═══════════════════════════════════════════════════════════
 
+async def movie_stats(tmdb_id: int) -> Dict[str, Any]:
+    """Live per-movie stats: subs, notified, broadcasts."""
+    try:
+        total = await subs_coll().count_documents({"tmdb_id": int(tmdb_id)})
+        pending = await subs_coll().count_documents(
+            {"tmdb_id": int(tmdb_id), "notified": False})
+        sent = await sent_coll().count_documents(
+            {"tmdb_id": int(tmdb_id), "mode": "now_available"})
+    except Exception:
+        total = pending = sent = 0
+
+    bc = await broadcast_get_latest(tmdb_id)
+    return {
+        "total_subs": total,
+        "pending": pending,
+        "notified": total - pending,
+        "files_sent": sent,
+        "broadcast": bc,
+        "ended": bool(bc and bc.get("cancelled")),
+    }
+
+
+async def end_movie(tmdb_id: int) -> Dict[str, int]:
+    """
+    Fully end a movie event:
+      • delete every pending sub (tokens)
+      • mark broadcasts cancelled
+    Returns counts.
+    """
+    try:
+        deleted = await cancel_all_subs(tmdb_id)
+    except Exception:
+        deleted = 0
+    try:
+        cancelled = await broadcast_mark_cancelled(tmdb_id)
+    except Exception:
+        cancelled = 0
+    return {"deleted": deleted, "broadcasts_cancelled": cancelled}
+
+
+async def is_movie_ended(tmdb_id: int) -> bool:
+    bc = await broadcast_get_latest(tmdb_id)
+    return bool(bc and bc.get("cancelled"))
 
 # ═══════════════════════════════════════════════════════════
 # INDEXES
