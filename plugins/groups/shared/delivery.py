@@ -86,8 +86,7 @@ _RE_JUNK = re.compile(
     r"esub|esubs|subs|sub|dual\s*audio|multi\s*audio|"
     r"proper|repack|extended|remastered|unrated|imax|"
     r"amzn|nf|dsnp|hmax|pcok|yts|yify|psa|rarbg|"
-    r"1xbet|1x|bet|"
-    r"tg|telegram"
+    r"1xbet|1x"
     r")\b",
     re.IGNORECASE,
 )
@@ -375,16 +374,18 @@ async def show_file_list(
             total_pages=total_pages,
         )
 
-        # Edit if it's a status message, else send new
         try:
-            if hasattr(target, "edit_text"):
+            try:
                 await target.edit_text(
                     text,
                     reply_markup=kb,
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-            else:
+            except Exception as e_edit:
+                if "not modified" in str(e_edit).lower():
+                    return True
+                # Can't edit (media message, deleted, etc.) → fall back
                 await target.reply_text(
                     text,
                     reply_markup=kb,
@@ -393,15 +394,8 @@ async def show_file_list(
                 )
             return True
         except Exception as e:
-            if "not modified" in str(e).lower():
-                return True
             logger.debug(f"[DELIVERY] show: {e}")
             return False
-
-    except Exception as e:
-        logger.exception(f"[DELIVERY] show_file_list: {e}")
-        return False
-
 
 # ============================================================
 # SECTION 7 — SESSION CREATION
