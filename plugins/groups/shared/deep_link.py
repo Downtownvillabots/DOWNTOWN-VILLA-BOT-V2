@@ -41,7 +41,6 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from plugins.groups.shared import deep_link as DL
 
 logger = logging.getLogger(__name__)
 
@@ -495,13 +494,12 @@ async def purge_expired() -> int:
         return 0
     try:
         r = await c.delete_many({
-            "expires_at": {"$lt": datetime.utcnow()}
+            "expires_at": {"$lt": datetime.now(timezone.utc)}
         })
         return int(r.deleted_count or 0)
     except Exception:
         return 0
-
-
+        
 # ============================================================
 # SECTION 9 — INDEXES
 # ============================================================
