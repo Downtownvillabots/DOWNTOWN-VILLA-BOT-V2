@@ -450,6 +450,7 @@ async def _send_request_flow(
                 year=year,
                 kind=kind,
                 tmdb_id=tmdb_id,
+                chat_id=q.message.chat.id if q.message.chat else 0,
             )
             if token:
                 try:
@@ -484,6 +485,7 @@ async def _send_request_flow(
             year=str(year) if year else None,
             kind=kind,
             tmdb_id=tmdb_id,
+            chat_id=q.message.chat.id if q.message.chat else 0,
         )
 
         if not token:
