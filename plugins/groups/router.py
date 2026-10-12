@@ -124,6 +124,24 @@ def _sess_drop(uid: int) -> None:
     _sessions.pop(int(uid), None)
 
 
+def _sess_chat_id(uid: int) -> Optional[int]:
+    """
+    Return the target group chat_id from the session store.
+    NEVER falls back to the callback message's own chat_id —
+    that is the admin's PM and would write to a bogus group.
+    """
+    s = _sess_get(uid)
+    if not s:
+        return None
+    cid = s.get("chat_id")
+    if not cid:
+        return None
+    try:
+        return int(cid)
+    except (TypeError, ValueError):
+        return None
+
+
 def _has_pending(uid: int) -> bool:
     return _sess_get(uid) is not None
 
@@ -284,12 +302,12 @@ async def group_router(client: Client, q: CallbackQuery):
 
         # ── BACK → main panel ──
         if action == "back":
-            sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id")
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
-                chat_id = q.message.chat.id if q.message.chat else 0
-            if not chat_id:
-                return await q.answer("⚠️ No target", show_alert=True)
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
 
             text, kb = await P.render_main(chat_id)
             await _safe_edit(q, text, kb)
@@ -299,12 +317,12 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "s":
             section = parts[2] if len(parts) > 2 else ""
 
-            sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id")
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
-                chat_id = q.message.chat.id if q.message.chat else 0
-            if not chat_id:
-                return await q.answer("⚠️ No target", show_alert=True)
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
 
             if not await _is_group_admin(client, chat_id, uid):
                 return await q.answer("⛔ Admin only", show_alert=True)
@@ -321,9 +339,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "tog":
             field = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not field:
                 return await q.answer("❌")
 
@@ -345,9 +361,7 @@ async def group_router(client: Client, q: CallbackQuery):
             sub = parts[2] if len(parts) > 2 else ""
             val = parts[3] if len(parts) > 3 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -366,9 +380,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "flow":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -382,9 +394,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "flow_tog":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -409,9 +419,7 @@ async def group_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -427,9 +435,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "flow_skip":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -450,9 +456,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "cap":
             sub = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -501,9 +505,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "btn":
             sub = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -579,9 +581,7 @@ async def group_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             await S.save_field(chat_id, "buttons_per_row", n)
@@ -593,9 +593,7 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── WELCOME ──
         if action in ("w_tog", "w_edit", "w_adtog"):
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -642,9 +640,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "ad_tog":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -665,9 +661,7 @@ async def group_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             await S.save_field(
@@ -684,9 +678,7 @@ async def group_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             await S.save_field(
@@ -701,9 +693,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "flt_tog":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id =_sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -720,9 +710,7 @@ async def group_router(client: Client, q: CallbackQuery):
 
         if action == "flt_add":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -746,9 +734,7 @@ async def group_router(client: Client, q: CallbackQuery):
 
         if action == "flt_words":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             text, kb = await P.render_words_list(chat_id)
@@ -757,9 +743,7 @@ async def group_router(client: Client, q: CallbackQuery):
 
         if action == "flt_clear":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -773,9 +757,7 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── FORCE-SUB ──
         if action == "fs_tog":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -790,9 +772,7 @@ async def group_router(client: Client, q: CallbackQuery):
 
         if action == "fs_add":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -820,9 +800,7 @@ async def group_router(client: Client, q: CallbackQuery):
             except (ValueError, IndexError):
                 return await q.answer("❌")
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -840,9 +818,7 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── VERIFY ──
         if action in ("v_tog", "v_url", "v_time"):
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -898,9 +874,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "sec":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -917,9 +891,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "req_tog":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -934,9 +906,7 @@ async def group_router(client: Client, q: CallbackQuery):
 
         if action == "req_ch":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -961,9 +931,7 @@ async def group_router(client: Client, q: CallbackQuery):
         if action == "meta_tog":
             key = parts[2] if len(parts) > 2 else ""
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -979,9 +947,7 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── STATS RESET ──
         if action == "stats_reset":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
@@ -1002,9 +968,7 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── RESET ALL ──
         if action == "reset_do":
             sess = _sess_get(uid) or {}
-            chat_id = sess.get("chat_id") or (
-                q.message.chat.id if q.message.chat else 0
-            )
+            chat_id = _sess_chat_id(uid)
             if not chat_id:
                 return await q.answer("❌")
             if not await _is_group_admin(client, chat_id, uid):
