@@ -49,6 +49,41 @@ logger = logging.getLogger(__name__)
 DIV = F.DIV
 
 
+async def _resolve_request_channel(chat_id: int = 0) -> Optional[int]:
+    """
+    Resolve the request channel for a group.
+
+    Priority:
+      1. group config `requests.channel` (if set)
+      2. global config.REQST_CHANNEL
+      3. None (requests disabled)
+    """
+    # 1. Per-group override
+    if chat_id:
+        try:
+            from plugins.groups import state as GS
+            cfg = await GS.get_config(int(chat_id))
+            r_cfg = cfg.get("requests") or {}
+            ch = r_cfg.get("channel")
+            if ch:
+                try:
+                    return int(ch)
+                except (TypeError, ValueError):
+                    pass
+        except Exception as e:
+            logger.debug(f"[REQ-FLOW] group channel resolve: {e}")
+
+    # 2. Global fallback
+    try:
+        ch = getattr(config, "REQST_CHANNEL", None)
+        if ch:
+            return int(ch)
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
+
 # ============================================================
 # SECTION 1 — USER REGISTRATION CHECK
 # ============================================================
@@ -88,6 +123,7 @@ async def post_request(
     year: Optional[int] = None,
     kind: str = "movie",
     tmdb_id: Optional[int] = None,
+    chat_id: int = 0,
 ) -> Optional[str]:
     """
     Post a request to REQST_CHANNEL.
@@ -132,6 +168,7 @@ async def post_request(
             year=year,
             kind=str(kind or "movie"),
             tmdb_id=tmdb_id,
+            chat_id=chat_id,
         )
     except Exception as e:
         logger.exception(f"[REQ-FLOW] inline post failed: {e}")
@@ -147,6 +184,7 @@ async def _post_inline(
     year: Optional[int],
     kind: str,
     tmdb_id: Optional[int],
+    chat_id: int = 0,
 ) -> Optional[str]:
     """
     Inline request posting — used when requests module is unavailable.
@@ -165,10 +203,11 @@ async def _post_inline(
     if not token:
         return None
 
-    # Post to channel
-    channel_id = getattr(config, "REQST_CHANNEL", None)
+    # Post to the resolved request channel
+    # (per-group override wins, else global REQST_CHANNEL)
+    channel_id = await _resolve_request_channel(chat_id)
     if not channel_id:
-        logger.debug("[REQ-FLOW] REQST_CHANNEL not set — skipping post")
+        logger.debug("[REQ-FLOW] no request channel configured")
         return token  # token exists, just not posted
 
     is_series = str(kind).lower() == "series"
@@ -255,6 +294,7 @@ async def _store_request(
     kind: str,
     tmdb_id: Optional[int],
     deferred: bool = False,
+    chat_id: int = 0,
 ) -> Optional[str]:
     """
     Store a request doc in SYSTEM DB.
@@ -290,6 +330,7 @@ async def _store_request(
         kind=kind,
         tmdb_id=tmdb_id,
         deferred=deferred,
+        chat_id=chat_id,
     )
 
 
@@ -302,6 +343,7 @@ async def _direct_store(
     kind: str,
     tmdb_id: Optional[int],
     deferred: bool = False,
+    chat_id: int = 0,
 ) -> Optional[str]:
     """Fallback: write to `search_requests` directly."""
     try:
@@ -328,6 +370,7 @@ async def _direct_store(
             "user_query": str(title)[:200],
             "status": "pending",
             "deferred": bool(deferred),
+            "chat_id": int(chat_id) if chat_id else None,
             "created_at": now,
             "updated_at": now,
             "expires_at": now + timedelta(days=30),
@@ -350,6 +393,7 @@ async def create_deferred_request(
     year: Optional[str] = None,
     kind: str = "movie",
     tmdb_id: Optional[int] = None,
+    chat_id: int = 0,
 ) -> Optional[str]:
     """
     Store a request that will be POSTED only when the user taps
@@ -378,6 +422,7 @@ async def create_deferred_request(
         kind=kind,
         tmdb_id=tmdb_id,
         deferred=True,
+        chat_id=chat_id,
     )
 
     if token:
@@ -446,8 +491,16 @@ async def handle_req_token(
         username = str(req.get("username") or "")
         full_name = str(req.get("full_name") or "")
 
-        # Post to REQST_CHANNEL
-        channel_id = getattr(config, "REQST_CHANNEL", None)
+        # Resolve request channel — but prefer the one already on
+        # the stored deferred doc, since the group context may be
+        # missing when this fires from PM.
+        stored_chat_id = 0
+        try:
+            stored_chat_id = int(req.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            stored_chat_id = 0
+
+        channel_id = await _resolve_request_channel(stored_chat_id)
         if not channel_id:
             await message.reply_text(
                 "\n".join([
@@ -458,7 +511,6 @@ async def handle_req_token(
                 parse_mode=ParseMode.HTML,
             )
             return True
-
         # Post using the canonical poster if available
         posted = False
         try:
