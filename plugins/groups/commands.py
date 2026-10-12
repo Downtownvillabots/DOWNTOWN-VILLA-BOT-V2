@@ -143,10 +143,11 @@ async def cmd_settings(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
         )
 
-    await _show_group_list(message)
+    await _show_group_list(client, message)
 
 
-async def _show_group_list(message: Message):
+async def _build_group_list() -> Tuple[str, InlineKeyboardMarkup]:
+    """Build the connected-groups list text + keyboard."""
     groups = await S.list_groups(limit=20)
     total = await S.count_groups()
 
@@ -184,13 +185,18 @@ async def _show_group_list(message: Message):
         callback_data="ga:close",
     )])
 
+    return "\n".join(lines)[:4000], InlineKeyboardMarkup(rows)
+
+
+async def _show_group_list(client: Client, message: Message) -> None:
+    """Reply with the connected-groups list."""
+    text, kb = await _build_group_list()
     await message.reply_text(
-        "\n".join(lines)[:4000],
-        reply_markup=InlineKeyboardMarkup(rows),
+        text,
+        reply_markup=kb,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
-
 
 # ============================================================
 # SECTION 3 — /reload
@@ -790,14 +796,29 @@ async def cb_list_groups(client: Client, q: CallbackQuery):
     if not q.from_user or not _is_bot_admin(q.from_user.id):
         return await q.answer("⛔ bot admins only", show_alert=True)
 
+    # Capture chat_id BEFORE deleting the message
+    chat_id = q.message.chat.id if q.message.chat else 0
     try:
         await q.message.delete()
     except Exception:
         pass
 
-    await _show_group_list(q.message)
-    await q.answer()
+    if not chat_id:
+        return await q.answer("❌ chat unavailable", show_alert=True)
 
+    text, kb = await _build_group_list()
+    try:
+        await client.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"[GROUPS] list send: {e}")
+
+    await q.answer()
 
 # ============================================================
 # SECTION 10 — DEEP-LINK ENTRY (gs:{chat_id})
