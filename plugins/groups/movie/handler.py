@@ -8,7 +8,7 @@
 # Flow:
 #   1. Gate: not series group · enabled · content_mode · cooldown
 #   2. Show "🔎 searching…" status
-#   3. quick_search(query)
+#   3. quick_search(query) # Build deep-link
 #        • If hits → file list (delivery.py) + deep-link buttons
 #   4. Spell check + retry (if no hits)
 #   5. Suggestions from TMDB (if still no hits)
@@ -469,13 +469,19 @@ async def _show_request_prompt(
                 ]),
             )
 
-        # Build deep-link
+        # Build deep-link — try identity(), fall back to get_me()
         bot_username = ""
         try:
             me = await client.identity()
-            bot_username = me.username or ""
+            bot_username = getattr(me, "username", "") or ""
         except Exception:
             pass
+        if not bot_username:
+            try:
+                me = await client.get_me()
+                bot_username = getattr(me, "username", "") or ""
+            except Exception:
+                pass
 
         if not bot_username:
             return await _edit_status(
