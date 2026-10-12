@@ -2827,11 +2827,24 @@ async def _cleanup_loop():
             pass
 
 
-try:
-    asyncio.get_event_loop().create_task(_cleanup_loop())
-except Exception:
-    pass
+_cleanup_task: Optional[asyncio.Task] = None
 
+
+def ensure_cleanup() -> None:
+    """
+    Start the cleanup loop (idempotent).
+    Must be called from within a running asyncio loop —
+    plugins/groups/__init__.py::ensure_startup() does this.
+    """
+    global _cleanup_task
+    if _cleanup_task and not _cleanup_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _cleanup_task = loop.create_task(_cleanup_loop())
+        logger.info("[SERIES-H] cleanup loop started")
+    except RuntimeError:
+        logger.debug("[SERIES-H] cleanup loop deferred (no running loop)")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 28 — SNAPSHOT
@@ -2866,4 +2879,5 @@ __all__ = [
     "check_fsub", "kb_fsub",
     "user_started_bot",
     "snapshot",
+    "ensure_cleanup",
 ]
