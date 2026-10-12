@@ -233,9 +233,10 @@ async def admin_list_router(client: Client, q: CallbackQuery):
             # Ensure the group exists in state DB
             await S.register_group(chat_id)
 
-            # Set session so the panel router knows the target chat
-            # (we access the router's internal session store by design)
-            R._sess_new(uid, "panel", chat_id)
+            # Set session so the panel router knows the target chat.
+            # step name is "view" — text_input.py silently ignores
+            # unknown steps, so this is safe.
+            R._sess_new(uid, "view", chat_id)
 
             # Render the panel and edit the existing message
             await R.open_panel_edit(client, q, chat_id)
