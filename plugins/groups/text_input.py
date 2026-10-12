@@ -165,8 +165,13 @@ async def groups_text_input(client: Client, message: Message):
         elif step == "req_ch":
             await _handle_req_ch(client, message, chat_id, text, uid)
         else:
-            # unknown step → drop
-            R.drop_session(uid)
+            # Unknown step (e.g. "view" from admin_list.py).
+            # Don't drop the session — the user may have typed
+            # text by mistake. Let it expire naturally.
+            logger.debug(
+                f"[GROUPS-TEXT] ignoring step={step!r} for uid={uid}"
+            )
+            return
 
         # Block further handlers (avoid double replies)
         try:
