@@ -456,6 +456,7 @@ async def _show_request_prompt(
             year=None,
             kind="movie",
             tmdb_id=None,
+            chat_id=status.chat.id if status.chat else 0,
         )
 
         if not token:
