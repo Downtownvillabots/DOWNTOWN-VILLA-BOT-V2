@@ -41,6 +41,62 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# SECTION 0 — SHARED HELPERS
+# ============================================================
+
+async def _bot_username(client: Client) -> str:
+    """
+    Resolve the bot username safely.
+    Tries `identity()` first (custom client method), then falls
+    back to the standard Pyrogram `get_me()`. Never raises.
+    """
+    # ✅ FIX: single helper for every bot-username lookup
+    try:
+        me = await client.identity()
+        u = getattr(me, "username", "") or ""
+        if u:
+            return u
+    except Exception:
+        pass
+    try:
+        me = await client.get_me()
+        return getattr(me, "username", "") or ""
+    except Exception:
+        return ""
+
+
+def _read_search_cfg(cfg: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Return per-page / per-row from the nested `search` section.
+    ✅ FIX: keys live at cfg["search"], not top level.
+    """
+    s = cfg.get("search") or {}
+    try:
+        per_page = int(s.get("search_per_page", 10) or 10)
+    except (TypeError, ValueError):
+        per_page = 10
+    try:
+        per_row = int(s.get("search_per_row", 1) or 1)
+    except (TypeError, ValueError):
+        per_row = 1
+    return {"per_page": per_page, "per_row": per_row}
+
+
+def _read_sort_mode(cfg: Dict[str, Any]) -> str:
+    """
+    Return sort mode from the delivery step config.
+    ✅ FIX: sort_order lives at cfg["flow"]["file_delivery"]["sort_order"],
+    not top level.
+    """
+    flow = cfg.get("flow") or {}
+    fd = flow.get("file_delivery") or {}
+    mode = str(fd.get("sort_order", "small_to_big") or "small_to_big")
+    if mode not in ("small_to_big", "big_to_small"):
+        mode = "small_to_big"
+    return mode
+
+
+# ============================================================
 # SECTION 1 — SESSION LOOKUP
 # ============================================================
 
@@ -127,11 +183,8 @@ async def _prompt_start(client: Client, q: CallbackQuery) -> None:
     If delivery fails (user never started bot), send a
     "start the bot" prompt.
     """
-    try:
-        me = await client.identity()
-        bot_username = me.username or ""
-    except Exception:
-        bot_username = ""
+    # ✅ FIX: use safe helper
+    bot_username = await _bot_username(client)
 
     if not bot_username:
         return await q.answer(
@@ -198,22 +251,17 @@ async def sr_more(client: Client, q: CallbackQuery):
 
         cfg = await S.get_config(q.message.chat.id)
 
-        # Rebuild keyboard for this page, then edit in place
-        bot_username = ""
-        try:
-            me = await client.identity()
-            bot_username = me.username or ""
-        except Exception:
-            pass
+        # ✅ FIX: safe bot username
+        bot_username = await _bot_username(client)
 
-        per_page = int(cfg.get("search_per_page", 10))
-        per_row = int(cfg.get("search_per_row", 1))
+        # ✅ FIX: read pagination from nested search section
+        pag = _read_search_cfg(cfg)
+        per_page = pag["per_page"]
+        per_row = pag["per_row"]
 
-        # Sort small → big to stay consistent with initial view
-        hits = SEARCH.sort_hits(
-            hits,
-            mode=str(cfg.get("sort_order", "small_to_big")),
-        )
+        # ✅ FIX: read sort mode from flow.file_delivery
+        sort_mode = _read_sort_mode(cfg)
+        hits = SEARCH.sort_hits(hits, mode=sort_mode)
 
         kb, total_pages, page = DELIVERY.build_file_list_kb(
             sid=sid,
@@ -444,12 +492,8 @@ async def _send_request_flow(
                 show_alert=True,
             )
 
-        # Get bot username
-        try:
-            me = await client.identity()
-            bot_username = me.username or ""
-        except Exception:
-            bot_username = ""
+        # ✅ FIX: safe bot username
+        bot_username = await _bot_username(client)
 
         if not bot_username:
             return await q.answer(
@@ -472,17 +516,16 @@ async def _send_request_flow(
                     f"📌 {F.sc('tap the button to send request')}",
                     f"📌 {F.sc('the admin will be notified')}",
                 ]),
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
                         f"{F.EMO['rocket']} {F.sc('send request')}",
                         url=deep_link,
-                    ),
-                ], [
-                    InlineKeyboardButton(
+                    )],
+                    [InlineKeyboardButton(
                         f"{F.EMO['cross']} {F.sc('cancel')}",
                         callback_data="sr:cancel",
-                    ),
-                ]]),
+                    )],
+                ]),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
