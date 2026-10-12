@@ -920,7 +920,10 @@ async def update_request(token: str, status: str) -> bool:
     try:
         r = await c.update_one(
             {"token_id": token},
-            {"$set": {"status": status, "updated_at": time.time()}},
+            {"$set": {
+                "status": status,
+                "updated_at": datetime.now(timezone.utc),
+            }},
         )
         return r.modified_count > 0
     except Exception:
