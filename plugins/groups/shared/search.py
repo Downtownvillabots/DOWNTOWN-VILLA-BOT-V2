@@ -293,6 +293,20 @@ def sort_hits(
 # SECTION 5 — FILTERS
 # ============================================================
 
+# ============================================================
+# SECTION 5 — FILTERS
+# ============================================================
+
+def _to_int_safe(v: Any) -> Optional[int]:
+    """Convert v to int safely. None on failure."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def filter_by_kind(
     hits: List[Dict[str, Any]],
     kind: str,
