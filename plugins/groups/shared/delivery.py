@@ -334,9 +334,12 @@ async def show_file_list(
     target: Message (send new) or status Message (edit)
     client: used to fetch bot username for deep-links
     """
-    try:
-        # Sort small → big
-        mode = str(cfg.get("sort_order", "small_to_big"))
+         # Sort by the delivery step setting (not a top-level key)
+        flow = cfg.get("flow") or {}
+        fd = flow.get("file_delivery") or {}
+        mode = str(fd.get("sort_order", "small_to_big") or "small_to_big")
+        if mode not in ("small_to_big", "big_to_small"):
+            mode = "small_to_big"
         sorted_hits = SEARCH.sort_hits(hits, mode=mode)
 
         # Resolve bot username
@@ -352,10 +355,19 @@ async def show_file_list(
                 except Exception:
                     bot_username = ""
 
-        # Per-page and per-row from config
-        per_page = int(cfg.get("search_per_page", _PER_PAGE_DEFAULT))
-        per_row = int(cfg.get("search_per_row", 1))
-
+        # Per-page and per-row from the nested `search` section
+        s_cfg = cfg.get("search") or {}
+        try:
+            per_page = int(
+                s_cfg.get("search_per_page", _PER_PAGE_DEFAULT)
+                or _PER_PAGE_DEFAULT
+            )
+        except (TypeError, ValueError):
+            per_page = _PER_PAGE_DEFAULT
+        try:
+            per_row = int(s_cfg.get("search_per_row", 1) or 1)
+        except (TypeError, ValueError):
+            per_row = 1
         total = len(sorted_hits)
 
         kb, total_pages, page = build_file_list_kb(
