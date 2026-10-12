@@ -67,7 +67,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "season":        {"enabled": True, "per_row": 2, "auto_skip": True,
                           "max_items": 12},
         "episode":       {"enabled": True, "per_row": 4, "auto_skip": True,
-                          "max_items": 20, "per_page": 20},
+                          "max_items": 20, "per_page": 10},
         "quality":       {"enabled": True, "per_row": 2, "auto_skip": True,
                           "max_items": 8},
         "file_delivery": {"enabled": True, "per_row": 1, "max_items": 10,
