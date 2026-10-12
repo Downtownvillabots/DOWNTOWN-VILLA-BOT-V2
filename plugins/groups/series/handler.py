@@ -504,11 +504,12 @@ def kb_seasons(
 def kb_episodes(
     eps: List[int], season: int, local_eps: List[int],
     per_row: int = 4, max_items: int = 30,
+    page: int = 1, per_page: int = 10,
 ) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
+    # Dedupe + sort
+    clean: List[int] = []
     seen: Set[int] = set()
-    for ep in eps[:max_items]:
+    for ep in eps:
         try:
             e = int(ep)
         except (TypeError, ValueError):
@@ -516,6 +517,28 @@ def kb_episodes(
         if e in seen:
             continue
         seen.add(e)
+        clean.append(e)
+    clean.sort()
+
+    total = len(clean)
+    if total == 0:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ BACK", callback_data="sg:back_seas"),
+            InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
+        ]])
+
+    # Clamp values
+    per_page = max(1, min(30, int(per_page or 10)))
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(total_pages, int(page or 1)))
+
+    start = (page - 1) * per_page
+    end = min(start + per_page, total)
+    slice_eps = clean[start:end]
+
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for e in slice_eps:
         mark = "🟢" if e in local_eps else "⚪"
         row.append(InlineKeyboardButton(
             f"{mark} E{e:02d}", callback_data=f"sg:ep:{e}"))
@@ -524,6 +547,26 @@ def kb_episodes(
             row = []
     if row:
         rows.append(row)
+
+    # Pagination row (only if multi-page)
+    if total_pages > 1:
+        nav: List[InlineKeyboardButton] = []
+        if page > 1:
+            nav.append(InlineKeyboardButton(
+                f"⬅️ {page - 1}",
+                callback_data=f"sg:ep_page:{page - 1}",
+            ))
+        nav.append(InlineKeyboardButton(
+            f"📄 {page}/{total_pages}",
+            callback_data="sg:ep_noop",
+        ))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton(
+                f"{page + 1} ➡️",
+                callback_data=f"sg:ep_page:{page + 1}",
+            ))
+        rows.append(nav)
+
     rows.append([
         InlineKeyboardButton("◀️ BACK", callback_data="sg:back_seas"),
         InlineKeyboardButton("❌ CLOSE", callback_data="sg:close"),
@@ -1847,11 +1890,27 @@ async def render_episode(
     per_row = await get_per_row(chat_id, "episode", 4)
     max_items = await get_max_items(chat_id, "episode", 30)
 
-    text = view_episodes(c.get("title"), season_i, len(season_hits or filtered))
-    kb = kb_episodes(all_eps, season_i, local_eps, per_row, max_items)
+    # Read per_page from the episode step config (defaults 10)
+    try:
+        step_cfg = await SFLOW.get_step_cfg(chat_id, "episode")
+        per_page = int(step_cfg.get("per_page", 10) or 10)
+    except Exception:
+        per_page = 10
+    per_page = max(5, min(20, per_page))
+
+    # Page from session (defaults 1, reset on new search)
+    page = int(c.get("ep_page", 1) or 1)
+
+    text = view_episodes(
+        c.get("title"), season_i, len(season_hits or filtered),
+    )
+    kb = kb_episodes(
+        all_eps, season_i, local_eps,
+        per_row=per_row, max_items=max_items,
+        page=page, per_page=per_page,
+    )
 
     await render(client, chat_id, target.id, text, kb, None)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 17b — QUALITY (v1 UX with user-started gate)
@@ -2482,6 +2541,7 @@ async def cb_seas(client: Client, q: CallbackQuery):
 
         season = int(merged[idx]["season"])
         c["selected_season"] = season
+        c["ep_page"] = 1   # reset pagination when new season picked
 
         filtered = c.get("filtered_hits") or s["data"].get("hits") or []
         try:
@@ -2525,6 +2585,39 @@ async def cb_ep(client: Client, q: CallbackQuery):
             await q.answer("⚠️ error", show_alert=True)
         except Exception:
             pass
+
+@Client.on_callback_query(
+    filters.regex(r"^sg:ep_page:(\d+)$"), group=-9999,
+)
+async def cb_ep_page(client: Client, q: CallbackQuery):
+    """Navigate to a specific episode page."""
+    try:
+        page = int(q.matches[0].group(1))
+        uid = q.from_user.id
+        s = sess_get(uid)
+        if not s:
+            return await q.answer("⏱️ expired", show_alert=True)
+
+        c = s["data"].get("chosen") or {}
+        c["ep_page"] = max(1, page)
+        sess_set(uid, chosen=c)
+
+        await q.answer(f"📄 {page}")
+        await render_episode(client, q.message, uid)
+    except Exception as e:
+        logger.exception(f"[SERIES-H] cb_ep_page: {e}")
+        try:
+            await q.answer("⚠️ error", show_alert=True)
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(
+    filters.regex(r"^sg:ep_noop$"), group=-9999,
+)
+async def cb_ep_noop(client: Client, q: CallbackQuery):
+    """Page-number button — no action."""
+    return await q.answer()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2604,7 +2697,13 @@ async def cb_back_lang(client: Client, q: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sg:back_seas$"), group=-9999)
 async def cb_back_seas(client: Client, q: CallbackQuery):
-    await render_season(client, q.message, q.from_user.id)
+    uid = q.from_user.id
+    s = sess_get(uid)
+    if s:
+        c = s["data"].get("chosen") or {}
+        c["ep_page"] = 1
+        sess_set(uid, chosen=c)
+    await render_season(client, q.message, uid)
     await q.answer()
 
 
@@ -2874,6 +2973,7 @@ __all__ = [
     "goto_step", "advance",
     "cb_pick", "cb_request",
     "cb_lang", "cb_seas", "cb_ep", "cb_qual",
+    "cb_ep_page", "cb_ep_noop",
     "cb_fsub_check",
     "cb_back_sugg", "cb_back_lang",
     "cb_back_seas", "cb_back_ep",
