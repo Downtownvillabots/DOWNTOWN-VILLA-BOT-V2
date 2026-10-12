@@ -817,6 +817,7 @@ async def add_request(
         return None
     try:
         token = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc)
         await c.insert_one({
             "token_id": token,
             "user_id": int(user_id),
@@ -827,7 +828,9 @@ async def add_request(
             "kind": "series",
             "source": source,
             "status": "not_found",
-            "created_at": time.time(),
+            "created_at": now,
+            "updated_at": now,
+            "expires_at": now + timedelta(days=30),
         })
         return token
     except Exception as e:
