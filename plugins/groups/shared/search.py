@@ -329,28 +329,53 @@ def filter_by_language(
     return out
 
 
+def _to_int_safe(v: Any) -> Optional[int]:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def filter_by_season(
     hits: List[Dict[str, Any]],
     season: int,
 ) -> List[Dict[str, Any]]:
-    return [h for h in hits if h.get("season") == season]
+    target = _to_int_safe(season)
+    if target is None:
+        return list(hits)
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        if _to_int_safe(h.get("season")) == target:
+            out.append(h)
+    return out
 
 
 def filter_by_episode(
     hits: List[Dict[str, Any]],
     episode: int,
 ) -> List[Dict[str, Any]]:
-    return [h for h in hits if h.get("episode") == episode]
+    target = _to_int_safe(episode)
+    if target is None:
+        return list(hits)
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        if _to_int_safe(h.get("episode")) == target:
+            out.append(h)
+    return out
 
 
 def filter_by_quality(
     hits: List[Dict[str, Any]],
     quality: str,
 ) -> List[Dict[str, Any]]:
-    q = (quality or "").upper()
+    q = (quality or "").upper().strip()
+    if not q:
+        return list(hits)
     return [
         h for h in hits
-        if str(h.get("quality") or "").upper() == q
+        if str(h.get("quality") or "").upper().strip() == q
     ]
 
 
