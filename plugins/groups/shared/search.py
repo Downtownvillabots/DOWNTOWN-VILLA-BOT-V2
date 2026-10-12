@@ -289,9 +289,6 @@ def sort_hits(
         return list(hits)
 
 
-# ============================================================
-# SECTION 5 — FILTERS
-# ============================================================
 
 # ============================================================
 # SECTION 5 — FILTERS
@@ -341,16 +338,6 @@ def filter_by_language(
         if not langs or any(ll in l or l in ll for l in langs):
             out.append(h)
     return out
-
-
-def _to_int_safe(v: Any) -> Optional[int]:
-    if v is None or v == "":
-        return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
-
 
 def filter_by_season(
     hits: List[Dict[str, Any]],
