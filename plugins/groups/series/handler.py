@@ -896,12 +896,34 @@ async def post_to_request_channel(
     year: Optional[Any] = None,
     tmdb_id: Optional[int] = None,
     source: str = "series_search",
+    chat_id: Optional[int] = None,
 ) -> Optional[str]:
-    if not REQST_CHANNEL:
-        logger.warning("[SERIES-H] REQST_CHANNEL not set")
+        # Resolve per-group request channel (fallback to global)
+    channel_id: Optional[int] = None
+    try:
+        from plugins.groups.shared import request_flow as _RF
+        channel_id = await _RF._resolve_request_channel(chat_id or 0)
+    except Exception as e:
+        logger.debug(f"[SERIES-H] channel resolve: {e}")
+        channel_id = None
+
+    if not channel_id:
+        channel_id = REQST_CHANNEL
+    if not channel_id:
+        logger.warning("[SERIES-H] no request channel configured")
         return None
 
     token = await add_request(user_id, title, year, tmdb_id, source)
+    if token and chat_id:
+        try:
+            c = _req_coll()
+            if c is not None:
+                await c.update_one(
+                    {"token_id": token},
+                    {"$set": {"chat_id": int(chat_id)}},
+                )
+        except Exception as e:
+            logger.debug(f"[SERIES-H] tag chat_id: {e}")
     if not token:
         return None
 
@@ -945,10 +967,11 @@ async def post_to_request_channel(
 
     try:
         await client.send_message(
-            chat_id=REQST_CHANNEL, text="\n".join(lines),
+            chat_id=channel_id, text="\n".join(lines),
             reply_markup=kb, parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        
         logger.info(f"[SERIES-H] request posted token={token}")
         return token
     except Exception as e:
@@ -1041,6 +1064,7 @@ async def kb_fsub(
 # ═══════════════════════════════════════════════════════════════════════════
 async def handle_no_results(
     client: Client, message: Message, status: Message, raw: str,
+    chat_id: Optional[int] = None,
 ) -> None:
     try:
         await client.edit_message_text(
@@ -1062,6 +1086,7 @@ async def handle_no_results(
         token = await post_to_request_channel(
             client, message.from_user.id, raw,
             source="series_no_match",
+            chat_id=chat_id or (message.chat.id if message.chat else 0),
         )
 
         if token:
@@ -1372,6 +1397,7 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if not stored:
                 return await handle_no_results(
                     client, message, status, txt,
+                    chat_id=chat_id,
                 )
 
             sess_new(
@@ -2380,6 +2406,7 @@ async def cb_pick(client: Client, q: CallbackQuery):
                 client, uid, title,
                 year=year or None, tmdb_id=tmdb_id,
                 source="suggestion_not_in_db",
+                chat_id=q.message.chat.id if q.message.chat else 0,
             )
 
             # Get bot username for the Start button
@@ -2469,6 +2496,7 @@ async def cb_request(client: Client, q: CallbackQuery):
         token = await post_to_request_channel(
             client, q.from_user.id, raw,
             source="series_manual_request",
+            chat_id=q.message.chat.id if q.message.chat else 0,
         )
         if token:
             await render(
