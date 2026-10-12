@@ -150,14 +150,20 @@ def summary() -> str:
 def ensure_startup() -> None:
     """
     Called by core.startup after client boots.
-    Ensures text_input cleanup loop is running.
+    Starts cleanup loops for text_input + series handler.
     """
     try:
         from plugins.groups import text_input
         text_input.ensure_cleanup()
     except Exception as e:
-        logger.debug(f"[GROUPS] startup hook: {e}")
+        logger.debug(f"[GROUPS] startup (text_input): {e}")
 
+    try:
+        from plugins.groups.series import handler as _sh
+        if hasattr(_sh, "ensure_cleanup"):
+            _sh.ensure_cleanup()
+    except Exception as e:
+        logger.debug(f"[GROUPS] startup (series handler): {e}")
 
 # ============================================================
 # SECTION 5 — PUBLIC API (re-export common helpers)
