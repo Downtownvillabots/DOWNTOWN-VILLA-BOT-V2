@@ -283,6 +283,18 @@ async def _deliver_files(
     chat_id: int,
     corrected_from: Optional[str] = None,
 ) -> None:
+    # Cap by the delivery step's max_items BEFORE creating the
+    # session — so sr:more pagination uses the same list.
+    try:
+        flow = cfg.get("flow") or {}
+        fd = flow.get("file_delivery") or {}
+        max_items = int(fd.get("max_items", 15) or 15)
+    except (TypeError, ValueError):
+        max_items = 15
+    max_items = max(1, min(30, max_items))
+    if len(hits) > max_items:
+        hits = hits[:max_items]
+
     # Create session for delivery + pagination
     sid = await DELIVERY.create_session(
         user_id=uid,
