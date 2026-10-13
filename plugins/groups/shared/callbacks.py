@@ -381,6 +381,18 @@ async def sr_sug(client: Client, q: CallbackQuery):
             uid = q.from_user.id
             chat_id = q.message.chat.id
 
+            # Cap using the delivery step's max_items
+            cfg_tmp = await S.get_config(chat_id)
+            try:
+                flow = cfg_tmp.get("flow") or {}
+                fd = flow.get("file_delivery") or {}
+                max_items = int(fd.get("max_items", 15) or 15)
+            except (TypeError, ValueError):
+                max_items = 15
+            max_items = max(1, min(30, max_items))
+            if len(hits) > max_items:
+                hits = hits[:max_items]
+
             new_sid = await DELIVERY.create_session(
                 user_id=uid,
                 chat_id=chat_id,
