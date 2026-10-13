@@ -368,6 +368,17 @@ async def show_file_list(
             per_row = int(s_cfg.get("search_per_row", 1) or 1)
         except (TypeError, ValueError):
             per_row = 1
+
+        # Max items — from the delivery step (default 15, capped by _PER_PAGE_MAX
+        # times pages). If 0/unset → no cap.
+        try:
+            max_items = int(fd.get("max_items", 15) or 15)
+        except (TypeError, ValueError):
+            max_items = 15
+        max_items = max(1, min(30, max_items))
+        if len(sorted_hits) > max_items:
+            sorted_hits = sorted_hits[:max_items]
+
         total = len(sorted_hits)
 
         kb, total_pages, page = build_file_list_kb(
