@@ -266,6 +266,7 @@ async def _run_pipeline(
         client=client,
         status=status,
         query=query,
+        chat_id=chat_id,
     )
 
 
@@ -363,7 +364,9 @@ async def _show_suggestions(
     stored = [s for s in stored if s.get("title")]
 
     if not stored:
-        return await _show_request_prompt(client, status, query)
+        return await _show_request_prompt(
+            client, status, query, chat_id=chat_id,
+        )
 
     # Create a session to hold the suggestions
     sid = await DELIVERY.create_session(
@@ -448,6 +451,7 @@ async def _show_request_prompt(
     client: Client,
     status: Message,
     query: str,
+    chat_id: int = 0,
 ) -> None:
     """
     Nothing found. Try to post a request directly.
@@ -535,6 +539,12 @@ async def _show_request_prompt(
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+            # Track the "not found" stat too — previously only
+            # search/results were tracked
+            try:
+                await S.bump_stat(chat_id, "not_found")
+            except Exception:
+                pass
         except Exception as e:
             logger.debug(f"[MOVIE-H] request prompt: {e}")
 
