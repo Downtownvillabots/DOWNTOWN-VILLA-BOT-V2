@@ -488,6 +488,88 @@ def build_empty_card(
 
 
 # ============================================================
+# SECTION 8b — AUTO-DELETE WARNING
+# ============================================================
+
+def build_autodelete_warning(
+    seconds: int,
+    title: str = "",
+    count: int = 1,
+) -> str:
+    """
+    Build the "this will be deleted" warning text.
+    seconds — how long until deletion
+    title   — movie/series name (optional)
+    count   — number of files about to be sent
+    """
+    if seconds <= 0:
+        return ""
+
+    # Human-friendly time
+    if seconds < 60:
+        t_str = f"{seconds}s"
+    elif seconds < 3600:
+        mins = seconds // 60
+        t_str = f"{mins} min"
+    else:
+        hrs = seconds // 3600
+        t_str = f"{hrs}h"
+
+    lines = [
+        f"⚠️ <b>{F.fb('AUTO-DELETE ENABLED')}</b>",
+        F.DIV, "",
+    ]
+    if title:
+        lines.append(f"🎬 <b>{F.sc(title[:60])}</b>")
+
+    if count > 1:
+        lines.append(
+            f"📁 <b>{count}</b> ꜰɪʟᴇꜱ · ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ "
+            f"<b>{t_str}</b>"
+        )
+    else:
+        lines.append(
+            f"📁 {F.sc('will be deleted in')} <b>{t_str}</b>"
+        )
+
+    lines += [
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('forward or save now')}",
+        f"📌 {F.sc('once deleted, search again')}",
+    ]
+    return "\n".join(lines)
+
+
+def read_autodelete_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return auto-delete settings for this group, in a form the
+    delivery code can use directly.
+
+    {
+      "enabled": bool,       # overall
+      "seconds": int,        # 0 = off
+      "warn_first": bool,    # send warning before files
+    }
+    """
+    ad = cfg.get("auto_delete") or {}
+    enabled = bool(ad.get("bot_messages", True))
+    try:
+        seconds = int(ad.get("bot_timer", 600) or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+
+    if not enabled or seconds <= 0:
+        return {"enabled": False, "seconds": 0, "warn_first": False}
+
+    return {
+        "enabled": True,
+        "seconds": seconds,
+        "warn_first": True,
+    }
+
+
+# ============================================================
 # SECTION 9 — PUBLIC EXPORTS
 # ============================================================
 
@@ -502,4 +584,7 @@ __all__ = [
     "show_file_list",
     "create_session",
     "build_empty_card",
+    # Auto-delete
+    "build_autodelete_warning",
+    "read_autodelete_cfg",
 ]
