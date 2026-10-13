@@ -263,6 +263,17 @@ async def sr_more(client: Client, q: CallbackQuery):
         sort_mode = _read_sort_mode(cfg)
         hits = SEARCH.sort_hits(hits, mode=sort_mode)
 
+        # ✅ FIX: apply the same max_items cap as show_file_list
+        try:
+            flow = cfg.get("flow") or {}
+            fd = flow.get("file_delivery") or {}
+            max_items = int(fd.get("max_items", 15) or 15)
+        except (TypeError, ValueError):
+            max_items = 15
+        max_items = max(1, min(30, max_items))
+        if len(hits) > max_items:
+            hits = hits[:max_items]
+
         kb, total_pages, page = DELIVERY.build_file_list_kb(
             sid=sid,
             hits=hits,
