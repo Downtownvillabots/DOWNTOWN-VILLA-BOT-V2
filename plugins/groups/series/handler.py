@@ -305,7 +305,16 @@ async def wizard_steps(chat_id: int) -> List[str]:
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 5 — VIEWS
 # ═══════════════════════════════════════════════════════════════════════════
-def view_suggestions(raw: str, items: List[Dict[str, Any]]) -> str:
+def view_suggestions(
+    raw: str,
+    items: List[Dict[str, Any]],
+    *,
+    show_rating: bool = True,
+) -> str:
+    """
+    Suggestion list header.
+    show_rating toggle comes from per-group config.
+    """
     lines = [
         f"{F.EMO['brand']} <b>{fb('DOWNTOWN VILLA')}</b>",
         f"🎬 <b>{fb('SERIES SUGGESTIONS')}</b>",
@@ -316,20 +325,21 @@ def view_suggestions(raw: str, items: List[Dict[str, Any]]) -> str:
     ]
     for i, it in enumerate(items, 1):
         title = (it.get("title") or "?").strip().upper()
-        rating = it.get("rating") or 0
         line = f"<b>{i}.</b> <b>{esc(title)}</b>"
-        try:
-            if rating:
-                line += f" · ⭐ {float(rating):.1f}"
-        except (TypeError, ValueError):
-            pass
+        if show_rating:
+            rating = it.get("rating") or 0
+            try:
+                r_float = float(rating)
+                if r_float > 0:
+                    line += f" · ⭐ {r_float:.1f}"
+            except (TypeError, ValueError):
+                pass
         lines.append(line)
     lines += [
         "", DIV_S,
         f"💡 {sc('not what you wanted?')} · ᴛᴀᴘ ʀᴇǫᴜᴇꜱᴛ ʙᴜᴛᴛᴏɴ",
     ]
     return "\n".join(lines)
-
 
 def view_languages(title: str, year: Any) -> str:
     yr = f" ({year})" if year else ""
@@ -426,19 +436,53 @@ def view_no_files_card(title: str, year: Any = None) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 6 — KEYBOARDS
 # ═══════════════════════════════════════════════════════════════════════════
-def kb_suggestions(items: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+def kb_suggestions(
+    items: List[Dict[str, Any]],
+    *,
+    show_rating: bool = True,
+    show_year: bool = True,
+    show_icon: bool = True,
+) -> InlineKeyboardMarkup:
+    """
+    Build the suggestion keyboard.
+
+    Toggles come from `flow.suggestions.{show_*}` in the
+    group's config — per-group control.
+    """
     rows: List[List[InlineKeyboardButton]] = []
     for i, it in enumerate(items):
         title = (it.get("title") or "?").strip().upper()
         if len(title) > 42:
             title = title[:41] + "…"
-        rating = it.get("rating") or 0
-        label = title
-        try:
-            if rating:
-                label += f" ⭐{float(rating):.1f}"
-        except (TypeError, ValueError):
-            pass
+
+        kind = str(it.get("kind") or "movie")
+        icon = "📺" if kind == "series" else "🎬"
+
+        # Compose label per toggles
+        if show_icon:
+            label = f"{icon} {title}"
+        else:
+            label = title
+
+        # Year
+        year = it.get("year")
+        if show_year and year:
+            label += f" ({year})"
+
+        # Rating
+        if show_rating:
+            rating = it.get("rating") or 0
+            try:
+                r_float = float(rating)
+            except (TypeError, ValueError):
+                r_float = 0.0
+            if r_float > 0:
+                label += f" ⭐{r_float:.1f}"
+
+        # Cap
+        if len(label) > 60:
+            label = label[:57] + "…"
+
         rows.append([
             InlineKeyboardButton(label, callback_data=f"sg:pick:{i}")
         ])
@@ -1450,13 +1494,28 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                 uid, chat_id,
                 suggestions=stored, raw_query=txt,
             )
+
+            # Read per-group toggles (default: show everything)
+            try:
+                flow = cfg.get("flow") or {}
+                sugg_cfg = flow.get("suggestions") or {}
+            except Exception:
+                sugg_cfg = {}
+            show_rating = bool(sugg_cfg.get("show_rating", True))
+            show_year = bool(sugg_cfg.get("show_year", True))
+            show_icon = bool(sugg_cfg.get("show_icon", True))
+
             await render(
                 client, chat_id, status.id,
-                view_suggestions(txt, stored),
-                kb_suggestions(stored),
+                view_suggestions(txt, stored, show_rating=show_rating),
+                kb_suggestions(
+                    stored,
+                    show_rating=show_rating,
+                    show_year=show_year,
+                    show_icon=show_icon,
+                ),
                 None,
             )
-
         except Exception as e:
             logger.exception(f"[SERIES-H] entry: {e}")
             if status is not None:
@@ -2794,21 +2853,42 @@ async def cb_fsub_check(client: Client, q: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^sg:back_sugg$"), group=-9999)
 async def cb_back_sugg(client: Client, q: CallbackQuery):
-    s = sess_get(q.from_user.id)
+    uid = q.from_user.id
+    s = sess_get(uid)
     if not s:
         return await q.answer("⏱️ expired", show_alert=True)
     items = s["data"].get("suggestions") or []
     raw = s["data"].get("raw_query") or ""
     if not items:
         return await q.answer("⚠️ no suggestions", show_alert=True)
+
+    chat_id = s["data"].get("chat_id") or (
+        q.message.chat.id if q.message.chat else 0
+    )
+
+    # Read toggles again (in case admin changed them)
+    try:
+        cfg = await S.get_config(chat_id)
+        flow = cfg.get("flow") or {}
+        sugg_cfg = flow.get("suggestions") or {}
+    except Exception:
+        sugg_cfg = {}
+    show_rating = bool(sugg_cfg.get("show_rating", True))
+    show_year = bool(sugg_cfg.get("show_year", True))
+    show_icon = bool(sugg_cfg.get("show_icon", True))
+
     await render(
         client, q.message.chat.id, q.message.id,
-        view_suggestions(raw, items),
-        kb_suggestions(items),
+        view_suggestions(raw, items, show_rating=show_rating),
+        kb_suggestions(
+            items,
+            show_rating=show_rating,
+            show_year=show_year,
+            show_icon=show_icon,
+        ),
         None,
     )
     await q.answer()
-
 
 @Client.on_callback_query(filters.regex(r"^sg:back_lang$"), group=-9999)
 async def cb_back_lang(client: Client, q: CallbackQuery):
