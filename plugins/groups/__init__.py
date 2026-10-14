@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 from typing import Dict, List, Tuple
@@ -63,6 +64,7 @@ _ORDERED_MODULES: List[Tuple[str, str]] = [
     ("plugins.groups.shared.delivery",       "shared.delivery"),
     ("plugins.groups.shared.deep_link",      "shared.deep_link"),
     ("plugins.groups.shared.request_flow",   "shared.request_flow"),
+    ("plugins.groups.shared.verify",         "shared.verify"),
     ("plugins.groups.shared.callbacks",      "shared.callbacks"),
 
     # ── Movie (library → then handler) ──
@@ -150,7 +152,7 @@ def summary() -> str:
 def ensure_startup() -> None:
     """
     Called by core.startup after client boots.
-    Starts cleanup loops for text_input + series handler.
+    Starts cleanup loops + initialises DB indexes.
     """
     try:
         from plugins.groups import text_input
@@ -164,6 +166,13 @@ def ensure_startup() -> None:
             _sh.ensure_cleanup()
     except Exception as e:
         logger.debug(f"[GROUPS] startup (series handler): {e}")
+
+    try:
+        from plugins.groups.shared import verify as _v
+        loop = asyncio.get_running_loop()
+        loop.create_task(_v.ensure_indexes())
+    except Exception as e:
+        logger.debug(f"[GROUPS] startup (verify): {e}")
 
 # ============================================================
 # SECTION 5 — PUBLIC API (re-export common helpers)
