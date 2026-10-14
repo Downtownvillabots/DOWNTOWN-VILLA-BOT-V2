@@ -546,7 +546,7 @@ async def render_flow_step(
         ))
     rows.append(layout_row)
 
-        if step_key in ("language", "season", "episode", "quality"):
+    if step_key in ("language", "season", "episode", "quality"):
         rows.append([InlineKeyboardButton(
             f"🔄 {F.sc('auto-skip if one')} · {'🟢' if auto_skip else '🔴'}",
             callback_data=f"ga:flow_skip:{step_key}",
