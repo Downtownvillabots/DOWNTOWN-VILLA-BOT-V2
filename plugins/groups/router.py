@@ -387,6 +387,39 @@ async def group_router(client: Client, q: CallbackQuery):
             return
 
         # ── SET CONTENT MODE ──
+        # ── SEARCH COOLDOWN ──
+        if action == "cd":
+            try:
+                n = int(parts[2])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            n = max(0, min(300, n))
+            chat_id = _sess_chat_id(uid)
+            if not chat_id:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            await S.save_field(
+                chat_id, "search.cooldown_seconds", n,
+            )
+            await q.answer(
+                "⏱️ Cooldown OFF" if n == 0
+                else f"⏱️ Cooldown {n}s"
+            )
+            text, kb = await P.render_search(chat_id)
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── SEARCH NO-OP ──
+        if action == "search_noop":
+            return await q.answer()
+
+        # ── SET CONTENT MODE ──
+        if action == "set":
         if action == "set":
             sub = parts[2] if len(parts) > 2 else ""
             val = parts[3] if len(parts) > 3 else ""
