@@ -348,10 +348,20 @@ async def render_flow_step(
         ))
     rows.append(layout_row)
 
-    if step_key in ("language", "season", "quality"):
+        if step_key in ("language", "season", "episode", "quality"):
         rows.append([InlineKeyboardButton(
             f"🔄 {F.sc('auto-skip if one')} · {'🟢' if auto_skip else '🔴'}",
             callback_data=f"ga:flow_skip:{step_key}",
+        )])
+
+    # ✨ Advanced settings button — only if this step has any
+    if step_key in (
+        "spell_check", "suggestions", "file_delivery",
+        "language", "season", "episode", "quality",
+    ):
+        rows.append([InlineKeyboardButton(
+            f"⚙️ {F.sc('advanced settings')}",
+            callback_data=f"ga:flow_adv:{step_key}",
         )])
 
     rows.append([
@@ -365,6 +375,345 @@ async def render_flow_step(
         ),
     ])
     return "\n".join(text), _kb(rows)
+
+async def render_flow_step_advanced(
+    chat_id: int, step_key: str,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    """
+    Advanced settings for one flow step.
+
+    Exposes every fine-grained knob the admin flow editor has:
+      • spell_check      → threshold, max_corrections
+      • suggestions      → min_score, provider, show_rating/year/icon
+      • file_delivery    → sort_order, size_format, show_quality/name, name_max_len
+      • language         → max_items
+      • season           → max_items
+      • episode          → max_items, per_page
+      • quality          → max_items
+    """
+    cfg = await S.get_config(chat_id)
+    flow = cfg.get("flow") or {}
+    s = flow.get(step_key) or {}
+
+    labels = {k: lbl for k, _, lbl in _FLOW_STEPS}
+    icons = {k: ic for k, ic, _ in _FLOW_STEPS}
+    label = labels.get(step_key, step_key)
+    icon = icons.get(step_key, "⚙️")
+
+    text_lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{icon} <b>{F.fb(f'{label.upper()} · ADVANCED')}</b>",
+        DIV, "",
+        f"🏷️ {F.sc('type')} · <code>{step_key}</code>",
+        "",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    def _opt_row(
+        field: str,
+        options: List[Tuple[Any, str]],
+        current: Any,
+    ) -> List[InlineKeyboardButton]:
+        r: List[InlineKeyboardButton] = []
+        for value, lbl in options:
+            mark = "✅ " if current == value else ""
+            r.append(InlineKeyboardButton(
+                f"{mark}{lbl}",
+                callback_data=f"ga:flow_set:{step_key}:{field}:{value}",
+            ))
+        return r
+
+    # ─────────────────────────────────────────────
+    # SPELL CHECK
+    # ─────────────────────────────────────────────
+    if step_key == "spell_check":
+        threshold = int(s.get("threshold", 82))
+        max_corr = int(s.get("max_corrections", 1))
+
+        text_lines += [
+            f"🎯 {F.sc('match threshold')} · <b>{threshold}</b>",
+            f"🔁 {F.sc('max corrections')} · <b>{max_corr}</b>",
+            "",
+            f"📌 {F.sc('higher threshold = stricter spelling')}",
+            f"📌 {F.sc('82 recommended')}",
+        ]
+
+        rows.append([InlineKeyboardButton(
+            f"🎯 {F.sc('threshold')}",
+            callback_data="ga:flow_noop",
+        )])
+        row1: List[InlineKeyboardButton] = []
+        for n in (60, 70, 75, 82):
+            row1.append(InlineKeyboardButton(
+                f"{'✅ ' if n == threshold else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:threshold:{n}",
+            ))
+        rows.append(row1)
+        row2: List[InlineKeyboardButton] = []
+        for n in (85, 90, 95):
+            row2.append(InlineKeyboardButton(
+                f"{'✅ ' if n == threshold else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:threshold:{n}",
+            ))
+        rows.append(row2)
+
+        rows.append([InlineKeyboardButton(
+            f"🔁 {F.sc('max corrections')}",
+            callback_data="ga:flow_noop",
+        )])
+        rows.append(_opt_row(
+            "max_corrections",
+            [(1, "1"), (2, "2"), (3, "3")],
+            max_corr,
+        ))
+
+    # ─────────────────────────────────────────────
+    # SUGGESTIONS
+    # ─────────────────────────────────────────────
+    elif step_key == "suggestions":
+        min_score = int(s.get("min_score", 45))
+        provider = str(s.get("provider", "both"))
+        show_rating = bool(s.get("show_rating", True))
+        show_year = bool(s.get("show_year", True))
+        show_icon = bool(s.get("show_icon", True))
+
+        text_lines += [
+            f"🎯 {F.sc('min match score')} · <b>{min_score}</b>",
+            f"📡 {F.sc('provider')} · <b>{provider}</b>",
+            f"⭐ {F.sc('show rating')} · {_on(show_rating)}",
+            f"📅 {F.sc('show year')} · {_on(show_year)}",
+            f"🎬 {F.sc('show icon')} · {_on(show_icon)}",
+            "",
+            f"📌 {F.sc('lower score = more suggestions')}",
+            f"📌 {F.sc('45 recommended')}",
+        ]
+
+        rows.append([InlineKeyboardButton(
+            f"🎯 {F.sc('min score')}",
+            callback_data="ga:flow_noop",
+        )])
+        row1 = []
+        for n in (30, 40, 45, 50):
+            row1.append(InlineKeyboardButton(
+                f"{'✅ ' if n == min_score else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:min_score:{n}",
+            ))
+        rows.append(row1)
+        row2 = []
+        for n in (60, 70, 80):
+            row2.append(InlineKeyboardButton(
+                f"{'✅ ' if n == min_score else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:min_score:{n}",
+            ))
+        rows.append(row2)
+
+        rows.append([InlineKeyboardButton(
+            f"📡 {F.sc('provider')}",
+            callback_data="ga:flow_noop",
+        )])
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✅ ' if provider == 'tmdb' else ''}TMDB",
+                callback_data=f"ga:flow_set:{step_key}:provider:tmdb",
+            ),
+            InlineKeyboardButton(
+                f"{'✅ ' if provider == 'imdb' else ''}IMDb",
+                callback_data=f"ga:flow_set:{step_key}:provider:imdb",
+            ),
+            InlineKeyboardButton(
+                f"{'✅ ' if provider == 'both' else ''}Both",
+                callback_data=f"ga:flow_set:{step_key}:provider:both",
+            ),
+        ])
+
+        rows.append([
+            InlineKeyboardButton(
+                f"⭐ {_on(show_rating)}",
+                callback_data=f"ga:flow_togf:{step_key}:show_rating",
+            ),
+            InlineKeyboardButton(
+                f"📅 {_on(show_year)}",
+                callback_data=f"ga:flow_togf:{step_key}:show_year",
+            ),
+            InlineKeyboardButton(
+                f"🎬 {_on(show_icon)}",
+                callback_data=f"ga:flow_togf:{step_key}:show_icon",
+            ),
+        ])
+
+    # ─────────────────────────────────────────────
+    # FILE DELIVERY
+    # ─────────────────────────────────────────────
+    elif step_key == "file_delivery":
+        sort_order = str(s.get("sort_order", "small_to_big"))
+        size_fmt = str(s.get("size_format", "short"))
+        show_quality = bool(s.get("show_quality", True))
+        show_name = bool(s.get("show_name", True))
+        name_len = int(s.get("name_max_len", 34))
+        max_items = int(s.get("max_items", 15))
+
+        text_lines += [
+            f"📊 {F.sc('sort')} · <b>{sort_order}</b>",
+            f"💾 {F.sc('size format')} · <b>{size_fmt}</b>",
+            f"🎯 {F.sc('show quality')} · {_on(show_quality)}",
+            f"📛 {F.sc('show name')} · {_on(show_name)}",
+            f"📏 {F.sc('name max len')} · <b>{name_len}</b>",
+            f"🔢 {F.sc('max files')} · <b>{max_items}</b>",
+        ]
+
+        rows.append([InlineKeyboardButton(
+            f"📊 {F.sc('sort order')}",
+            callback_data="ga:flow_noop",
+        )])
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✅ ' if sort_order == 'small_to_big' else ''}📈 small→big",
+                callback_data=f"ga:flow_set:{step_key}:sort_order:small_to_big",
+            ),
+            InlineKeyboardButton(
+                f"{'✅ ' if sort_order == 'big_to_small' else ''}📉 big→small",
+                callback_data=f"ga:flow_set:{step_key}:sort_order:big_to_small",
+            ),
+        ])
+
+        rows.append([InlineKeyboardButton(
+            f"💾 {F.sc('size format')}",
+            callback_data="ga:flow_noop",
+        )])
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✅ ' if size_fmt == 'short' else ''}short (1.4G)",
+                callback_data=f"ga:flow_set:{step_key}:size_format:short",
+            ),
+            InlineKeyboardButton(
+                f"{'✅ ' if size_fmt == 'full' else ''}full (1.4 GB)",
+                callback_data=f"ga:flow_set:{step_key}:size_format:full",
+            ),
+        ])
+
+        rows.append([
+            InlineKeyboardButton(
+                f"🎯 {_on(show_quality)}",
+                callback_data=f"ga:flow_togf:{step_key}:show_quality",
+            ),
+            InlineKeyboardButton(
+                f"📛 {_on(show_name)}",
+                callback_data=f"ga:flow_togf:{step_key}:show_name",
+            ),
+        ])
+
+        rows.append([InlineKeyboardButton(
+            f"📏 {F.sc('name max length')}",
+            callback_data="ga:flow_noop",
+        )])
+        lrow1 = []
+        for n in (20, 25, 30):
+            lrow1.append(InlineKeyboardButton(
+                f"{'✅ ' if n == name_len else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:name_max_len:{n}",
+            ))
+        rows.append(lrow1)
+        lrow2 = []
+        for n in (34, 40, 50):
+            lrow2.append(InlineKeyboardButton(
+                f"{'✅ ' if n == name_len else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:name_max_len:{n}",
+            ))
+        rows.append(lrow2)
+
+        rows.append([InlineKeyboardButton(
+            f"🔢 {F.sc('max files per search')}",
+            callback_data="ga:flow_noop",
+        )])
+        mrow1 = []
+        for n in (5, 10, 15):
+            mrow1.append(InlineKeyboardButton(
+                f"{'✅ ' if n == max_items else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:max_items:{n}",
+            ))
+        rows.append(mrow1)
+        mrow2 = []
+        for n in (20, 25, 30):
+            mrow2.append(InlineKeyboardButton(
+                f"{'✅ ' if n == max_items else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:max_items:{n}",
+            ))
+        rows.append(mrow2)
+
+    # ─────────────────────────────────────────────
+    # WIZARD STEPS (language / season / episode / quality)
+    # ─────────────────────────────────────────────
+    elif step_key in ("language", "season", "episode", "quality"):
+        max_items = int(s.get("max_items", 12))
+        per_page = int(s.get("per_page", 10)) if step_key == "episode" else None
+
+        text_lines += [
+            f"🔢 {F.sc('max items')} · <b>{max_items}</b>",
+        ]
+        if per_page is not None:
+            text_lines.append(f"📄 {F.sc('per page')} · <b>{per_page}</b>")
+
+        # max_items options depend on step
+        item_opts_map = {
+            "language": [3, 5, 8, 12, 15, 20],
+            "season":   [5, 10, 12, 15, 20, 30],
+            "episode":  [10, 20, 30, 50, 75, 100],
+            "quality":  [3, 5, 8, 10, 12, 15],
+        }
+        opts = item_opts_map.get(step_key, [5, 10, 15, 20, 25, 30])
+
+        rows.append([InlineKeyboardButton(
+            f"🔢 {F.sc('max items')}",
+            callback_data="ga:flow_noop",
+        )])
+        irow1 = []
+        for n in opts[:3]:
+            irow1.append(InlineKeyboardButton(
+                f"{'✅ ' if n == max_items else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:max_items:{n}",
+            ))
+        rows.append(irow1)
+        irow2 = []
+        for n in opts[3:]:
+            irow2.append(InlineKeyboardButton(
+                f"{'✅ ' if n == max_items else ''}{n}",
+                callback_data=f"ga:flow_set:{step_key}:max_items:{n}",
+            ))
+        rows.append(irow2)
+
+        if per_page is not None:
+            rows.append([InlineKeyboardButton(
+                f"📄 {F.sc('episodes per page')}",
+                callback_data="ga:flow_noop",
+            )])
+            prow = []
+            for n in (5, 10, 15, 20):
+                prow.append(InlineKeyboardButton(
+                    f"{'✅ ' if n == per_page else ''}{n}",
+                    callback_data=f"ga:flow_set:{step_key}:per_page:{n}",
+                ))
+            rows.append(prow)
+
+    # ─────────────────────────────────────────────
+    # NO ADVANCED OPTIONS
+    # ─────────────────────────────────────────────
+    else:
+        text_lines.append(
+            f"⚪ {F.sc('no advanced settings for this step')}"
+        )
+
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=f"ga:flow:{step_key}",
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data="ga:close",
+        ),
+    ])
+    return "\n".join(text_lines), _kb(rows)
 
 
 # ============================================================
@@ -1028,6 +1377,7 @@ __all__ = [
     "render_search",
     "render_content",
     "render_flow", "render_flow_step",
+    "render_flow_step_advanced"
     "render_caption", "render_caption_preview",
     "render_buttons", "render_button_view",
     "render_welcome",
