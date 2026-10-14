@@ -110,8 +110,6 @@ async def render_main(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     stats_line = (
         f"📊 {F.sc('stats')} · "
         f"🔎 <b>{s_searches}</b> · "
-        f"✅ <b>{s_found}</b> · "
-        f"❌ <b>{s_notfound}</b> · "
         f"📤 <b>{s_sent}</b> · "
         f"📈 <b>{rate_str}</b>"
     )
@@ -1485,6 +1483,11 @@ async def render_stats(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     else:
         updated_str = "—"
 
+    sugg_shown = _i("suggestions_shown")
+    sugg_clicked = _i("suggestions_clicked")
+    sugg_led = _i("suggestions_led_to_files")
+    reqs = _i("requests_sent")
+
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"📊 <b>{F.fb('GROUP STATS')}</b>",
@@ -1498,6 +1501,12 @@ async def render_stats(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         _line("❌", "not found", FM.num(notfound)),
         _line("📤", "files sent", FM.num(sent)),
         "",
+        DIV_S,
+        _line("💡", "suggestions shown", FM.num(sugg_shown)),
+        _line("👆", "suggestions clicked", FM.num(sugg_clicked)),
+        _line("🎯", "sugg → files", FM.num(sugg_led)),
+        _line("📩", "requests sent", FM.num(reqs)),
+        "",
         DIV_S, "",
         f"📈 {F.sc('success rate')} · <b>{rate_str}</b>",
         f"🕒 {F.sc('last updated')} · <code>{updated_str}</code>",
@@ -1506,7 +1515,6 @@ async def render_stats(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"📌 {F.sc('counters reset when you tap')} "
         f"<b>{F.sc('reset stats')}</b>",
     ])
-
     rows = [
         [InlineKeyboardButton(
             f"🔄 {F.sc('refresh')}",
