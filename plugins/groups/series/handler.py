@@ -1428,6 +1428,12 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                     f"[SERIES-H] DB match {matched_title!r} "
                     f"({len(hits)} hits)"
                 )
+                # Track successful search
+                try:
+                    await S.bump_stat(chat_id, "results_found")
+                except Exception:
+                    pass
+
                 chosen = await enrich_with_tmdb(matched_title, hits)
 
                 sess_new(
@@ -1493,10 +1499,22 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                     stored.append(d)
 
             if not stored:
+                # No suggestions → not_found
+                try:
+                    await S.bump_stat(chat_id, "not_found")
+                except Exception:
+                    pass
                 return await handle_no_results(
                     client, message, status, txt,
                     chat_id=chat_id,
                 )
+
+            # Track that suggestions were shown
+            try:
+                await S.bump_stat(chat_id, "not_found")
+                await S.bump_stat(chat_id, "suggestions_shown")
+            except Exception:
+                pass
 
             sess_new(
                 uid, chat_id,
@@ -1904,6 +1922,13 @@ async def series_delivery_start(client: Client, message: Message):
             ]),
             parse_mode=ParseMode.HTML,
         )
+    except Exception:
+        pass
+
+    # Track delivery in group stats
+    try:
+        if chat_id and sent > 0:
+            await S.bump_stat(chat_id, "files_sent", sent)
     except Exception:
         pass
 
@@ -2615,6 +2640,14 @@ async def cb_pick(client: Client, q: CallbackQuery):
 
         await q.answer("🔍 loading…")
 
+        # ── Track suggestion click ──
+        chat_id = q.message.chat.id if q.message.chat else 0
+        try:
+            if chat_id:
+                await S.bump_stat(chat_id, "suggestions_clicked")
+        except Exception:
+            pass
+
         # ── Step 1: search DB with the suggestion title ──
         db_match = await smart_db_search(title)
 
@@ -2624,11 +2657,17 @@ async def cb_pick(client: Client, q: CallbackQuery):
                 f"[SERIES-H] suggestion click → no DB match: {title!r}"
             )
 
+            try:
+                if chat_id:
+                    await S.bump_stat(chat_id, "requests_sent")
+            except Exception:
+                pass
+
             token = await post_to_request_channel(
                 client, uid, title,
                 year=year or None, tmdb_id=tmdb_id,
                 source="suggestion_not_in_db",
-                chat_id=q.message.chat.id if q.message.chat else 0,
+                chat_id=chat_id,
             )
 
             # Get bot username for the Start button
@@ -2679,6 +2718,14 @@ async def cb_pick(client: Client, q: CallbackQuery):
             f"[SERIES-H] suggestion click → DB match {matched_title!r} "
             f"({len(hits)} hits)"
         )
+        try:
+            if chat_id:
+                await S.bump_stat(
+                    chat_id, "suggestions_led_to_files",
+                )
+                await S.bump_stat(chat_id, "results_found")
+        except Exception:
+            pass
 
         chosen_data = await enrich_with_tmdb(
             matched_title, hits,
