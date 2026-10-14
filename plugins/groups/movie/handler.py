@@ -517,8 +517,11 @@ async def _show_request_prompt(
     chat_id: int = 0,
 ) -> None:
     """
-    Nothing found. Try to post a request directly.
-    New user → deep-link prompt.
+    Nothing found in DB. Try the smart request flow:
+
+      1. Respect `requests.enabled` per-group toggle
+      2. Registered user → post directly (no deep-link needed)
+      3. New user        → deferred token + deep-link prompt
     """
     try:
         uid = status.from_user.id if status.from_user else 0
@@ -526,16 +529,74 @@ async def _show_request_prompt(
         username = user.username if user else ""
         full_name = user.first_name if user else ""
 
-        # Create deferred request
+        # ── 1. Check requests.enabled for this group ──
+        try:
+            cfg = await S.get_config(chat_id) if chat_id else {}
+            req_cfg = cfg.get("requests") or {}
+            requests_enabled = bool(req_cfg.get("enabled", True))
+        except Exception:
+            requests_enabled = True
+
+        if not requests_enabled:
+            return await _edit_status(
+                status,
+                "\n".join([
+                    f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>",
+                    F.DIV, "",
+                    f"🔍 <code>{F.sc(str(query)[:50])}</code>",
+                    "",
+                    f"📌 {F.sc('requests are disabled in this group')}",
+                    f"📌 {F.sc('try a different spelling')}",
+                ]),
+            )
+
+        # ── 2. Registered user? Post directly ──
+        is_reg = False
+        try:
+            is_reg = await RF.is_registered(uid)
+        except Exception:
+            is_reg = False
+
+        if is_reg:
+            token = await RF.post_request(
+                client=client,
+                user_id=uid,
+                username=username or "",
+                full_name=full_name or "",
+                title=str(query)[:200],
+                year=None,
+                kind="movie",
+                tmdb_id=None,
+                chat_id=chat_id or (
+                    status.chat.id if status.chat else 0
+                ),
+            )
+            if token:
+                return await _edit_status(
+                    status,
+                    "\n".join([
+                        f"{F.EMO['check']} <b>{F.fb('REQUEST SENT')}</b>",
+                        F.DIV, "",
+                        f"🎬 <b>{F.sc(str(query)[:60])}</b>",
+                        "",
+                        f"📌 {F.sc('admins have been notified')}",
+                        f"📌 {F.sc('you will be messaged once uploaded')}",
+                    ]),
+                )
+            # direct post failed → fall through to deferred path
+
+        # ── 3. Deferred path (new user or direct post failed) ──
         token = await RF.create_deferred_request(
             user_id=uid,
             username=username or "",
             full_name=full_name or "",
-            title=query,
+            title=str(query)[:200],
             year=None,
             kind="movie",
             tmdb_id=None,
-            chat_id=status.chat.id if status.chat else 0,
+            chat_id=chat_id or (
+                status.chat.id if status.chat else 0
+            ),
         )
 
         if not token:
@@ -544,12 +605,12 @@ async def _show_request_prompt(
                 "\n".join([
                     f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>",
                     F.DIV, "",
-                    f"🔍 <code>{F.sc(query[:50])}</code>",
+                    f"🔍 <code>{F.sc(str(query)[:50])}</code>",
                     f"📌 {F.sc('try a different spelling')}",
                 ]),
             )
 
-        # Build deep-link — try identity(), fall back to get_me()
+        # ── Build deep-link (with safe fallback) ──
         bot_username = ""
         try:
             me = await client.identity()
@@ -584,7 +645,7 @@ async def _show_request_prompt(
         lines = [
             f"{F.EMO['warn']} <b>{F.fb('NOT IN OUR DATABASE')}</b>",
             F.DIV, "",
-            f"🎬 <b>{F.sc(query[:60])}</b>",
+            f"🎬 <b>{F.sc(str(query)[:60])}</b>",
             "",
             f"📌 {F.sc('tap the button below to send a request')}",
             f"📌 {F.sc('the admin will be notified')}",
@@ -608,10 +669,10 @@ async def _show_request_prompt(
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-            # Track the "not found" stat too — previously only
-            # search/results were tracked
+            # Track the "not found" stat
             try:
-                await S.bump_stat(chat_id, "not_found")
+                if chat_id:
+                    await S.bump_stat(chat_id, "not_found")
             except Exception:
                 pass
         except Exception as e:
@@ -619,7 +680,6 @@ async def _show_request_prompt(
 
     except Exception as e:
         logger.exception(f"[MOVIE-H] request prompt: {e}")
-
 
 # ============================================================
 # SECTION 8 — SHARDS OFFLINE
