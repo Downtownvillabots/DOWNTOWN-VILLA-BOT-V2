@@ -387,6 +387,13 @@ async def _show_suggestions(
     show_year = bool(sugg_cfg.get("show_year", True))
     show_icon = bool(sugg_cfg.get("show_icon", True))
 
+    # Track that a search reached suggestions (base search failed)
+    try:
+        await S.bump_stat(chat_id, "not_found")
+        await S.bump_stat(chat_id, "suggestions_shown")
+    except Exception:
+        pass
+
     # Create a session to hold the suggestions
     sid = await DELIVERY.create_session(
         user_id=uid,
@@ -589,6 +596,12 @@ async def _show_request_prompt(
                 ),
             )
             if token:
+                try:
+                    if chat_id:
+                        await S.bump_stat(chat_id, "not_found")
+                        await S.bump_stat(chat_id, "requests_sent")
+                except Exception:
+                    pass
                 return await _edit_status(
                     status,
                     "\n".join([
@@ -617,6 +630,11 @@ async def _show_request_prompt(
         )
 
         if not token:
+            try:
+                if chat_id:
+                    await S.bump_stat(chat_id, "not_found")
+            except Exception:
+                pass
             return await _edit_status(
                 status,
                 "\n".join([
@@ -627,6 +645,12 @@ async def _show_request_prompt(
                 ]),
             )
 
+        # Token created → track request
+        try:
+            if chat_id:
+                await S.bump_stat(chat_id, "requests_sent")
+        except Exception:
+            pass
         # ── Build deep-link (with safe fallback) ──
         bot_username = ""
         try:
