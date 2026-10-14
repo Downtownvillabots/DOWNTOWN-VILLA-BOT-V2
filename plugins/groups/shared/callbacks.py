@@ -157,8 +157,20 @@ async def sr_file(client: Client, q: CallbackQuery):
             if v_cfg.get("enabled") and v_cfg.get("shortener_url"):
                 from plugins.groups.shared import verify as V
                 uid = q.from_user.id
-                if not await V.is_verified(uid, chat_id):
-                    # Not verified → build + send verify card
+
+                needs_verify = not await V.is_verified(uid, chat_id)
+
+                # ✅ Return-user shortcut: auto-renew if recent
+                if needs_verify:
+                    renewed = await V.try_auto_renew(uid, chat_id)
+                    if renewed:
+                        logger.debug(
+                            f"[SR-CB] verify auto-renewed for {uid}"
+                        )
+                        needs_verify = False
+
+                if needs_verify:
+                    # Full verify flow (first-time or >24h since last)
                     bot_username = await _bot_username(client)
                     if not bot_username:
                         return await q.answer(
@@ -168,8 +180,6 @@ async def sr_file(client: Client, q: CallbackQuery):
                     target = (
                         f"https://t.me/{bot_username}?start=v_{{url}}"
                     )
-                    # Pass the target so shortener can append
-                    # (the token is generated inside build_verify_card)
                     text, kb = await V.build_verify_card(
                         client, cfg, chat_id, uid, target,
                     )
@@ -191,7 +201,6 @@ async def sr_file(client: Client, q: CallbackQuery):
                     return
         except Exception as e:
             logger.debug(f"[SR-CB] verify gate: {e}")
-
         # Notify user
         await q.answer("📤 Sending to your PM…")
 
