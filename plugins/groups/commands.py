@@ -939,7 +939,7 @@ def _fmt_num(n: Any) -> str:
 
 
 def _read_stats(doc: Dict[str, Any]) -> Dict[str, int]:
-    """Pull the 4 counters out of a group doc."""
+    """Pull all 8 counters out of a group doc."""
     st = doc.get("stats") or {}
     def _i(k):
         try:
@@ -947,12 +947,15 @@ def _read_stats(doc: Dict[str, Any]) -> Dict[str, int]:
         except (TypeError, ValueError):
             return 0
     return {
-        "searches_today": _i("searches_today"),
-        "results_found":  _i("results_found"),
-        "not_found":      _i("not_found"),
-        "files_sent":     _i("files_sent"),
+        "searches_today":         _i("searches_today"),
+        "results_found":          _i("results_found"),
+        "not_found":              _i("not_found"),
+        "files_sent":             _i("files_sent"),
+        "suggestions_shown":      _i("suggestions_shown"),
+        "suggestions_clicked":    _i("suggestions_clicked"),
+        "suggestions_led_to_files": _i("suggestions_led_to_files"),
+        "requests_sent":          _i("requests_sent"),
     }
-
 
 @Client.on_message(
     filters.command(["groupstats", "gstats"]) & filters.private,
@@ -1027,14 +1030,27 @@ async def cmd_groupstats(client: Client, message: Message):
         title = str(target_doc.get("title") or target_cid)[:60]
         st = _read_stats(target_doc)
 
-        # Success rate (found / total searches)
+        # Rates
         searches = st["searches_today"]
         found = st["results_found"]
         if searches > 0:
-            rate = (found / searches) * 100
-            rate_str = f"{rate:.1f}%"
+            rate_str = f"{(found / searches) * 100:.1f}%"
         else:
             rate_str = "—"
+
+        # Suggestion rates
+        sugg_shown = st["suggestions_shown"]
+        sugg_clicked = st["suggestions_clicked"]
+        sugg_led = st["suggestions_led_to_files"]
+
+        if sugg_shown > 0:
+            sugg_ctr = f"{(sugg_clicked / sugg_shown) * 100:.0f}%"
+        else:
+            sugg_ctr = "—"
+        if sugg_clicked > 0:
+            sugg_conv = f"{(sugg_led / sugg_clicked) * 100:.0f}%"
+        else:
+            sugg_conv = "—"
 
         lines = [
             f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -1052,8 +1068,20 @@ async def cmd_groupstats(client: Client, message: Message):
             f"📤 {F.sc('files sent')} · "
             f"<b>{_fmt_num(st['files_sent'])}</b>",
             "",
+            F.DIV_S,
+            f"💡 {F.sc('suggestions shown')} · "
+            f"<b>{_fmt_num(sugg_shown)}</b>",
+            f"👆 {F.sc('suggestions clicked')} · "
+            f"<b>{_fmt_num(sugg_clicked)}</b>",
+            f"🎯 {F.sc('sugg → files')} · "
+            f"<b>{_fmt_num(sugg_led)}</b>",
+            f"📩 {F.sc('requests sent')} · "
+            f"<b>{_fmt_num(st['requests_sent'])}</b>",
+            "",
             F.DIV_S, "",
             f"📈 {F.sc('success rate')} · <b>{rate_str}</b>",
+            f"👆 {F.sc('click rate')} · <b>{sugg_ctr}</b>",
+            f"🎯 {F.sc('conversion')} · <b>{sugg_conv}</b>",
             "",
             F.DIV_S,
             f"♻️ {F.sc('reset')} · "
@@ -1064,7 +1092,6 @@ async def cmd_groupstats(client: Client, message: Message):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-
     # ── All groups ──
     # Aggregate + collect per-group
     totals = {
@@ -1072,12 +1099,16 @@ async def cmd_groupstats(client: Client, message: Message):
         "results_found": 0,
         "not_found": 0,
         "files_sent": 0,
+        "suggestions_shown": 0,
+        "suggestions_clicked": 0,
+        "suggestions_led_to_files": 0,
+        "requests_sent": 0,
     }
     entries: List[Dict[str, Any]] = []
     for d in docs:
         st = _read_stats(d)
         for k in totals:
-            totals[k] += st[k]
+            totals[k] += st.get(k, 0)
         entries.append({
             "chat_id": int(d.get("chat_id") or 0),
             "title": str(d.get("title") or d.get("chat_id"))[:40],
@@ -1113,6 +1144,13 @@ async def cmd_groupstats(client: Client, message: Message):
         f"📤 {F.sc('files sent')} · "
         f"<b>{_fmt_num(totals['files_sent'])}</b>",
         "",
+        f"💡 {F.sc('sugg shown')} · "
+        f"<b>{_fmt_num(totals['suggestions_shown'])}</b>",
+        f"👆 {F.sc('sugg clicked')} · "
+        f"<b>{_fmt_num(totals['suggestions_clicked'])}</b>",
+        f"📩 {F.sc('requests')} · "
+        f"<b>{_fmt_num(totals['requests_sent'])}</b>",
+        "",
         f"📈 {F.sc('success rate')} · <b>{overall_rate_str}</b>",
         "",
         F.DIV_S, "",
@@ -1122,20 +1160,25 @@ async def cmd_groupstats(client: Client, message: Message):
     ]
 
     for i, e in enumerate(top, 1):
-        if e["searches_today"] == 0 and e["files_sent"] == 0:
+        searches_i = e.get("searches_today", 0)
+        sent_i = e.get("files_sent", 0)
+        reqs_i = e.get("requests_sent", 0)
+        if searches_i == 0 and sent_i == 0 and reqs_i == 0:
             continue
         lines.append(
             f"<b>{i:02d}.</b> {F.sc(e['title'])} "
-            f"· <code>{_fmt_num(e['searches_today'])}</code> 🔎 "
-            f"· <code>{_fmt_num(e['files_sent'])}</code> 📤"
+            f"· <code>{_fmt_num(searches_i)}</code> 🔎 "
+            f"· <code>{_fmt_num(sent_i)}</code> 📤 "
+            f"· <code>{_fmt_num(reqs_i)}</code> 📩"
         )
 
     if all(
-        e["searches_today"] == 0 and e["files_sent"] == 0
+        e.get("searches_today", 0) == 0
+        and e.get("files_sent", 0) == 0
+        and e.get("requests_sent", 0) == 0
         for e in entries
     ):
         lines.append(f"⚪ {F.sc('no activity yet')}")
-
     lines += [
         "",
         F.DIV_S,
@@ -1191,6 +1234,10 @@ async def cmd_reset_groupstats(client: Client, message: Message):
             "results_found": 0,
             "not_found": 0,
             "files_sent": 0,
+            "suggestions_shown": 0,
+            "suggestions_clicked": 0,
+            "suggestions_led_to_files": 0,
+            "requests_sent": 0,
             "updated_at": now,
         })
     except Exception as e:
@@ -1633,6 +1680,408 @@ async def cmd_restore_all(client: Client, message: Message):
     )
 
 
+# ============================================================
+# SECTION 8e — /groups (bot admins only)
+# ============================================================
+#
+# /groups                → list every group with config status
+# /groups -1001234567890 → one group detailed card
+#
+# Distinct from /groupstats:
+#   /groupstats → counters + top list
+#   /groups     → config snapshot (mode, flow, verify, etc.)
+
+def _cfg_on(v: Any) -> str:
+    return "🟢" if v else "🔴"
+
+
+def _mode_icon(mode: str) -> str:
+    m = str(mode or "both").lower()
+    if m == "movie":
+        return "🎬"
+    if m == "series":
+        return "📺"
+    return "🎬📺"
+
+
+def _mode_label(mode: str) -> str:
+    m = str(mode or "both").lower()
+    return {"movie": "MOVIE", "series": "SERIES", "both": "BOTH"}.get(
+        m, "BOTH"
+    )
+
+
+@Client.on_message(
+    filters.command(["groups", "glist"]) & filters.private,
+    group=-8500,
+)
+async def cmd_groups(client: Client, message: Message):
+    """
+    Compact config snapshot for every group.
+    With chat_id argument → detailed card for one group.
+    """
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Optional chat_id argument ──
+    args = (message.text or "").split()
+    target_cid: Optional[int] = None
+    if len(args) >= 2:
+        try:
+            target_cid = int(args[1])
+        except (ValueError, TypeError):
+            return await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['cross']} <b>{F.fb('INVALID CHAT ID')}</b>",
+                    F.DIV, "",
+                    "ᴜꜱᴀɢᴇ:",
+                    "• <code>/groups</code> — list",
+                    "• <code>/groups -1001234567890</code> — one",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+
+    # ── Fetch all groups ──
+    try:
+        docs = await S.list_groups(limit=100)
+    except Exception as e:
+        logger.exception(f"[GROUPS] list: {e}")
+        return await message.reply_text(f"❌ {e}")
+
+    if not docs:
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"👥 <b>{F.fb('CONNECTED GROUPS')}</b>",
+                F.DIV, "",
+                f"⚪ {F.sc('no groups registered yet')}",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Specific group ──
+    if target_cid is not None:
+        return await _render_group_card(
+            client, message, target_cid, docs,
+        )
+
+    # ── All groups ──
+    return await _render_group_list(client, message, docs)
+
+
+async def _render_group_list(
+    client: Client,
+    message: Message,
+    docs: List[Dict[str, Any]],
+) -> None:
+    """Render the compact list of every group."""
+    enabled_count = 0
+    disabled_count = 0
+    movie_count = 0
+    series_count = 0
+    both_count = 0
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"👥 <b>{F.fb('CONNECTED GROUPS')}</b>",
+        F.DIV, "",
+    ]
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    for d in docs[:40]:
+        try:
+            cid = int(d.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not cid:
+            continue
+
+        title = str(d.get("title") or cid)[:40]
+        enabled = bool(d.get("enabled", True))
+        mode = str(d.get("content_mode", "both")).lower()
+
+        # Search toggles
+        search_on = bool(d.get("search_enabled", True))
+        pm_on = bool(d.get("pm_search_enabled", True))
+
+        # Feature flags (compressed)
+        fsub_on = bool((d.get("fsub") or {}).get("enabled", False))
+        verify_on = bool((d.get("verify") or {}).get("enabled", False))
+        welcome_on = bool(d.get("welcome_enabled", False))
+
+        # Flow step count
+        flow = d.get("flow") or {}
+        steps = sum(
+            1 for v in flow.values()
+            if isinstance(v, dict) and v.get("enabled", True)
+        )
+
+        # Counters
+        st = d.get("stats") or {}
+        try:
+            searches = int(st.get("searches_today", 0) or 0)
+            sent = int(st.get("files_sent", 0) or 0)
+        except (TypeError, ValueError):
+            searches = sent = 0
+
+        # Aggregates
+        if enabled:
+            enabled_count += 1
+        else:
+            disabled_count += 1
+        if mode == "movie":
+            movie_count += 1
+        elif mode == "series":
+            series_count += 1
+        else:
+            both_count += 1
+
+        mode_icon = _mode_icon(mode)
+
+        # Compact per-group status line
+        status_bits = []
+        if search_on:
+            status_bits.append("🔎")
+        if pm_on:
+            status_bits.append("💬")
+        if fsub_on:
+            status_bits.append("📢")
+        if verify_on:
+            status_bits.append("🔐")
+        if welcome_on:
+            status_bits.append("👋")
+        badges = " ".join(status_bits) or "—"
+
+        lines.append(
+            f"{_cfg_on(enabled)} {mode_icon} "
+            f"<b>{F.sc(title)}</b>"
+        )
+        lines.append(
+            f"   <code>{cid}</code> · "
+            f"{F.sc('steps')} <b>{steps}</b> · "
+            f"{F.sc('flows')} {badges}"
+        )
+        lines.append(
+            f"   🔎 <b>{searches}</b> · 📤 <b>{sent}</b>"
+        )
+
+        # Button row: [icon title] opens panel in PM
+        btn_icon = mode_icon
+        row: List[InlineKeyboardButton] = [
+            InlineKeyboardButton(
+                f"{_cfg_on(enabled)} {btn_icon} {title[:26]}",
+                callback_data=f"ga:open:{cid}",
+            )
+        ]
+        rows.append(row)
+
+    # ── Summary footer ──
+    total = len(docs)
+    lines += [
+        "",
+        F.DIV_S, "",
+        f"📊 {F.sc('total')} · <b>{total}</b>",
+        f"🟢 {F.sc('enabled')} · <b>{enabled_count}</b> "
+        f"· 🔴 <b>{disabled_count}</b>",
+        f"🎬 <b>{movie_count}</b> · "
+        f"📺 <b>{series_count}</b> · "
+        f"🎬📺 <b>{both_count}</b>",
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('detailed')} · "
+        f"<code>/groups -1001234567890</code>",
+        f"📌 {F.sc('stats')} · <code>/groupstats</code>",
+    ]
+
+    # Close / refresh row
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data="ga:list",
+        ),
+        InlineKeyboardButton(
+            f"{F.EMO['cross']} {F.sc('close')}",
+            callback_data="ga:close",
+        ),
+    ])
+
+    try:
+        await message.reply_text(
+            "\n".join(lines)[:4000],
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"[GROUPS] list send: {e}")
+
+
+async def _render_group_card(
+    client: Client,
+    message: Message,
+    cid: int,
+    docs: List[Dict[str, Any]],
+) -> None:
+    """Detailed config card for a single group."""
+    # Find the doc
+    target_doc = None
+    for d in docs:
+        try:
+            if int(d.get("chat_id") or 0) == cid:
+                target_doc = d
+                break
+        except (TypeError, ValueError):
+            continue
+
+    if not target_doc:
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['cross']} <b>{F.fb('GROUP NOT FOUND')}</b>",
+                F.DIV, "",
+                f"🆔 <code>{cid}</code>",
+                f"📌 {F.sc('not registered in the bot')}",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    title = str(target_doc.get("title") or cid)[:60]
+    username = str(target_doc.get("username") or "")
+    enabled = bool(target_doc.get("enabled", True))
+    mode = str(target_doc.get("content_mode", "both")).lower()
+    mode_icon = _mode_icon(mode)
+    mode_label = _mode_label(mode)
+
+    # Flow breakdown
+    flow = target_doc.get("flow") or {}
+    enabled_steps = [
+        k for k, v in flow.items()
+        if isinstance(v, dict) and v.get("enabled", True)
+    ]
+    total_steps = len(flow)
+
+    # Features
+    fsub = target_doc.get("fsub") or {}
+    verify = target_doc.get("verify") or {}
+    requests_cfg = target_doc.get("requests") or {}
+    auto_del = target_doc.get("auto_delete") or {}
+    filters_cfg = target_doc.get("filters") or {}
+
+    fsub_ch = len(fsub.get("channels") or [])
+    req_ch = requests_cfg.get("channel")
+    buttons = target_doc.get("result_buttons") or []
+    banned_words = filters_cfg.get("banned_words") or []
+
+    # Counters
+    st = target_doc.get("stats") or {}
+
+    def _i(k: str) -> int:
+        try:
+            return int(st.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    searches = _i("searches_today")
+    found = _i("results_found")
+    notfound = _i("not_found")
+    sent = _i("files_sent")
+    sugg_shown = _i("suggestions_shown")
+    sugg_clicked = _i("suggestions_clicked")
+    reqs = _i("requests_sent")
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"👥 <b>{F.fb('GROUP CARD')}</b>",
+        F.DIV, "",
+        f"{_cfg_on(enabled)} <b>{F.sc(title)}</b>",
+        f"{mode_icon} <code>{mode_label}</code> · "
+        f"<code>{cid}</code>",
+    ]
+    if username:
+        lines.append(f"🔗 @{F.sc(username)}")
+
+    lines += [
+        "",
+        F.DIV_S, "",
+        f"🎯 <b>{F.sc('FLOW')}</b>",
+        f"📊 {F.sc('steps')} · <b>{len(enabled_steps)}</b> / "
+        f"{total_steps}",
+        f"🛠️ <code>{', '.join(enabled_steps[:6]) or '—'}</code>",
+    ]
+
+    lines += [
+        "",
+        F.DIV_S, "",
+        f"⚙️ <b>{F.sc('FEATURES')}</b>",
+        f"🔎 {F.sc('group search')} · "
+        f"{_cfg_on(target_doc.get('search_enabled', True))}",
+        f"💬 {F.sc('pm search')} · "
+        f"{_cfg_on(target_doc.get('pm_search_enabled', True))}",
+        f"👋 {F.sc('welcome')} · "
+        f"{_cfg_on(target_doc.get('welcome_enabled', False))}",
+        f"📢 {F.sc('force-sub')} · "
+        f"{_cfg_on(fsub.get('enabled', False))} "
+        f"(<b>{fsub_ch}</b>)",
+        f"🔐 {F.sc('verify')} · "
+        f"{_cfg_on(verify.get('enabled', False))}",
+        f"📩 {F.sc('requests')} · "
+        f"{_cfg_on(requests_cfg.get('enabled', True))} "
+        f"· <code>{req_ch or 'global'}</code>",
+        f"⏱️ {F.sc('auto-delete')} · "
+        f"{_cfg_on(auto_del.get('bot_messages', False))} "
+        f"<code>{auto_del.get('bot_timer', 600)}s</code>",
+        f"🔘 {F.sc('buttons')} · <b>{len(buttons)}</b>",
+        f"🚫 {F.sc('banned words')} · <b>{len(banned_words)}</b>",
+    ]
+
+    lines += [
+        "",
+        F.DIV_S, "",
+        f"📊 <b>{F.sc('ACTIVITY')}</b>",
+        f"🔎 <b>{searches}</b> · "
+        f"✅ <b>{found}</b> · "
+        f"❌ <b>{notfound}</b>",
+        f"📤 <b>{sent}</b>",
+        f"💡 <b>{sugg_shown}</b> "
+        f"(<b>{sugg_clicked}</b> {F.sc('clicked')})",
+        f"📩 <b>{reqs}</b>",
+    ]
+
+    rows = [
+        [InlineKeyboardButton(
+            f"⚙️ {F.sc('open settings panel')}",
+            callback_data=f"ga:open:{cid}",
+        )],
+        [
+            InlineKeyboardButton(
+                f"📊 {F.sc('stats')}",
+                callback_data="ga:noop",
+            ),
+            InlineKeyboardButton(
+                f"📦 {F.sc('backup')}",
+                callback_data="ga:noop",
+            ),
+        ],
+        [InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('list')}",
+            callback_data="ga:list",
+        )],
+    ]
+
+    try:
+        await message.reply_text(
+            "\n".join(lines)[:4000],
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"[GROUPS] card send: {e}")
+
+
 
 
 # ============================================================
@@ -1754,6 +2203,7 @@ __all__ = [
     "cmd_reset_group_default",
     "cmd_groupstats",
     "cmd_reset_groupstats",
+    "cmd_groups",
     "cmd_backup_group",
     "cmd_restore_group",
     "cmd_backup_all",
