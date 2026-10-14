@@ -1,31 +1,6 @@
 # ============================================================
 # 🏨 DOWNTOWN VILLA — GROUPS STATE (v2 — FULL CUSTOMIZATION)
 # ============================================================
-#
-# Per-group configuration layer. EVERY feature is controllable
-# per group from Telegram. No code deploy needed.
-#
-# Storage:  USER DB → `groups` collection
-# Cache:    in-memory, 5 min TTL
-#
-# Sections:
-#   basic       → enabled, content_mode, search_enabled, pm_search_enabled
-#   flow        → per-step enable + per_row + order + auto_skip
-#   search      → spell_check threshold, suggestions count, thresholds
-#   imdb        → provider toggles, fuzzy thresholds
-#   buttons     → result buttons, per_row, size, quality format
-#   caption     → template
-#   welcome     → welcome message + auto-delete
-#   auto_delete → bot/user/command timers
-#   filters     → banned words + links
-#   fsub        → force-sub channels
-#   verify      → shortener + timer
-#   security    → url/telegram link blocking, flood control
-#   requests    → enabled, channel, PM update
-#   metadata    → poster/rating/genre/year toggles
-#   stats       → counters
-#
-# ============================================================
 
 from __future__ import annotations
 
@@ -43,184 +18,114 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 DEFAULT_CFG: Dict[str, Any] = {
-
-    # ── BASIC ──
     "enabled": True,
-    "content_mode": "both",              # movie | series | both
+    "content_mode": "both",
     "search_enabled": True,
     "pm_search_enabled": True,
 
-    # ── FLOW ORDER (per group, list of step keys) ──
-    # If empty → use plugin defaults
-    "flow_order": {
-        "series": [],
-        "movie": [],
-    },
+    "flow_order": {"series": [], "movie": []},
 
-    # ── FLOW PER-STEP CONFIG ──
     "flow": {
         "base_search":   {"enabled": True, "per_row": 1},
         "spell_check":   {"enabled": True, "threshold": 82, "max_corrections": 1},
         "suggestions":   {"enabled": True, "per_row": 1, "max_items": 6,
-                          "min_score": 45, "provider": "both"},
-        "language":      {"enabled": True, "per_row": 2, "auto_skip": True,
-                          "max_items": 12},
-        "season":        {"enabled": True, "per_row": 2, "auto_skip": True,
-                          "max_items": 12},
+                          "min_score": 45, "provider": "both",
+                          "show_rating": True, "show_year": True, "show_icon": True},
+        "language":      {"enabled": True, "per_row": 2, "auto_skip": True, "max_items": 12},
+        "season":        {"enabled": True, "per_row": 2, "auto_skip": True, "max_items": 12},
         "episode":       {"enabled": True, "per_row": 4, "auto_skip": True,
                           "max_items": 20, "per_page": 10},
-        "quality":       {"enabled": True, "per_row": 2, "auto_skip": True,
-                          "max_items": 8},
-        "file_delivery": {"enabled": True, "per_row": 1, "max_items": 10,
-                          "sort_order": "small_to_big"},
+        "quality":       {"enabled": True, "per_row": 2, "auto_skip": True, "max_items": 8},
+        "file_delivery": {"enabled": True, "per_row": 1, "max_items": 15,
+                          "sort_order": "small_to_big",
+                          "show_quality": True, "show_name": True,
+                          "name_max_len": 34, "size_format": "short"},
     },
 
-    # ── SEARCH TUNING ──
     "search": {
-        # Spell check accuracy (0-100, higher = stricter)
         "spell_threshold": 82,
-        # How many times to retry with corrections
         "max_corrections": 1,
-        # Auto-correct confidence threshold (never below this)
         "min_correction_score": 80,
-        # Search cache TTL (seconds)
         "cache_ttl": 300,
-        # Case-insensitive matching
         "case_insensitive": True,
-        # Max results from DB before paging
         "search_per_page": 10,
         "search_per_row": 1,
-        # Seconds between two searches from the same user
-        # (0 = no cooldown, 3 = default, 60 = heavy anti-spam)
         "cooldown_seconds": 3,
     },
 
-    # ── IMDb / PROVIDERS ──
     "imdb": {
-        # Enable IMDb suggestions
-        "enabled": True,
-        # Enable TMDB suggestions
-        "tmdb_enabled": True,
-        # Min fuzzy score to accept a suggestion (0-100)
-        "min_match_score": 45,
-        # How many providers to query
-        "max_providers": 2,
-        # Boost year match
-        "year_boost": 5,
-        # Show ratings in suggestion buttons
-        "show_rating": True,
-        # Show year in suggestion buttons
-        "show_year": True,
-        # Show type icon (🎬/📺)
-        "show_icon": True,
-        # Suggestion action: "search" | "request" | "both"
+        "enabled": True, "tmdb_enabled": True,
+        "min_match_score": 45, "max_providers": 2, "year_boost": 5,
+        "show_rating": True, "show_year": True, "show_icon": True,
         "on_pick": "both",
     },
 
-    # ── CAPTION ──
-    "caption_template": None,            # None → global default
+    "caption_template": None,
     "caption_variables": {
-        "title": "{title}",
-        "quality": "{quality}",
-        "size": "{size}",
-        "audio": "{audio}",
-        "subtitle": "{subtitle}",
+        "title": "{title}", "quality": "{quality}",
+        "size": "{size}", "audio": "{audio}", "subtitle": "{subtitle}",
     },
 
-    # ── RESULT BUTTONS ──
     "result_buttons": [],
     "buttons_per_row": 2,
-    "button_size_format": "short",       # short | full
+    "button_size_format": "short",
     "button_show_quality": True,
     "button_show_name": True,
     "button_name_max_len": 34,
 
-    # ── WELCOME ──
     "welcome_enabled": False,
     "welcome_text": None,
     "welcome_buttons": [],
     "welcome_auto_delete": True,
     "welcome_delete_after": 600,
 
-    # ── AUTO-DELETE ──
     "auto_delete": {
-        "bot_messages": True,
-        "bot_timer": 600,
-        "user_messages": True,
-        "keep_last_n": 10,
+        "bot_messages": True, "bot_timer": 600,
+        "user_messages": True, "keep_last_n": 10,
         "command_messages": True,
     },
 
-    # ── FILTERS ──
     "filters": {
-        "banned_words": [],
-        "banned_links": True,
-        "block_forward": False,
-        "block_media": False,
+        "banned_words": [], "banned_links": True,
+        "block_forward": False, "block_media": False,
     },
 
-    # ── FORCE-SUB ──
     "fsub": {
-        "enabled": False,
-        "channels": [],
+        "enabled": False, "channels": [],
         "title": "🔒 JOIN REQUIRED",
         "message": (
             "You must join our channels to use this bot.\n"
             "Tap the buttons below, then press Try Again."
         ),
-        "join_label": "🔔 JOIN",
-        "try_label": "🔄 TRY AGAIN",
+        "join_label": "🔔 JOIN", "try_label": "🔄 TRY AGAIN",
     },
 
-    # ── VERIFICATION ──
-    "verify": {
-        "enabled": False,
-        "shortener_url": None,
-        "verify_time": 1200,
-    },
+    "verify": {"enabled": False, "shortener_url": None, "verify_time": 1200},
 
-    # ── SECURITY ──
     "security": {
-        "url_blocking": True,
-        "telegram_links": True,
-        "admin_bypass": True,
-        "search_flood_control": True,
+        "url_blocking": True, "telegram_links": True,
+        "admin_bypass": True, "search_flood_control": True,
         "search_limit": 5,
     },
 
-    # ── REQUESTS ──
     "requests": {
-        "enabled": True,
-        "channel": None,
-        "user_pm_update": True,
-        "duplicate_check": True,
+        "enabled": True, "channel": None,
+        "user_pm_update": True, "duplicate_check": True,
     },
 
-    # ── METADATA ──
     "metadata": {
-        "poster": True,
-        "rating": True,
-        "genre": True,
-        "year": True,
-        "language": True,
+        "poster": True, "rating": True, "genre": True,
+        "year": True, "language": True,
     },
 
-    # ── STATS ──
     "stats": {
-        "searches_today": 0,
-        "results_found": 0,
-        "not_found": 0,
-        "files_sent": 0,
-        # Suggestion engagement
-        "suggestions_shown": 0,
-        "suggestions_clicked": 0,
-        "suggestions_led_to_files": 0,
-        # Requests
-        "requests_sent": 0,
+        "searches_today": 0, "results_found": 0,
+        "not_found": 0, "files_sent": 0,
+        "suggestions_shown": 0, "suggestions_clicked": 0,
+        "suggestions_led_to_files": 0, "requests_sent": 0,
         "updated_at": None,
     },
 
-    # ── META ──
     "created_at": None,
     "updated_at": None,
     "title": None,
@@ -289,16 +194,9 @@ def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-
 # ============================================================
 # SECTION 4b — GLOBAL DEFAULT TEMPLATE
 # ============================================================
-#
-# Stored in SYSTEM DB → bot_settings → _id="group_defaults".
-# New groups inherit it. Reset config → back to it.
-#
-# Keys stripped from the template (per-group, not defaults):
-#   chat_id, _id, title, username, created_at, updated_at, stats
 
 _TEMPLATE_ID = "group_defaults"
 _TEMPLATE_COLLECTION = "bot_settings"
@@ -320,50 +218,31 @@ def _template_coll():
 
 
 def _strip_for_template(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a clean copy of cfg, minus per-instance keys."""
     out: Dict[str, Any] = {}
     for k, v in (cfg or {}).items():
-        if k in _STRIP_KEYS:
-            continue
-        if k == "stats":
+        if k in _STRIP_KEYS or k == "stats":
             continue
         out[k] = copy.deepcopy(v)
     return out
 
 
 async def get_default_template() -> Dict[str, Any]:
-    """
-    Return the global default config template.
-
-    Priority:
-      1. stored template (bot_settings.group_defaults)
-      2. code DEFAULT_CFG
-
-    Always returns a fresh deepcopy — safe to mutate.
-    """
     coll = _template_coll()
     if coll is None:
         return copy.deepcopy(DEFAULT_CFG)
-
     try:
         doc = await coll.find_one({"_id": _TEMPLATE_ID})
     except Exception as e:
         logger.debug(f"[GROUPS] template read: {e}")
         return copy.deepcopy(DEFAULT_CFG)
-
     if not doc:
         return copy.deepcopy(DEFAULT_CFG)
-
     doc.pop("_id", None)
     merged = _merge(DEFAULT_CFG, doc)
     return copy.deepcopy(merged)
 
 
 async def save_default_template(cfg: Dict[str, Any]) -> bool:
-    """
-    Save cfg as the new global default template.
-    Per-instance keys (chat_id, title, stats) are stripped.
-    """
     coll = _template_coll()
     if coll is None:
         return False
@@ -383,10 +262,6 @@ async def save_default_template(cfg: Dict[str, Any]) -> bool:
 
 
 async def reset_default_template() -> bool:
-    """
-    Delete the stored template — falls back to code DEFAULT_CFG.
-    Existing groups are NOT touched.
-    """
     coll = _template_coll()
     if coll is None:
         return False
@@ -404,9 +279,7 @@ async def has_custom_template() -> bool:
     if coll is None:
         return False
     try:
-        doc = await coll.find_one(
-            {"_id": _TEMPLATE_ID}, {"_id": 1},
-        )
+        doc = await coll.find_one({"_id": _TEMPLATE_ID}, {"_id": 1})
         return doc is not None
     except Exception:
         return False
@@ -435,7 +308,6 @@ async def get_config(chat_id: int, use_cache: bool = True) -> Dict[str, Any]:
         doc = None
 
     if not doc:
-        # New group → inherit the global template
         template = await get_default_template()
         merged = {"chat_id": cid, **template}
         if use_cache:
@@ -464,14 +336,8 @@ async def save_field(chat_id: int, field_path: str, value: Any) -> bool:
         await coll.update_one(
             {"chat_id": int(chat_id)},
             {
-                "$set": {
-                    field_path: value,
-                    "updated_at": now,
-                },
-                "$setOnInsert": {
-                    "chat_id": int(chat_id),
-                    "created_at": now,
-                },
+                "$set": {field_path: value, "updated_at": now},
+                "$setOnInsert": {"chat_id": int(chat_id), "created_at": now},
             },
             upsert=True,
         )
@@ -494,10 +360,7 @@ async def save_fields(chat_id: int, fields: Dict[str, Any]) -> bool:
             {"chat_id": int(chat_id)},
             {
                 "$set": payload,
-                "$setOnInsert": {
-                    "chat_id": int(chat_id),
-                    "created_at": now,
-                },
+                "$setOnInsert": {"chat_id": int(chat_id), "created_at": now},
             },
             upsert=True,
         )
@@ -522,12 +385,12 @@ async def register_group(
         return False
     try:
         now = datetime.utcnow()
-        # Inherit the global template for new groups
         template = await get_default_template()
-        payload = {k: v for k, v in template.items()
-                   if k not in ("created_at", "updated_at",
-                                "title", "username", "_id",
-                                "chat_id")}
+        payload = {
+            k: v for k, v in template.items()
+            if k not in ("created_at", "updated_at", "title", "username",
+                         "_id", "chat_id")
+        }
         await coll.update_one(
             {"chat_id": int(chat_id)},
             {
@@ -550,6 +413,7 @@ async def register_group(
         logger.warning(f"[GROUPS] register: {e}")
         return False
 
+
 async def reset_config(chat_id: int) -> bool:
     coll = _coll()
     if coll is None:
@@ -564,23 +428,17 @@ async def reset_config(chat_id: int) -> bool:
             "created_at": doc.get("created_at", now),
             "updated_at": now,
         }
-        # Use the global template (falls back to DEFAULT_CFG)
         template = await get_default_template()
         for k, v in template.items():
-            if k in ("created_at", "updated_at",
-                     "title", "username", "_id", "chat_id"):
+            if k in ("created_at", "updated_at", "title", "username",
+                     "_id", "chat_id"):
                 continue
-            fresh[k] = v
-        # Reset stats to zero
+            fresh[k] = copy.deepcopy(v)
         fresh["stats"] = {
-            "searches_today": 0,
-            "results_found": 0,
-            "not_found": 0,
-            "files_sent": 0,
-            "suggestions_shown": 0,
-            "suggestions_clicked": 0,
-            "suggestions_led_to_files": 0,
-            "requests_sent": 0,
+            "searches_today": 0, "results_found": 0,
+            "not_found": 0, "files_sent": 0,
+            "suggestions_shown": 0, "suggestions_clicked": 0,
+            "suggestions_led_to_files": 0, "requests_sent": 0,
             "updated_at": now,
         }
         await coll.replace_one(
@@ -593,6 +451,7 @@ async def reset_config(chat_id: int) -> bool:
     except Exception as e:
         logger.warning(f"[GROUPS] reset: {e}")
         return False
+
 
 async def delete_group(chat_id: int) -> bool:
     coll = _coll()
@@ -670,7 +529,6 @@ __all__ = [
     "list_groups", "count_groups",
     "invalidate_all",
     "bump_stat",
-    # Global template
     "get_default_template",
     "save_default_template",
     "reset_default_template",
