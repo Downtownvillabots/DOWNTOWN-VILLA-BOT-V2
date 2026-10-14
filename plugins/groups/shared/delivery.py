@@ -334,7 +334,8 @@ async def show_file_list(
     target: Message (send new) or status Message (edit)
     client: used to fetch bot username for deep-links
     """
-         # Sort by the delivery step setting (not a top-level key)
+    try:
+        # Sort by the delivery step setting (not a top-level key)
         flow = cfg.get("flow") or {}
         fd = flow.get("file_delivery") or {}
         mode = str(fd.get("sort_order", "small_to_big") or "small_to_big")
@@ -415,7 +416,7 @@ async def show_file_list(
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
-            return True
+                return True
         except Exception as e:
             logger.debug(f"[DELIVERY] show: {e}")
             return False
