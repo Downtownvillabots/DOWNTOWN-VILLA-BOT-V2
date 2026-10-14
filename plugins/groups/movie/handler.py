@@ -390,14 +390,29 @@ async def _show_suggestions(
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"{F.EMO['search']} <b>{F.fb('DID YOU MEAN?')}</b>",
         F.DIV, "",
-        f"🔍 {F.sc('you searched')} · <code>{F.sc(query[:50])}</code>",
-        f"📝 {F.sc('no exact match')}",
+        f"🔍 {F.sc('you searched')} · <code>{F.sc(str(query)[:50])}</code>",
+        f"📝 {F.sc('no exact match — pick the right one')}",
         "",
         F.DIV_S,
-        f"📌 {F.sc('tap a title below')}",
+        f"📌 {F.sc('tap a title to see files')}",
+        f"📌 {F.sc('or send a request to admin')}",
     ]
 
     rows: List[List[InlineKeyboardButton]] = []
+
+    # Top-of-list action: send request directly
+    rows.append([InlineKeyboardButton(
+        f"📩 {F.sc('send request to admin')}",
+        callback_data=f"sr:req:{sid}",
+    )])
+
+    # Divider (no-op)
+    rows.append([InlineKeyboardButton(
+        "─────────",
+        callback_data="sr:cancel_noop",
+    )])
+
+    # Then the suggestions
     for i, s in enumerate(stored[:8]):
         title = str(s.get("title") or "?")[:34]
         year = s.get("year")
@@ -405,11 +420,18 @@ async def _show_suggestions(
         kind = str(s.get("kind") or "movie")
         icon = "📺" if kind == "series" else "🎬"
 
+        # Build the label, but keep total length ≤ 60 chars
         label = f"{icon} {title}"
         if year:
             label += f" ({year})"
-        if rating:
-            label += f" · ⭐{rating:.1f}"
+        # Rating only if there's room
+        try:
+            r_float = float(rating)
+        except (TypeError, ValueError):
+            r_float = 0.0
+        if r_float > 0 and len(label) + 8 <= 60:
+            label += f" · ⭐{r_float:.1f}"
+
         if len(label) > 60:
             label = label[:57] + "…"
 
@@ -418,19 +440,44 @@ async def _show_suggestions(
             callback_data=f"sr:sug:{sid}:{i}",
         )])
 
+    # Real "send request" button — uses sr:req callback
     rows.append([InlineKeyboardButton(
         f"📩 {F.sc('send request')}",
-        callback_data=f"sr:sug:{sid}:0",  # first suggestion → request flow
+        callback_data=f"sr:req:{sid}",
     )])
+
+    # Google search — proper URL encoding
+    try:
+        from urllib.parse import quote as _q
+        g_url = (
+            "https://www.google.com/search?q="
+            + _q(str(query)[:200], safe="")
+        )
+    except Exception:
+        g_url = "https://www.google.com/search?q=" + str(query)[:200]
     rows.append([InlineKeyboardButton(
         f"🔍 {F.sc('search on google')}",
-        url=f"https://www.google.com/search?q={query}",
+        url=g_url,
     )])
+
+    # IMDb direct search (bonus — helps when TMDB misses)
+    try:
+        from urllib.parse import quote as _q
+        i_url = (
+            "https://www.imdb.com/find?q="
+            + _q(str(query)[:200], safe="")
+        )
+        rows.append([InlineKeyboardButton(
+            "🎬 IMDb",
+            url=i_url,
+        )])
+    except Exception:
+        pass
+
     rows.append([InlineKeyboardButton(
         f"{F.EMO['cross']} {F.sc('close')}",
         callback_data="sr:cancel",
     )])
-
     # Edit status message
     try:
         await status.edit_text(
@@ -501,12 +548,18 @@ async def _show_request_prompt(
                 pass
 
         if not bot_username:
+            # Token was created — the request is already logged.
+            # Show a positive confirmation so the user doesn't
+            # re-search thinking it failed.
             return await _edit_status(
                 status,
                 "\n".join([
-                    f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>",
+                    f"{F.EMO['check']} <b>{F.fb('REQUEST LOGGED')}</b>",
                     F.DIV, "",
-                    f"📌 {F.sc('try a different spelling')}",
+                    f"🎬 <b>{F.sc(str(query)[:60])}</b>",
+                    "",
+                    f"📌 {F.sc('admins have been notified')}",
+                    f"📌 {F.sc('you will be messaged once uploaded')}",
                 ]),
             )
 
