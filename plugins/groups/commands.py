@@ -2081,6 +2081,119 @@ async def _render_group_card(
     except Exception as e:
         logger.debug(f"[GROUPS] card send: {e}")
 
+# ============================================================
+# SECTION 8f — /dbtest (bot admins only)
+# ============================================================
+#
+# Live health check of every shard across all 4 pools.
+
+@Client.on_message(
+    filters.command(["dbtest", "dbhealth"]) & filters.private,
+    group=-8500,
+)
+async def cmd_dbtest(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    status = await message.reply_text(
+        f"🔧 {F.sc('checking database health…')}",
+        parse_mode=ParseMode.HTML,
+    )
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🗄️ <b>{F.fb('DATABASE HEALTH')}</b>",
+        F.DIV, "",
+    ]
+
+    try:
+        from database import db_registry
+    except Exception as e:
+        return await status.edit_text(f"❌ {e}")
+
+    # ── Pool icons ──
+    pool_icons = {
+        "system": "⚙️",
+        "user":   "👤",
+        "media":  "🎬",
+        "backup": "💾",
+    }
+
+    total_shards = 0
+    online_shards = 0
+    total_docs = 0
+
+    try:
+        entries = db_registry.all_entries()
+    except Exception as e:
+        return await status.edit_text(f"❌ {e}")
+
+    for pool_name in ("system", "user", "media", "backup"):
+        pool_entries = [e for e in entries if e.pool == pool_name]
+        if not pool_entries:
+            continue
+
+        online = sum(1 for e in pool_entries if e.online)
+        total_shards += len(pool_entries)
+        online_shards += online
+
+        icon = pool_icons.get(pool_name, "📦")
+        marker = "🟢" if online == len(pool_entries) else "🔴"
+
+        lines.append(
+            f"{marker} {icon} <b>{F.sc(pool_name.upper())}</b> · "
+            f"<b>{online}</b> / {len(pool_entries)}"
+        )
+
+        for e in pool_entries:
+            e_marker = "🟢" if e.online else "🔴"
+            ping = f"{e.last_ping_ms:.0f}ms" if e.online else "—"
+
+            # Per-shard doc count
+            doc_count = 0
+            try:
+                if e.online and e.db is not None:
+                    coll_names = await e.db.list_collection_names()
+                    if "media_files" in coll_names:
+                        doc_count = await e.db["media_files"].estimated_document_count()
+                    elif coll_names:
+                        # Use first collection
+                        doc_count = await e.db[coll_names[0]].estimated_document_count()
+                    total_docs += doc_count
+            except Exception:
+                pass
+
+            err = f" · <code>{e.error[:40]}</code>" if e.error else ""
+            lines.append(
+                f"   {e_marker} #{e.index:02d} "
+                f"<code>{e.label[:20]}</code> · "
+                f"<code>{ping}</code> · "
+                f"<b>{doc_count:,}</b>{err}"
+            )
+
+    lines += [
+        "",
+        F.DIV_S, "",
+        f"📊 {F.sc('total shards')} · "
+        f"<b>{online_shards}</b> / {total_shards} online",
+        f"📦 {F.sc('total documents')} · "
+        f"<b>{total_docs:,}</b>",
+        "",
+        f"🕒 <code>{FM.datetime_()}</code>",
+    ]
+
+    try:
+        await status.edit_text(
+            "\n".join(lines)[:4000],
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.debug(f"[GROUPS] dbtest edit: {e}")
+
 
 
 
@@ -2204,6 +2317,8 @@ __all__ = [
     "cmd_groupstats",
     "cmd_reset_groupstats",
     "cmd_groups",
+    "cmd_dbtest",
+    "cmd_backup_group",
     "cmd_backup_group",
     "cmd_restore_group",
     "cmd_backup_all",
