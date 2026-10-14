@@ -222,7 +222,15 @@ async def sr_file(client: Client, q: CallbackQuery):
             ok, err = await DEL.delivery.send_file(
                 client, q.from_user.id, file_hit,
             )
-            if not ok:
+            if ok:
+                # Track delivery against this group
+                try:
+                    gid = q.message.chat.id if q.message.chat else 0
+                    if gid:
+                        await S.bump_stat(gid, "files_sent")
+                except Exception:
+                    pass
+            else:
                 # Group context → prompt user to /start bot
                 await _prompt_start(client, q)
         except Exception as e:
@@ -438,10 +446,26 @@ async def sr_sug(client: Client, q: CallbackQuery):
             title, year=year, kind=kind,
         )
 
+        chat_id = q.message.chat.id if q.message.chat else 0
+
+        # Track suggestion engagement
+        try:
+            await S.bump_stat(chat_id, "suggestions_clicked")
+        except Exception:
+            pass
+
         if hits:
+            # Track that the suggestion actually produced files
+            try:
+                await S.bump_stat(
+                    chat_id, "suggestions_led_to_files",
+                )
+                await S.bump_stat(chat_id, "results_found")
+            except Exception:
+                pass
+
             # Build new session and show file list
             uid = q.from_user.id
-            chat_id = q.message.chat.id
 
             # Cap using the delivery step's max_items
             cfg_tmp = await S.get_config(chat_id)
@@ -578,6 +602,14 @@ async def sr_req(client: Client, q: CallbackQuery):
             pass
 
         await q.answer("📩 Sending request…")
+
+        # Track request
+        try:
+            gid = q.message.chat.id if q.message.chat else 0
+            if gid:
+                await S.bump_stat(gid, "requests_sent")
+        except Exception:
+            pass
 
         # Delegate to the shared request flow
         await _send_request_flow(
