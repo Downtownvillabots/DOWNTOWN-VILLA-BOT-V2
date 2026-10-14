@@ -319,6 +319,25 @@ async def group_router(client: Client, q: CallbackQuery):
                 pass
             return await q.answer("Closed")
 
+        # ── OPEN GROUP PANEL ──
+        if action == "open":
+            try:
+                target_chat = int(parts[2])
+            except (ValueError, IndexError):
+                return await q.answer("❌ invalid chat id")
+
+            if not await _is_group_admin(client, target_chat, uid):
+                return await q.answer(
+                    "⛔ Admin only", show_alert=True,
+                )
+
+            # Set session for this user → this group
+            _sess_new(uid, "view", target_chat)
+
+            text, kb = await P.render_main(target_chat)
+            await _safe_edit(q, text, kb)
+            return await q.answer("⚙️ Opening…")
+
         # ── BACK → main panel ──
         if action == "back":
             chat_id = _sess_chat_id(uid)
