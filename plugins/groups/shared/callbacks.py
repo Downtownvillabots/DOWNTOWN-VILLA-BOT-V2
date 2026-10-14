@@ -157,6 +157,15 @@ async def sr_file(client: Client, q: CallbackQuery):
 
         try:
             file_hit = FileHit.from_dict(hit) if isinstance(hit, dict) else hit
+            # Attach the group chat_id so delivery can load the
+            # per-group button config. FileHit allows setattr.
+            try:
+                setattr(
+                    file_hit, "source_chat_id",
+                    q.message.chat.id if q.message.chat else 0,
+                )
+            except Exception:
+                pass
             ok, err = await DEL.delivery.send_file(
                 client, q.from_user.id, file_hit,
             )
