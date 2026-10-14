@@ -90,6 +90,9 @@ DEFAULT_CFG: Dict[str, Any] = {
         # Max results from DB before paging
         "search_per_page": 10,
         "search_per_row": 1,
+        # Seconds between two searches from the same user
+        # (0 = no cooldown, 3 = default, 60 = heavy anti-spam)
+        "cooldown_seconds": 3,
     },
 
     # ── IMDb / PROVIDERS ──
