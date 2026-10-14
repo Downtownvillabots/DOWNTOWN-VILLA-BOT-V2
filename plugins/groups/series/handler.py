@@ -1644,7 +1644,19 @@ async def series_delivery_start(client: Client, message: Message):
             v_cfg = cfg_v.get("verify") or {}
             if v_cfg.get("enabled") and v_cfg.get("shortener_url"):
                 from plugins.groups.shared import verify as V
-                if not await V.is_verified(uid, chat_id):
+
+                needs_verify = not await V.is_verified(uid, chat_id)
+
+                # ✅ Return-user shortcut: auto-renew if recent
+                if needs_verify:
+                    renewed = await V.try_auto_renew(uid, chat_id)
+                    if renewed:
+                        logger.debug(
+                            f"[SERIES-H] verify auto-renewed uid={uid}"
+                        )
+                        needs_verify = False
+
+                if needs_verify:
                     # Build shortener target
                     bot_username = ""
                     try:
