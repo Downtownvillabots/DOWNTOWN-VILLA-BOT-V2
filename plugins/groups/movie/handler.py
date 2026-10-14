@@ -368,6 +368,17 @@ async def _show_suggestions(
             client, status, query, chat_id=chat_id,
         )
 
+    # Read per-group display toggles (default: show everything)
+    try:
+        cfg_for_sugg = await S.get_config(chat_id)
+        flow = cfg_for_sugg.get("flow") or {}
+        sugg_cfg = flow.get("suggestions") or {}
+    except Exception:
+        sugg_cfg = {}
+    show_rating = bool(sugg_cfg.get("show_rating", True))
+    show_year = bool(sugg_cfg.get("show_year", True))
+    show_icon = bool(sugg_cfg.get("show_icon", True))
+
     # Create a session to hold the suggestions
     sid = await DELIVERY.create_session(
         user_id=uid,
@@ -412,7 +423,7 @@ async def _show_suggestions(
         callback_data="sr:cancel_noop",
     )])
 
-    # Then the suggestions
+    # Then the suggestions — toggles apply
     for i, s in enumerate(stored[:8]):
         title = str(s.get("title") or "?")[:34]
         year = s.get("year")
@@ -420,16 +431,22 @@ async def _show_suggestions(
         kind = str(s.get("kind") or "movie")
         icon = "📺" if kind == "series" else "🎬"
 
-        # Build the label, but keep total length ≤ 60 chars
-        label = f"{icon} {title}"
-        if year:
+        # Build label: icon + title
+        if show_icon:
+            label = f"{icon} {title}"
+        else:
+            label = title
+
+        # Year
+        if show_year and year:
             label += f" ({year})"
-        # Rating only if there's room
+
+        # Rating — only if toggle on, and only if room
         try:
             r_float = float(rating)
         except (TypeError, ValueError):
             r_float = 0.0
-        if r_float > 0 and len(label) + 8 <= 60:
+        if show_rating and r_float > 0 and len(label) + 8 <= 60:
             label += f" · ⭐{r_float:.1f}"
 
         if len(label) > 60:
@@ -439,7 +456,6 @@ async def _show_suggestions(
             label,
             callback_data=f"sr:sug:{sid}:{i}",
         )])
-
     # Real "send request" button — uses sr:req callback
     rows.append([InlineKeyboardButton(
         f"📩 {F.sc('send request')}",
