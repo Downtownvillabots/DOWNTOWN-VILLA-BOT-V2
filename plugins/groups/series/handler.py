@@ -1541,8 +1541,8 @@ async def series_delivery_start(client: Client, message: Message):
     # ── Load group config ──
     caption_tpl = ""
     custom_buttons: List[Dict[str, Any]] = []
-    auto_delete_min = 0
-
+    auto_delete_sec = 0
+    
     if chat_id:
         try:
             cfg = await S.get_config(chat_id)
@@ -1550,10 +1550,10 @@ async def series_delivery_start(client: Client, message: Message):
             custom_buttons = cfg.get("result_buttons") or []
             ad = cfg.get("auto_delete") or {}
             if ad.get("bot_messages", True):
-                auto_delete_min = int(ad.get("bot_timer", 0) or 0) // 60
+                auto_delete_sec = int(ad.get("bot_timer", 0) or 0)
             logger.info(
                 f"[SERIES-H] cfg: caption={'Y' if caption_tpl else 'N'} "
-                f"buttons={len(custom_buttons)} autodel={auto_delete_min}m"
+                f"buttons={len(custom_buttons)} autodel={auto_delete_sec}s"
             )
         except Exception as e:
             logger.warning(f"[SERIES-H] cfg load: {e}")
@@ -1586,8 +1586,29 @@ async def series_delivery_start(client: Client, message: Message):
     except Exception as e:
         logger.warning(f"[SERIES-H] intro fail: {e}")
 
+    # ── Auto-delete warning (before delivery) ──
+    auto_seconds = auto_delete_sec
+    warn_msg = None
+    if auto_seconds > 0:
+        try:
+            from plugins.groups.shared import delivery as _DL
+            warn_text = _DL.build_autodelete_warning(
+                seconds=auto_seconds,
+                title=title,
+                count=len(hits),
+            )
+            warn_msg = await message.reply_text(
+                warn_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.debug(f"[SERIES-H] warn send: {e}")
+
     # ── Deliver files ──
     sent_ids: List[int] = []
+    if warn_msg and warn_msg.id:
+        sent_ids.append(warn_msg.id)
     sent = 0
     failed = 0
 
@@ -1675,25 +1696,10 @@ async def series_delivery_start(client: Client, message: Message):
         f"[SERIES-H] ═══ delivery done: sent={sent} failed={failed} ═══"
     )
 
-    # ── Auto-delete schedule ──
-    if auto_delete_min > 0 and sent_ids:
-        try:
-            warn = await message.reply_text(
-                "\n".join([
-                    f"⚠️ <b>{fb('AUTO-DELETE')}</b>",
-                    f"📌 {sc('this will be deleted in')} "
-                    f"<b>{auto_delete_min} {sc('minutes')}</b>",
-                    f"📌 {sc('save or forward now')}",
-                ]),
-                parse_mode=ParseMode.HTML,
-            )
-            if warn and warn.id:
-                sent_ids.append(warn.id)
-        except Exception:
-            pass
-
+    # ── Schedule auto-delete for everything we sent ──
+    if auto_seconds > 0 and sent_ids:
         asyncio.create_task(
-            _pm_auto_delete(client, uid, sent_ids, auto_delete_min * 60)
+            _pm_auto_delete(client, uid, sent_ids, auto_seconds)
         )
 
     # ── Summary ──
