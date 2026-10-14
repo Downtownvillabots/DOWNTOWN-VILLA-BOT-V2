@@ -647,6 +647,15 @@ async def sr_cancel(client: Client, q: CallbackQuery):
     await q.answer("❌ Cancelled")
 
 
+@Client.on_callback_query(
+    filters.regex(r"^sr:cancel_noop$"),
+    group=-8097,
+)
+async def sr_cancel_noop(client: Client, q: CallbackQuery):
+    """Divider row — no action."""
+    return await q.answer()
+
+
 # ============================================================
 # SECTION 7 — PUBLIC EXPORTS
 # ============================================================
@@ -661,5 +670,6 @@ __all__ = [
     "sr_sug",
     "sr_req",
     "sr_cancel",
+    "sr_cancel_noop",
     "snapshot",
 ]
