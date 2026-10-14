@@ -511,7 +511,19 @@ async def sr_req(client: Client, q: CallbackQuery):
         if not raw:
             return await q.answer("❌ empty query", show_alert=True)
 
-        # Kind: if the session has any "series" hint, mark it so
+        # Verify requests are still enabled for this group
+        chat_id = q.message.chat.id if q.message.chat else 0
+        try:
+            cfg_check = await S.get_config(chat_id)
+            req_cfg = cfg_check.get("requests") or {}
+            if not bool(req_cfg.get("enabled", True)):
+                return await q.answer(
+                    "📌 Requests are disabled here",
+                    show_alert=True,
+                )
+        except Exception:
+            pass
+
         await q.answer("📩 Sending request…")
 
         # Delegate to the shared request flow
