@@ -457,6 +457,39 @@ def is_complete(hits: List[Dict[str, Any]]) -> bool:
 # SECTION 7 — PUBLIC EXPORTS
 # ============================================================
 
+# ============================================================
+# SECTION 7 — COOLDOWN READER
+# ============================================================
+
+async def get_cooldown_seconds(
+    chat_id: int,
+    default: float = 3.0,
+) -> float:
+    """
+    Return the per-group cooldown between searches.
+
+    Reads cfg["search"]["cooldown_seconds"]. Returns `default`
+    on any error. Clamps to [0, 300].
+    """
+    try:
+        from plugins.groups import state as GS
+        cfg = await GS.get_config(int(chat_id))
+        s = cfg.get("search") or {}
+        v = s.get("cooldown_seconds", default)
+        n = float(v)
+        if n < 0:
+            return 0.0
+        if n > 300:
+            return 300.0
+        return n
+    except Exception:
+        return float(default)
+
+
+# ============================================================
+# SECTION 7 — PUBLIC EXPORTS
+# ============================================================
+
 __all__ = [
     # Normalize
     "to_dict",
@@ -477,4 +510,7 @@ __all__ = [
     "unique_seasons",
     "unique_episodes",
     "is_complete",
+    # Cooldown
+    "get_cooldown_seconds",
 ]
+
