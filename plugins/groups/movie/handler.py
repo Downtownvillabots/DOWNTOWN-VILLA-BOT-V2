@@ -409,19 +409,28 @@ async def _show_suggestions(
         f"📌 {F.sc('or send a request to admin')}",
     ]
 
+    # Check requests.enabled for this group
+    requests_enabled = True
+    try:
+        cfg_check = await S.get_config(chat_id)
+        req_cfg = cfg_check.get("requests") or {}
+        requests_enabled = bool(req_cfg.get("enabled", True))
+    except Exception:
+        requests_enabled = True
+
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Top-of-list action: send request directly
-    rows.append([InlineKeyboardButton(
-        f"📩 {F.sc('send request to admin')}",
-        callback_data=f"sr:req:{sid}",
-    )])
-
-    # Divider (no-op)
-    rows.append([InlineKeyboardButton(
-        "─────────",
-        callback_data="sr:cancel_noop",
-    )])
+    # Top-of-list action: send request directly (if enabled)
+    if requests_enabled:
+        rows.append([InlineKeyboardButton(
+            f"📩 {F.sc('send request to admin')}",
+            callback_data=f"sr:req:{sid}",
+        )])
+        # Divider (no-op)
+        rows.append([InlineKeyboardButton(
+            "─────────",
+            callback_data="sr:cancel_noop",
+        )])
 
     # Then the suggestions — toggles apply
     for i, s in enumerate(stored[:8]):
