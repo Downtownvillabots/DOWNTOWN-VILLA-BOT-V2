@@ -57,7 +57,21 @@ class Delivery:
 
             uid = int(user_id)
             caption = self._build_caption(hit)
-            kb = self._build_buttons(hit)
+
+            # Load per-group config so custom buttons apply
+            cfg: Dict[str, Any] = {}
+            try:
+                from plugins.groups import state as GS
+                # user_id is not a chat_id — but the sender passes
+                # this only in group context. We look up the config
+                # by chat_id if the caller provides it in the hit.
+                sender_chat = _get(hit, "source_chat_id") or 0
+                if sender_chat:
+                    cfg = await GS.get_config(int(sender_chat))
+            except Exception:
+                cfg = {}
+
+            kb = self._build_buttons(hit, cfg=cfg)
 
             sent = None
             try:
@@ -157,22 +171,82 @@ class Delivery:
 
     # ── BUTTONS ──
 
-    def _build_buttons(self, hit: Any) -> Optional[InlineKeyboardMarkup]:
-        rows: list = []
+    def _build_buttons(self, hit: Any, cfg: Optional[Dict[str, Any]] = None) -> Optional[InlineKeyboardMarkup]:
+        """
+        Build reply_markup for a delivered file.
 
+        Priority:
+          1. Custom result_buttons from cfg (per-group)
+          2. Share button
+          3. Updates channel (if config.UPDATE_CHNL_LNK set)
+        """
+        rows: List[List[InlineKeyboardButton]] = []
+        cfg = cfg or {}
+
+        # ── 1. Custom result_buttons from group config ──
+        try:
+            custom = cfg.get("result_buttons") or []
+        except Exception:
+            custom = []
+
+        per_row = 2
+        try:
+            per_row = int(cfg.get("buttons_per_row", 2) or 2)
+        except (TypeError, ValueError):
+            per_row = 2
+        per_row = max(1, min(3, per_row))
+
+        row_buf: List[InlineKeyboardButton] = []
+        for b in custom:
+            if not isinstance(b, dict):
+                continue
+            if not b.get("enabled", True):
+                continue
+            name = str(b.get("name") or "")[:60]
+            url = str(b.get("url") or "").strip()
+            if not name or not url:
+                continue
+            if url.startswith("@"):
+                url = f"https://t.me/{url[1:]}"
+            elif not (url.startswith("http://")
+                      or url.startswith("https://")
+                      or url.startswith("tg://")):
+                if "." in url and " " not in url:
+                    url = f"https://{url}"
+                else:
+                    continue
+            row_buf.append(InlineKeyboardButton(name, url=url))
+            if len(row_buf) >= per_row:
+                rows.append(row_buf)
+                row_buf = []
+        if row_buf:
+            rows.append(row_buf)
+
+        # ── 2. Share button ──
         title = str(_get(hit, "title") or _get(hit, "series_title") or "file")
+        try:
+            share_target = (
+                getattr(config, "UPDATE_CHNL_LNK", None)
+                or getattr(config, "BOT_LINK", None)
+                or "https://t.me/"
+            )
+        except Exception:
+            share_target = "https://t.me/"
+
         share_url = (
             f"https://t.me/share/url?"
-            f"url=https://t.me/&"
+            f"url={_url_escape(share_target)}&"
             f"text={_url_escape(title)}"
         )
         rows.append([InlineKeyboardButton("📤 SHARE", url=share_url)])
 
+        # ── 3. Updates channel ──
         try:
-            if config.UPDATE_CHNL_LNK:
+            ch = getattr(config, "UPDATE_CHNL_LNK", None)
+            if ch:
                 rows.append([InlineKeyboardButton(
                     f"📢 {F.sc('updates')}",
-                    url=config.UPDATE_CHNL_LNK,
+                    url=ch,
                 )])
         except Exception:
             pass
