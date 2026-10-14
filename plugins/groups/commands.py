@@ -1754,5 +1754,9 @@ __all__ = [
     "cmd_reset_group_default",
     "cmd_groupstats",
     "cmd_reset_groupstats",
+    "cmd_backup_group",
+    "cmd_restore_group",
+    "cmd_backup_all",
+    "cmd_restore_all",
     "start_group_settings",
 ]
