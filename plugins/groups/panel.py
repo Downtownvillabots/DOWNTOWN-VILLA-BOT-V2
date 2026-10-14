@@ -271,9 +271,81 @@ _FLOW_STEPS = [
 ]
 
 
-async def render_flow(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+# Default orders (mirrors movie/flow.py & series/flow.py)
+_DEFAULT_MOVIE_ORDER = [
+    "base_search", "spell_check", "suggestions",
+    "quality", "file_delivery",
+]
+_DEFAULT_SERIES_ORDER = [
+    "base_search", "spell_check", "suggestions",
+    "language", "season", "episode", "quality", "file_delivery",
+]
+
+
+def _resolve_flow_order(
+    cfg: Dict[str, Any],
+    flow_type: str,
+) -> List[str]:
+    """
+    Return the effective step order for this flow type.
+
+    flow_type: "movie" | "series"
+    """
+    flow_order = cfg.get("flow_order") or {}
+    custom = list(flow_order.get(flow_type) or [])
+
+    default = (
+        _DEFAULT_SERIES_ORDER if flow_type == "series"
+        else _DEFAULT_MOVIE_ORDER
+    )
+    allowed = set(default)
+
+    # Keep valid, dedup, drop unknown
+    out: List[str] = []
+    seen: set = set()
+    for k in custom:
+        if k in allowed and k not in seen:
+            out.append(k)
+            seen.add(k)
+
+    # Append any missing defaults
+    for k in default:
+        if k not in seen:
+            out.append(k)
+            seen.add(k)
+
+    return out
+
+
+def _detect_flow_type(cfg: Dict[str, Any]) -> str:
+    """Pick which flow type to show by default."""
+    mode = str(cfg.get("content_mode", "both")).lower()
+    if mode == "series":
+        return "series"
+    return "movie"  # movie or both → start with movie
+
+
+async def render_flow(
+    chat_id: int,
+    flow_type: Optional[str] = None,
+) -> Tuple[str, InlineKeyboardMarkup]:
+    """
+    Flow editor — reorder + configure steps.
+
+    When the group is content_mode="both", a Movie/Series tab
+    switcher appears at the top.
+    """
     cfg = await S.get_config(chat_id)
     flow = cfg.get("flow") or {}
+    mode = str(cfg.get("content_mode", "both")).lower()
+
+    # Which flow are we editing?
+    if flow_type not in ("movie", "series"):
+        flow_type = _detect_flow_type(cfg)
+
+    order = _resolve_flow_order(cfg, flow_type)
+    flow_label = "MOVIE" if flow_type == "movie" else "SERIES"
+    flow_icon = "🎬" if flow_type == "movie" else "📺"
 
     text_lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -284,20 +356,82 @@ async def render_flow(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     ]
 
     rows: List[List[InlineKeyboardButton]] = []
-    for key, icon, label in _FLOW_STEPS:
+
+    # ── Movie/Series tab switcher (only for "both" groups) ──
+    if mode == "both":
+        rows.append([
+            InlineKeyboardButton(
+                f"{'✅ ' if flow_type == 'movie' else ''}"
+                f"🎬 {F.sc('movie')}",
+                callback_data="ga:flow_tab:movie",
+            ),
+            InlineKeyboardButton(
+                f"{'✅ ' if flow_type == 'series' else ''}"
+                f"📺 {F.sc('series')}",
+                callback_data="ga:flow_tab:series",
+            ),
+        ])
+
+    text_lines += [
+        f"{flow_icon} <b>{F.sc(flow_label)} FLOW</b> · "
+        f"<code>{len(order)}</code> {F.sc('steps')}",
+        "",
+        f"📌 {F.sc('tap a step to configure')}",
+        f"📌 {F.sc('use ⬆️⬇️ to reorder')}",
+        "",
+    ]
+
+    # ── Step rows with reorder arrows ──
+    icon_map = {k: ic for k, ic, _ in _FLOW_STEPS}
+    label_map = {k: lbl for k, _, lbl in _FLOW_STEPS}
+
+    for i, key in enumerate(order):
         s = flow.get(key) or {}
         enabled = s.get("enabled", True)
         per_row = s.get("per_row", 2)
         marker = "🟢" if enabled else "🔴"
+        icon = icon_map.get(key, "⚙️")
+        label = label_map.get(key, key)
+
+        # Truncate label so row fits
+        short = label[:14]
 
         text_lines.append(
-            f"{marker} {icon} <b>{F.sc(label)}</b> · "
-            f"<code>{per_row}/row</code>"
+            f"{marker} <b>{i + 1:02d}.</b> {icon} "
+            f"{F.sc(label)} · <code>{per_row}/row</code>"
         )
 
-        rows.append([InlineKeyboardButton(
-            f"{marker} {icon} {label}",
+        # Row: [step button] [up] [down]
+        step_btn = InlineKeyboardButton(
+            f"{marker} {i + 1:02d}. {icon} {short}",
             callback_data=f"ga:flow:{key}",
+        )
+        if i > 0:
+            up_btn = InlineKeyboardButton(
+                "⬆️",
+                callback_data=f"ga:flow_up:{flow_type}:{i}",
+            )
+        else:
+            up_btn = InlineKeyboardButton(
+                "·", callback_data="ga:flow_noop",
+            )
+        if i < len(order) - 1:
+            down_btn = InlineKeyboardButton(
+                "⬇️",
+                callback_data=f"ga:flow_down:{flow_type}:{i}",
+            )
+        else:
+            down_btn = InlineKeyboardButton(
+                "·", callback_data="ga:flow_noop",
+            )
+
+        rows.append([step_btn, up_btn, down_btn])
+
+    # Reset order button
+    if (cfg.get("flow_order") or {}).get(flow_type):
+        rows.append([InlineKeyboardButton(
+            f"♻️ {F.sc('reset order')}",
+            callback_data=f"ga:flow_rst_order:{flow_type}",
         )])
 
     rows.append(_back_close("ga:back")[0])
