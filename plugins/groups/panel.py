@@ -1633,7 +1633,7 @@ __all__ = [
     "render_search",
     "render_content",
     "render_flow", "render_flow_step",
-    "render_flow_step_advanced"
+    "render_flow_step_advanced",
     "render_caption", "render_caption_preview",
     "render_buttons", "render_button_view",
     "render_welcome",
