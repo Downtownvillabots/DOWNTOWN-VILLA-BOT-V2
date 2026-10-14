@@ -211,6 +211,12 @@ DEFAULT_CFG: Dict[str, Any] = {
         "results_found": 0,
         "not_found": 0,
         "files_sent": 0,
+        # Suggestion engagement
+        "suggestions_shown": 0,
+        "suggestions_clicked": 0,
+        "suggestions_led_to_files": 0,
+        # Requests
+        "requests_sent": 0,
         "updated_at": None,
     },
 
@@ -571,6 +577,10 @@ async def reset_config(chat_id: int) -> bool:
             "results_found": 0,
             "not_found": 0,
             "files_sent": 0,
+            "suggestions_shown": 0,
+            "suggestions_clicked": 0,
+            "suggestions_led_to_files": 0,
+            "requests_sent": 0,
             "updated_at": now,
         }
         await coll.replace_one(
