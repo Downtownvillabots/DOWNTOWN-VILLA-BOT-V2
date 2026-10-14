@@ -91,6 +91,31 @@ async def render_main(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     ad_timer = int((cfg.get("auto_delete") or {}).get("bot_timer", 600))
     cap_custom = bool(cfg.get("caption_template"))
 
+    # ── Compact stats summary ──
+    st = cfg.get("stats") or {}
+    try:
+        s_searches = int(st.get("searches_today", 0) or 0)
+        s_found = int(st.get("results_found", 0) or 0)
+        s_notfound = int(st.get("not_found", 0) or 0)
+        s_sent = int(st.get("files_sent", 0) or 0)
+    except (TypeError, ValueError):
+        s_searches = s_found = s_notfound = s_sent = 0
+
+    if s_searches > 0:
+        rate = (s_found / s_searches) * 100
+        rate_str = f"{rate:.0f}%"
+    else:
+        rate_str = "—"
+
+    stats_line = (
+        f"📊 {F.sc('stats')} · "
+        f"🔎 <b>{s_searches}</b> · "
+        f"✅ <b>{s_found}</b> · "
+        f"❌ <b>{s_notfound}</b> · "
+        f"📤 <b>{s_sent}</b> · "
+        f"📈 <b>{rate_str}</b>"
+    )
+
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"{F.EMO['gear']} <b>{F.fb('GROUP SETTINGS')}</b>",
@@ -108,8 +133,10 @@ async def render_main(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         _line("🔐", "verify", _on((cfg.get("verify") or {}).get("enabled", False))),
         _line("📝", "caption", "custom" if cap_custom else "global"),
         _line("🔘", "buttons", f"{btn_n}"),
+        "",
+        DIV_S,
+        stats_line,
     ])
-
     rows = [
         [InlineKeyboardButton(
             f"{F.EMO['search']} {F.sc('search settings')}",
@@ -1390,14 +1417,56 @@ async def render_stats(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     cfg = await S.get_config(chat_id)
     st = cfg.get("stats") or {}
 
+    def _i(k: str) -> int:
+        try:
+            return int(st.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    searches = _i("searches_today")
+    found = _i("results_found")
+    notfound = _i("not_found")
+    sent = _i("files_sent")
+
+    if searches > 0:
+        rate = (found / searches) * 100
+        rate_str = f"{rate:.1f}%"
+    else:
+        rate_str = "—"
+
+    # Last updated timestamp
+    updated = st.get("updated_at")
+    if updated is not None:
+        try:
+            if hasattr(updated, "strftime"):
+                updated_str = updated.strftime("%d %b %Y · %H:%M")
+            else:
+                updated_str = str(updated)[:19]
+        except Exception:
+            updated_str = "—"
+    else:
+        updated_str = "—"
+
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"📊 <b>{F.fb('GROUP STATS')}</b>",
         DIV, "",
-        _line("🔎", "searches today", FM.num(st.get("searches_today", 0))),
-        _line("✅", "results found", FM.num(st.get("results_found", 0))),
-        _line("❌", "not found", FM.num(st.get("not_found", 0))),
-        _line("📤", "files sent", FM.num(st.get("files_sent", 0))),
+        f"👥 <b>{F.sc(str(cfg.get('title') or chat_id)[:50])}</b>",
+        f"🆔 <code>{chat_id}</code>",
+        "",
+        DIV_S, "",
+        _line("🔎", "searches today", FM.num(searches)),
+        _line("✅", "results found", FM.num(found)),
+        _line("❌", "not found", FM.num(notfound)),
+        _line("📤", "files sent", FM.num(sent)),
+        "",
+        DIV_S, "",
+        f"📈 {F.sc('success rate')} · <b>{rate_str}</b>",
+        f"🕒 {F.sc('last updated')} · <code>{updated_str}</code>",
+        "",
+        DIV_S,
+        f"📌 {F.sc('counters reset when you tap')} "
+        f"<b>{F.sc('reset stats')}</b>",
     ])
 
     rows = [
@@ -1441,6 +1510,12 @@ async def render_view(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         _line("🚫", "banned words",
               f"{len(filt.get('banned_words') or [])}"),
         _line("🔐", "verify", _on(ver.get("enabled", False))),
+        "",
+        DIV_S,
+        _line("🔎", "searches today",
+              FM.num((cfg.get("stats") or {}).get("searches_today", 0))),
+        _line("📤", "files sent",
+              FM.num((cfg.get("stats") or {}).get("files_sent", 0))),
     ])
 
     rows = [_back_close("ga:back")[0]]
