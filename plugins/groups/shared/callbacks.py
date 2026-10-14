@@ -443,6 +443,61 @@ async def sr_sug(client: Client, q: CallbackQuery):
 
 
 # ============================================================
+# SECTION 4b — SR:REQ (user tapped "send request" from suggestions)
+# ============================================================
+
+@Client.on_callback_query(
+    filters.regex(r"^sr:req:"),
+    group=-8097,
+)
+async def sr_req(client: Client, q: CallbackQuery):
+    """
+    User tapped "📩 Send request" from the suggestion screen.
+    Callback: sr:req:{sid}
+
+    Reads the raw query from the session and triggers the
+    request flow directly — no suggestion index needed.
+    """
+    try:
+        parts = str(q.data).split(":")
+        if len(parts) < 3:
+            return await q.answer("❌ invalid", show_alert=True)
+        sid = parts[2]
+
+        session = await _get_session(sid)
+        if not session:
+            return await q.answer(
+                "⏱️ Session expired — search again",
+                show_alert=True,
+            )
+
+        # Use the original query text
+        raw = str(session.query or "").strip()
+        if not raw:
+            return await q.answer("❌ empty query", show_alert=True)
+
+        # Kind: if the session has any "series" hint, mark it so
+        await q.answer("📩 Sending request…")
+
+        # Delegate to the shared request flow
+        await _send_request_flow(
+            client=client,
+            q=q,
+            title=raw,
+            year=None,
+            kind="movie",
+            tmdb_id=None,
+        )
+
+    except Exception as e:
+        logger.exception(f"[SR-CB] sr_req: {e}")
+        try:
+            await q.answer("❌ Error", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
 # SECTION 5 — REQUEST FLOW (from suggestion with no DB hits)
 # ============================================================
 
@@ -604,6 +659,7 @@ __all__ = [
     "sr_file",
     "sr_more",
     "sr_sug",
+    "sr_req",
     "sr_cancel",
     "snapshot",
 ]
