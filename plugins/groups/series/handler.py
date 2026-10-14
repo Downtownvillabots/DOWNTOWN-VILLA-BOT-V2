@@ -1716,6 +1716,8 @@ async def series_delivery_start(client: Client, message: Message):
                             except Exception:
                                 pass
                             return
+        except Exception as e:
+            logger.debug(f"[SERIES-H] verify gate: {e}")
 
     if not hits:
         try:
