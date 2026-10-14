@@ -431,26 +431,79 @@ async def group_router(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
-        # ── FLOW: TOGGLE AUTO-SKIP ──
-        if action == "flow_skip":
+                # ── FLOW: OPEN ADVANCED ──
+        if action == "flow_adv":
             key = parts[2] if len(parts) > 2 else ""
-            sess = _sess_get(uid) or {}
             chat_id = _sess_chat_id(uid)
             if not chat_id or not key:
-                return await q.answer("❌")
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            text, kb = await P.render_flow_step_advanced(chat_id, key)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── FLOW: SET ADVANCED FIELD ─
+        if action == "flow_set":
+            # ga:flow_set:{step_key}:{field}:{value}
+            key = parts[2] if len(parts) > 2 else ""
+            field = parts[3] if len(parts) > 3 else ""
+            raw_val = parts[4] if len(parts) > 4 else ""
+            chat_id = _sess_chat_id(uid)
+            if not chat_id or not key or not field:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            # Cast value: int if numeric, else str
+            try:
+                value: Any = int(raw_val)
+            except (TypeError, ValueError):
+                value = raw_val
+
+            await S.save_field(
+                chat_id, f"flow.{key}.{field}", value,
+            )
+            await q.answer(f"✅ {field}={value}")
+            text, kb = await P.render_flow_step_advanced(chat_id, key)
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── FLOW: TOGGLE ADVANCED FIELD ──
+        if action == "flow_togf":
+            key = parts[2] if len(parts) > 2 else ""
+            field = parts[3] if len(parts) > 3 else ""
+            chat_id = _sess_chat_id(uid)
+            if not chat_id or not key or not field:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
             if not await _is_group_admin(client, chat_id, uid):
                 return await q.answer("⛔ Admin only", show_alert=True)
 
             cfg = await S.get_config(chat_id)
             flow = cfg.get("flow") or {}
-            cur = bool((flow.get(key) or {}).get("auto_skip", True))
+            step = flow.get(key) or {}
+            cur = bool(step.get(field, False))
             await S.save_field(
-                chat_id, f"flow.{key}.auto_skip", not cur,
+                chat_id, f"flow.{key}.{field}", not cur,
             )
-            await q.answer("🔄")
-            text, kb = await P.render_flow_step(chat_id, key)
+            await q.answer(f"{'🟢' if not cur else '🔴'}")
+            text, kb = await P.render_flow_step_advanced(chat_id, key)
             await _safe_edit(q, text, kb)
             return
+
+        # ── FLOW: NO-OP (section label rows) ──
+        if action == "flow_noop":
+            return await q.answer()
 
         # ── CAPTION: EDIT SESSION ──
         if action == "cap":
