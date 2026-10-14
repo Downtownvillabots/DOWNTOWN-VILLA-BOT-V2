@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import time
 from datetime import datetime
@@ -1203,6 +1205,430 @@ async def cmd_reset_groupstats(client: Client, message: Message):
             "",
             f"📌 {F.sc('all counters set to 0')}",
         ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+# ============================================================
+# SECTION 8d — GROUP CONFIG BACKUP / RESTORE (bot admins)
+# ============================================================
+#
+# /backupgroup <chat_id>     → JSON file to PM
+# /restoregroup <chat_id>    → reply to JSON, apply
+# /backupall                 → every group in one JSON
+# /restoreall                → reply to JSON, restore all
+#
+# Only whitelisted keys (DEFAULT_CFG) are applied. Per-instance
+# keys (chat_id, title, stats) are stripped before export.
+# ============================================================
+
+_STRIP_ON_EXPORT = frozenset({
+    "chat_id", "_id", "title", "username",
+    "created_at", "updated_at",
+})
+
+
+def _export_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a clean copy of cfg for JSON export."""
+    out: Dict[str, Any] = {}
+    for k, v in (cfg or {}).items():
+        if k in _STRIP_ON_EXPORT:
+            continue
+        if k == "stats":
+            continue
+        out[k] = v
+    return out
+
+
+def _sanitize_import(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep only keys that exist in DEFAULT_CFG.
+    Drops anything unknown — safe against malicious payloads.
+    """
+    if not isinstance(cfg, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in cfg.items():
+        if k in _STRIP_ON_EXPORT:
+            continue
+        if k == "stats":
+            continue
+        if k not in S.DEFAULT_CFG:
+            continue
+        out[k] = v
+    return out
+
+
+async def _send_json_file(
+    client: Client,
+    chat_id: int,
+    data: Any,
+    filename: str,
+    caption: str,
+) -> bool:
+    """Send a JSON payload as a document."""
+    try:
+        raw = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    except Exception as e:
+        logger.warning(f"[GROUPS] json encode: {e}")
+        return False
+
+    try:
+        buf = io.BytesIO(raw)
+        buf.name = filename
+        await client.send_document(
+            chat_id=int(chat_id),
+            document=buf,
+            file_name=filename,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except Exception as e:
+        logger.exception(f"[GROUPS] send json: {e}")
+        return False
+
+
+async def _download_json(message: Message) -> Optional[Any]:
+    """Download a JSON document from a replied-to message."""
+    target = message.reply_to_message
+    if not target or not target.document:
+        return None
+    try:
+        path = await target.download()
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        logger.warning(f"[GROUPS] download json: {e}")
+        return None
+
+
+# ── /backupgroup ──
+
+@Client.on_message(
+    filters.command(["backupgroup", "bg"]) & filters.private,
+    group=-8500,
+)
+async def cmd_backup_group(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    args = (message.text or "").split()
+    if len(args) < 2:
+        return await message.reply_text(
+            "\n".join([
+                "ᴜꜱᴀɢᴇ: <code>/backupgroup -1001234567890</code>",
+                "",
+                f"📌 {F.sc('get the id from')} <code>/groupstats</code>",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        cid = int(args[1])
+    except (ValueError, TypeError):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('invalid chat id')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        cfg = await S.get_config(cid, use_cache=False)
+    except Exception as e:
+        return await message.reply_text(f"❌ {e}")
+
+    if not cfg.get("chat_id"):
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['cross']} <b>{F.fb('GROUP NOT FOUND')}</b>",
+                F.DIV, "",
+                f"🆔 <code>{cid}</code>",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    export = {
+        "version": 1,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "chat_id": cid,
+        "title": str(cfg.get("title") or "")[:100],
+        "config": _export_config(cfg),
+    }
+
+    fname = f"group_backup_{cid}_{int(time.time())}.json"
+    caption = "\n".join([
+        f"{F.EMO['check']} <b>{F.fb('BACKUP READY')}</b>",
+        F.DIV, "",
+        f"👥 {F.sc('group')} · <code>{cid}</code>",
+        f"📦 {F.sc('keys')} · <b>{len(export['config'])}</b>",
+        "",
+        f"📌 {F.sc('keep this file safe')}",
+        f"📌 {F.sc('restore with')} "
+        f"<code>/restoregroup {cid}</code>",
+    ])
+
+    ok = await _send_json_file(
+        client, message.chat.id, export, fname, caption,
+    )
+    if not ok:
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('send failed')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── /restoregroup ──
+
+@Client.on_message(
+    filters.command(["restoregroup", "rg"])
+    & filters.private
+    & filters.reply,
+    group=-8500,
+)
+async def cmd_restore_group(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return
+
+    args = (message.text or "").split()
+    if len(args) < 2:
+        return await message.reply_text(
+            "\n".join([
+                "ᴜꜱᴀɢᴇ:",
+                f"1. {F.sc('reply to a backup json')}",
+                "2. <code>/restoregroup -1001234567890</code>",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        cid = int(args[1])
+    except (ValueError, TypeError):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('invalid chat id')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    data = await _download_json(message)
+    if data is None:
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('could not read json')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # Accept two shapes:
+    #   1. Wrapped:   {"chat_id": X, "config": {...}}
+    #   2. Flat:      {...keys of config...}
+    raw_cfg: Dict[str, Any] = {}
+    if isinstance(data, dict):
+        if isinstance(data.get("config"), dict):
+            raw_cfg = data["config"]
+        else:
+            raw_cfg = data
+
+    clean = _sanitize_import(raw_cfg)
+    if not clean:
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['cross']} <b>{F.fb('INVALID BACKUP')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('no valid keys found')}",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # Preserve existing meta
+    try:
+        existing = await S.get_config(cid, use_cache=False)
+    except Exception:
+        existing = {}
+
+    now = datetime.utcnow()
+    doc: Dict[str, Any] = {
+        "chat_id": int(cid),
+        "title": existing.get("title"),
+        "username": existing.get("username"),
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+        "stats": existing.get("stats") or {
+            "searches_today": 0,
+            "results_found": 0,
+            "not_found": 0,
+            "files_sent": 0,
+            "updated_at": now,
+        },
+    }
+
+    # Merge defaults over top of the sanitized import so any
+    # missing key falls back to the code default.
+    template = await S.get_default_template()
+    merged = dict(template)
+    for k, v in clean.items():
+        merged[k] = v
+    for k in S.DEFAULT_CFG.keys():
+        if k not in merged and k in clean:
+            merged[k] = clean[k]
+
+    # Strip per-instance keys from merged
+    for k in _STRIP_ON_EXPORT:
+        merged.pop(k, None)
+    merged.pop("stats", None)
+
+    doc.update(merged)
+
+    try:
+        coll = S._coll()
+        if coll is None:
+            raise RuntimeError("no db")
+        await coll.replace_one({"chat_id": int(cid)}, doc, upsert=True)
+        S._cache_invalidate(int(cid))
+    except Exception as e:
+        logger.exception(f"[GROUPS] restore: {e}")
+        return await message.reply_text(f"❌ {e}")
+
+    await message.reply_text(
+        "\n".join([
+            f"{F.EMO['check']} <b>{F.fb('RESTORE COMPLETE')}</b>",
+            F.DIV, "",
+            f"👥 {F.sc('group')} · <code>{cid}</code>",
+            f"📦 {F.sc('keys applied')} · <b>{len(clean)}</b>",
+            "",
+            f"📌 {F.sc('config is now live')}",
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /backupall ──
+
+@Client.on_message(
+    filters.command(["backupall", "ba"]) & filters.private,
+    group=-8500,
+)
+async def cmd_backup_all(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        docs = await S.list_groups(limit=500)
+    except Exception as e:
+        return await message.reply_text(f"❌ {e}")
+
+    if not docs:
+        return await message.reply_text(
+            f"⚪ {F.sc('no groups registered yet')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    bundle: Dict[str, Any] = {
+        "version": 1,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "groups": {},
+    }
+    count = 0
+    for d in docs:
+        try:
+            cid = int(d.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not cid:
+            continue
+        try:
+            cfg = await S.get_config(cid, use_cache=False)
+        except Exception:
+            continue
+        bundle["groups"][str(cid)] = {
+            "title": str(cfg.get("title") or "")[:100],
+            "config": _export_config(cfg),
+        }
+        count += 1
+
+    fname = f"all_groups_backup_{int(time.time())}.json"
+    caption = "\n".join([
+        f"{F.EMO['check']} <b>{F.fb('FULL BACKUP READY')}</b>",
+        F.DIV, "",
+        f"👥 {F.sc('groups')} · <b>{count}</b>",
+        "",
+        f"📌 {F.sc('restore with')} <code>/restoreall</code>",
+    ])
+
+    await _send_json_file(
+        client, message.chat.id, bundle, fname, caption,
+    )
+
+
+# ── /restoreall ──
+
+@Client.on_message(
+    filters.command(["restoreall", "ra"])
+    & filters.private
+    & filters.reply,
+    group=-8500,
+)
+async def cmd_restore_all(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return
+
+    data = await _download_json(message)
+    if not isinstance(data, dict) or not isinstance(
+        data.get("groups"), dict,
+    ):
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['cross']} <b>{F.fb('INVALID BUNDLE')}</b>",
+                F.DIV, "",
+                f"📌 {F.sc('reply to a /backupall file')}",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    groups = data["groups"]
+    if not groups:
+        return await message.reply_text(
+            f"⚪ {F.sc('empty bundle')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # Confirm
+    total = len(groups)
+    confirm_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"✅ {F.sc(f'yes, restore {total}')}",
+            callback_data="ga:rstall_do",
+        ),
+        InlineKeyboardButton(
+            f"❌ {F.sc('cancel')}",
+            callback_data="ga:rstall_no",
+        ),
+    ]])
+
+    # Stash the payload for the callback to pick up
+    try:
+        from plugins.groups import router as R
+        R._sess_new(
+            message.from_user.id,
+            "rstall",
+            message.chat.id,
+            payload=groups,
+        )
+    except Exception as e:
+        logger.debug(f"[GROUPS] stash rstall: {e}")
+
+    await message.reply_text(
+        "\n".join([
+            f"{F.EMO['warn']} <b>{F.fb('RESTORE ALL GROUPS?')}</b>",
+            F.DIV, "",
+            f"👥 {F.sc('groups in bundle')} · <b>{total}</b>",
+            "",
+            f"⚠️ {F.sc('this will overwrite existing configs')}",
+            f"📌 {F.sc('stats and titles are preserved')}",
+        ]),
+        reply_markup=confirm_kb,
         parse_mode=ParseMode.HTML,
     )
 
