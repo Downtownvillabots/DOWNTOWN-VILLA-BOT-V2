@@ -440,6 +440,7 @@ async def render_flow(
 
 async def render_flow_step(
     chat_id: int, step_key: str,
+    flow_type: str = "movie",
 ) -> Tuple[str, InlineKeyboardMarkup]:
     cfg = await S.get_config(chat_id)
     flow = cfg.get("flow") or {}
@@ -501,7 +502,7 @@ async def render_flow_step(
     rows.append([
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data="ga:s:flow",
+            callback_data=f"ga:s:flow:{flow_type}",
         ),
         InlineKeyboardButton(
             f"{F.EMO['cross']} {F.sc('close')}",
@@ -512,6 +513,7 @@ async def render_flow_step(
 
 async def render_flow_step_advanced(
     chat_id: int, step_key: str,
+    flow_type: str = "movie",
 ) -> Tuple[str, InlineKeyboardMarkup]:
     """
     Advanced settings for one flow step.
@@ -840,7 +842,7 @@ async def render_flow_step_advanced(
     rows.append([
         InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('back')}",
-            callback_data=f"ga:flow:{step_key}",
+            callback_data=f"ga:flow:{flow_type}:{step_key}",
         ),
         InlineKeyboardButton(
             f"{F.EMO['cross']} {F.sc('close')}",
@@ -848,7 +850,6 @@ async def render_flow_step_advanced(
         ),
     ])
     return "\n".join(text_lines), _kb(rows)
-
 
 # ============================================================
 # SECTION 6 — CAPTION
