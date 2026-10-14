@@ -148,6 +148,50 @@ async def sr_file(client: Client, q: CallbackQuery):
 
         hit = candidates[idx]
 
+        chat_id = q.message.chat.id if q.message.chat else 0
+
+        # ── Verify gate ──
+        try:
+            cfg = await S.get_config(chat_id)
+            v_cfg = cfg.get("verify") or {}
+            if v_cfg.get("enabled") and v_cfg.get("shortener_url"):
+                from plugins.groups.shared import verify as V
+                uid = q.from_user.id
+                if not await V.is_verified(uid, chat_id):
+                    # Not verified → build + send verify card
+                    bot_username = await _bot_username(client)
+                    if not bot_username:
+                        return await q.answer(
+                            "⚠️ Bot username missing",
+                            show_alert=True,
+                        )
+                    target = (
+                        f"https://t.me/{bot_username}?start=v_{{url}}"
+                    )
+                    # Pass the target so shortener can append
+                    # (the token is generated inside build_verify_card)
+                    text, kb = await V.build_verify_card(
+                        client, cfg, chat_id, uid, target,
+                    )
+                    if not text or not kb:
+                        return await q.answer(
+                            "⚠️ Verify setup error",
+                            show_alert=True,
+                        )
+                    await q.answer("🔐 Verify required")
+                    try:
+                        await q.message.reply_text(
+                            text,
+                            reply_markup=kb,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.debug(f"[SR-CB] verify card: {e}")
+                    return
+        except Exception as e:
+            logger.debug(f"[SR-CB] verify gate: {e}")
+
         # Notify user
         await q.answer("📤 Sending to your PM…")
 
@@ -693,6 +737,73 @@ async def sr_cancel(client: Client, q: CallbackQuery):
         pass
     await q.answer("❌ Cancelled")
 
+@Client.on_callback_query(
+    filters.regex(r"^sr:vchk:"),
+    group=-8097,
+)
+async def sr_vchk(client: Client, q: CallbackQuery):
+    """
+    User tapped "✅ I VERIFIED" on a verify card.
+
+    Callback: sr:vchk:{token}
+
+    Looks up the token. If verified → delete the card and
+    tell the user to retap the file button.
+    """
+    try:
+        parts = str(q.data).split(":")
+        if len(parts) < 3:
+            return await q.answer("❌ invalid", show_alert=True)
+        token = parts[2]
+
+        from plugins.groups.shared import verify as V
+        doc = await V.get_token(token)
+
+        if not doc:
+            return await q.answer(
+                "⏱️ Link expired — search again",
+                show_alert=True,
+            )
+
+        uid = q.from_user.id
+        owner = int(doc.get("user_id", 0))
+        if owner != uid:
+            return await q.answer(
+                "⛔ Not your link", show_alert=True,
+            )
+
+        if not doc.get("verified"):
+            return await q.answer(
+                "⚠️ Open the shortener first",
+                show_alert=True,
+            )
+
+        # Verified! Delete the card and confirm
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+
+        try:
+            await q.message.reply_text(
+                "\n".join([
+                    f"{F.EMO['check']} <b>{F.fb('VERIFIED')}</b>",
+                    F.DIV, "",
+                    f"📌 {F.sc('now tap the file button again')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+        await q.answer("✅ Verified")
+    except Exception as e:
+        logger.exception(f"[SR-CB] vchk: {e}")
+        try:
+            await q.answer("❌ Error", show_alert=True)
+        except Exception:
+            pass
+
 
 @Client.on_callback_query(
     filters.regex(r"^sr:cancel_noop$"),
@@ -716,6 +827,7 @@ __all__ = [
     "sr_more",
     "sr_sug",
     "sr_req",
+    "sr_vchk",
     "sr_cancel",
     "sr_cancel_noop",
     "snapshot",
