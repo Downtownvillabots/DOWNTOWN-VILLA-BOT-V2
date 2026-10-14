@@ -13,6 +13,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from utils import fonts as F
 from utils import format as FM
+from core import config
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +75,34 @@ def build_caption(hit: Any, cfg: Dict[str, Any]) -> str:
 # ============================================================
 
 def build_kb(hit: Any, cfg: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
-    per_row = max(1, min(3, int(cfg.get("delivered_buttons_per_row", 2) or 2)))
+    """
+    Reply markup for a PM-delivered file.
+
+    Reads `result_buttons` (the current group schema), falling
+    back to `delivered_buttons` (legacy PM schema) for safety.
+    """
+    # Accept both new + legacy key names
+    buttons = (
+        cfg.get("result_buttons")
+        or cfg.get("delivered_buttons")
+        or []
+    )
+
+    per_row = 2
+    for key in ("buttons_per_row", "delivered_buttons_per_row"):
+        try:
+            v = int(cfg.get(key, 0) or 0)
+            if v:
+                per_row = v
+                break
+        except (TypeError, ValueError):
+            continue
+    per_row = max(1, min(3, per_row))
+
     rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
 
-    for b in (cfg.get("delivered_buttons") or []):
+    for b in buttons:
         if not isinstance(b, dict) or not b.get("enabled", True):
             continue
         name = str(b.get("name") or "")[:60]
@@ -101,19 +125,25 @@ def build_kb(hit: Any, cfg: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
     if row:
         rows.append(row)
 
-    # Share button
+    # ── Share button ──
     if cfg.get("share_button", True):
         title = _get(hit, "title") or _get(hit, "series_title") or "file"
         try:
             from urllib.parse import quote
+            share_target = (
+                getattr(config, "UPDATE_CHNL_LNK", None)
+                or getattr(config, "BOT_LINK", None)
+                or "https://t.me/"
+            )
             share_text = quote(str(title), safe="")
+            share_url = (
+                f"https://t.me/share/url?"
+                f"url={quote(share_target, safe='')}&"
+                f"text={share_text}"
+            )
         except Exception:
-            share_text = "Check%20this"
-        share_url = (
-            f"https://t.me/share/url?"
-            f"url=https://t.me/&"
-            f"text={share_text}"
-        )
+            share_url = "https://t.me/"
+
         rows.append([InlineKeyboardButton(
             f"📤 {F.sc('share')}", url=share_url,
         )])
