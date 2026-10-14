@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from datetime import datetime
@@ -279,6 +280,129 @@ def _merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+
+# ============================================================
+# SECTION 4b — GLOBAL DEFAULT TEMPLATE
+# ============================================================
+#
+# Stored in SYSTEM DB → bot_settings → _id="group_defaults".
+# New groups inherit it. Reset config → back to it.
+#
+# Keys stripped from the template (per-group, not defaults):
+#   chat_id, _id, title, username, created_at, updated_at, stats
+
+_TEMPLATE_ID = "group_defaults"
+_TEMPLATE_COLLECTION = "bot_settings"
+
+_STRIP_KEYS = frozenset({
+    "chat_id", "_id", "title", "username",
+    "created_at", "updated_at",
+})
+
+
+def _template_coll():
+    try:
+        from database import db_registry
+        db = db_registry.get_system_db()
+        return db[_TEMPLATE_COLLECTION] if db is not None else None
+    except Exception as e:
+        logger.debug(f"[GROUPS] template coll: {e}")
+        return None
+
+
+def _strip_for_template(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a clean copy of cfg, minus per-instance keys."""
+    out: Dict[str, Any] = {}
+    for k, v in (cfg or {}).items():
+        if k in _STRIP_KEYS:
+            continue
+        if k == "stats":
+            continue
+        out[k] = copy.deepcopy(v)
+    return out
+
+
+async def get_default_template() -> Dict[str, Any]:
+    """
+    Return the global default config template.
+
+    Priority:
+      1. stored template (bot_settings.group_defaults)
+      2. code DEFAULT_CFG
+
+    Always returns a fresh deepcopy — safe to mutate.
+    """
+    coll = _template_coll()
+    if coll is None:
+        return copy.deepcopy(DEFAULT_CFG)
+
+    try:
+        doc = await coll.find_one({"_id": _TEMPLATE_ID})
+    except Exception as e:
+        logger.debug(f"[GROUPS] template read: {e}")
+        return copy.deepcopy(DEFAULT_CFG)
+
+    if not doc:
+        return copy.deepcopy(DEFAULT_CFG)
+
+    doc.pop("_id", None)
+    merged = _merge(DEFAULT_CFG, doc)
+    return copy.deepcopy(merged)
+
+
+async def save_default_template(cfg: Dict[str, Any]) -> bool:
+    """
+    Save cfg as the new global default template.
+    Per-instance keys (chat_id, title, stats) are stripped.
+    """
+    coll = _template_coll()
+    if coll is None:
+        return False
+    try:
+        payload = _strip_for_template(cfg)
+        payload["updated_at"] = datetime.utcnow()
+        await coll.update_one(
+            {"_id": _TEMPLATE_ID},
+            {"$set": payload},
+            upsert=True,
+        )
+        logger.info("[GROUPS] template saved")
+        return True
+    except Exception as e:
+        logger.warning(f"[GROUPS] template save: {e}")
+        return False
+
+
+async def reset_default_template() -> bool:
+    """
+    Delete the stored template — falls back to code DEFAULT_CFG.
+    Existing groups are NOT touched.
+    """
+    coll = _template_coll()
+    if coll is None:
+        return False
+    try:
+        await coll.delete_one({"_id": _TEMPLATE_ID})
+        logger.info("[GROUPS] template reset")
+        return True
+    except Exception as e:
+        logger.warning(f"[GROUPS] template reset: {e}")
+        return False
+
+
+async def has_custom_template() -> bool:
+    coll = _template_coll()
+    if coll is None:
+        return False
+    try:
+        doc = await coll.find_one(
+            {"_id": _TEMPLATE_ID}, {"_id": 1},
+        )
+        return doc is not None
+    except Exception:
+        return False
+
+
 # ============================================================
 # SECTION 5 — READ
 # ============================================================
@@ -292,7 +416,8 @@ async def get_config(chat_id: int, use_cache: bool = True) -> Dict[str, Any]:
 
     coll = _coll()
     if coll is None:
-        return {"chat_id": cid, **DEFAULT_CFG}
+        template = await get_default_template()
+        return {"chat_id": cid, **template}
 
     try:
         doc = await coll.find_one({"chat_id": cid})
@@ -301,7 +426,9 @@ async def get_config(chat_id: int, use_cache: bool = True) -> Dict[str, Any]:
         doc = None
 
     if not doc:
-        merged = {"chat_id": cid, **DEFAULT_CFG}
+        # New group → inherit the global template
+        template = await get_default_template()
+        merged = {"chat_id": cid, **template}
         if use_cache:
             _cache_set(cid, merged)
         return merged
@@ -386,9 +513,12 @@ async def register_group(
         return False
     try:
         now = datetime.utcnow()
-        payload = {k: v for k, v in DEFAULT_CFG.items()
+        # Inherit the global template for new groups
+        template = await get_default_template()
+        payload = {k: v for k, v in template.items()
                    if k not in ("created_at", "updated_at",
-                                "title", "username")}
+                                "title", "username", "_id",
+                                "chat_id")}
         await coll.update_one(
             {"chat_id": int(chat_id)},
             {
@@ -411,7 +541,6 @@ async def register_group(
         logger.warning(f"[GROUPS] register: {e}")
         return False
 
-
 async def reset_config(chat_id: int) -> bool:
     coll = _coll()
     if coll is None:
@@ -426,10 +555,21 @@ async def reset_config(chat_id: int) -> bool:
             "created_at": doc.get("created_at", now),
             "updated_at": now,
         }
-        for k, v in DEFAULT_CFG.items():
-            if k in ("created_at", "updated_at", "title", "username"):
+        # Use the global template (falls back to DEFAULT_CFG)
+        template = await get_default_template()
+        for k, v in template.items():
+            if k in ("created_at", "updated_at",
+                     "title", "username", "_id", "chat_id"):
                 continue
             fresh[k] = v
+        # Reset stats to zero
+        fresh["stats"] = {
+            "searches_today": 0,
+            "results_found": 0,
+            "not_found": 0,
+            "files_sent": 0,
+            "updated_at": now,
+        }
         await coll.replace_one(
             {"chat_id": int(chat_id)},
             fresh,
@@ -440,7 +580,6 @@ async def reset_config(chat_id: int) -> bool:
     except Exception as e:
         logger.warning(f"[GROUPS] reset: {e}")
         return False
-
 
 async def delete_group(chat_id: int) -> bool:
     coll = _coll()
@@ -518,4 +657,9 @@ __all__ = [
     "list_groups", "count_groups",
     "invalidate_all",
     "bump_stat",
+    # Global template
+    "get_default_template",
+    "save_default_template",
+    "reset_default_template",
+    "has_custom_template",
 ]
