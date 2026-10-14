@@ -176,13 +176,23 @@ async def mark_verified(token: str) -> bool:
                 pass
             ttl = max(60, min(86400, ttl))
 
+            # Preserve first_verified_at across re-verifies
+            existing = await g.find_one({
+                "user_id": user_id, "chat_id": chat_id,
+            })
+            first_at = (existing or {}).get("first_verified_at")
+            if not isinstance(first_at, datetime):
+                first_at = now
+
             await g.update_one(
                 {"user_id": user_id, "chat_id": chat_id},
                 {"$set": {
                     "user_id": user_id,
                     "chat_id": chat_id,
                     "verified_at": now,
+                    "first_verified_at": first_at,
                     "until": now + timedelta(seconds=ttl),
+                    "auto_renewed": False,
                 }},
                 upsert=True,
             )
@@ -231,6 +241,88 @@ async def get_grant(
 async def is_verified(user_id: int, chat_id: int) -> bool:
     doc = await get_grant(user_id, chat_id)
     return doc is not None
+
+
+# ── Return-user shortcut ──
+# If the user has verified in the last N hours, auto-renew their
+# grant without making them open the shortener again.
+RETURN_USER_WINDOW = 24 * 3600   # 24 hours
+
+
+async def try_auto_renew(
+    user_id: int,
+    chat_id: int,
+) -> bool:
+    """
+    If the user has verified in the last RETURN_USER_WINDOW seconds,
+    create a fresh grant immediately and return True.
+
+    If no prior verification exists (or it's too old), return False
+    — the caller should fall back to the full verify flow.
+    """
+    g = _grants()
+    if g is None:
+        return False
+
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=RETURN_USER_WINDOW)
+
+        # Find a recent verify for this user+chat (even if `until`
+        # has passed — we look at last_verified_at).
+        doc = await g.find_one({
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+        })
+        if not doc:
+            return False
+
+        # Read the most recent verification moment
+        last = doc.get("verified_at") or doc.get("first_verified_at")
+        if not isinstance(last, datetime):
+            return False
+        # Normalise tz
+        if last.tzinfo is None:
+            last_aware = last.replace(tzinfo=timezone.utc)
+        else:
+            last_aware = last
+        if last_aware < cutoff:
+            return False
+
+        # Within window → refresh grant
+        # Pull TTL from group config
+        ttl = DEFAULT_GRANT_TTL
+        try:
+            from plugins.groups import state as GS
+            cfg = await GS.get_config(chat_id)
+            v = cfg.get("verify") or {}
+            ttl = int(v.get("verify_time", DEFAULT_GRANT_TTL) or
+                      DEFAULT_GRANT_TTL)
+        except Exception:
+            pass
+        ttl = max(60, min(86400, ttl))
+
+        await g.update_one(
+            {"user_id": int(user_id), "chat_id": int(chat_id)},
+            {"$set": {
+                "user_id": int(user_id),
+                "chat_id": int(chat_id),
+                "verified_at": now,
+                "first_verified_at": last_aware,
+                "until": now + timedelta(seconds=ttl),
+                "auto_renewed": True,
+            }},
+            upsert=True,
+        )
+        logger.info(
+            f"[VERIFY] auto-renew uid={user_id} chat={chat_id} "
+            f"for {ttl}s"
+        )
+        return True
+
+    except Exception as e:
+        logger.debug(f"[VERIFY] auto-renew: {e}")
+        return False
 
 
 # ============================================================
@@ -504,6 +596,8 @@ __all__ = [
     "purge_expired",
     "ensure_indexes",
     "snapshot",
+    "try_auto_renew",
     "DEFAULT_TOKEN_TTL",
     "DEFAULT_GRANT_TTL",
+    "RETURN_USER_WINDOW",
 ]
