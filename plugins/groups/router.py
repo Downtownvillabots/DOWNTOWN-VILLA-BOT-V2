@@ -200,11 +200,6 @@ async def _render_section(
         return await P.render_search(chat_id)
     if section == "content":
         return await P.render_content(chat_id)
-    if section == "flow":
-        # Preserve the last-active flow tab per-user
-        sess = _sess_get(uid_for_section) or {}
-        flow_type = sess.get("flow_type") or "movie"
-        return await P.render_flow(chat_id, flow_type)
     if section == "caption":
         return await P.render_caption(chat_id)
     if section == "buttons":
