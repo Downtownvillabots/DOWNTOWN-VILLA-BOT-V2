@@ -181,7 +181,7 @@ async def _build_group_list() -> Tuple[str, InlineKeyboardMarkup]:
 
     rows.append([InlineKeyboardButton(
         f"{F.EMO['refresh']} {F.sc('refresh')}",
-        callback_data="ga:list",
+        callback_data="galist:refresh",
     )])
     rows.append([InlineKeyboardButton(
         f"{F.EMO['cross']} {F.sc('close')}",
@@ -1901,7 +1901,7 @@ async def _render_group_list(
     rows.append([
         InlineKeyboardButton(
             f"{F.EMO['refresh']} {F.sc('refresh')}",
-            callback_data="ga:list",
+            callback_data="galist:refresh",
         ),
         InlineKeyboardButton(
             f"{F.EMO['cross']} {F.sc('close')}",
@@ -2067,7 +2067,7 @@ async def _render_group_card(
         ],
         [InlineKeyboardButton(
             f"{F.EMO['back']} {F.sc('list')}",
-            callback_data="ga:list",
+            callback_data="galist:refresh",
         )],
     ]
 
@@ -2202,7 +2202,7 @@ async def cmd_dbtest(client: Client, message: Message):
 # ============================================================
 
 @Client.on_callback_query(
-    filters.regex(r"^ga:list$"),
+    filters.regex(r"^galist:(refresh)$"),
     group=-8499,
 )
 async def cb_list_groups(client: Client, q: CallbackQuery):
@@ -2231,7 +2231,7 @@ async def cb_list_groups(client: Client, q: CallbackQuery):
     except Exception as e:
         logger.debug(f"[GROUPS] list send: {e}")
 
-    await q.answer()
+    await q.answer("🔄 Refreshed")
 
 # ============================================================
 # SECTION 10 — DEEP-LINK ENTRY (gs:{chat_id})
@@ -2318,7 +2318,6 @@ __all__ = [
     "cmd_reset_groupstats",
     "cmd_groups",
     "cmd_dbtest",
-    "cmd_backup_group",
     "cmd_backup_group",
     "cmd_restore_group",
     "cmd_backup_all",
