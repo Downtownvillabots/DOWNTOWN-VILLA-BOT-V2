@@ -175,15 +175,19 @@ async def send_file(
         pass
 
     # ── Auto-delete with warning ──
-    if cfg.get("auto_delete_enabled", False):
-        minutes = int(cfg.get("auto_delete_minutes", 10) or 10)
-        if minutes > 0:
+    # Read from the current auto_delete schema
+    ad = cfg.get("auto_delete") or {}
+    if ad.get("bot_messages", False):
+        try:
+            seconds = int(ad.get("bot_timer", 600) or 0)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds > 0:
             asyncio.create_task(
                 _auto_delete_with_warning(
-                    client, user_id, sent.id, minutes, cfg
+                    client, user_id, sent.id, seconds, cfg
                 )
             )
-
     return True
 
 
@@ -195,17 +199,41 @@ async def _auto_delete_with_warning(
     client: Client,
     chat_id: int,
     msg_id: int,
-    minutes: int,
+    seconds: int,
     cfg: Dict[str, Any],
 ) -> None:
+    """
+    Send a warning, wait, then delete the file + the warning.
+    seconds — how long until deletion (was: minutes)
+    """
     try:
-        # Send warning message
-        warn_text = str(cfg.get("auto_delete_warning") or
-                        "⚠️ This file will be deleted in {minutes} minutes")
-        try:
-            warn_text = warn_text.format(minutes=minutes)
-        except Exception:
-            pass
+        # Human-friendly time
+        if seconds < 60:
+            t_str = f"{seconds}s"
+        elif seconds < 3600:
+            t_str = f"{seconds // 60} min"
+        else:
+            t_str = f"{seconds // 3600}h"
+
+        # Prefer the group-configurable warning text (if provided)
+        warn_text = str(cfg.get("auto_delete_warning") or "")
+        if not warn_text:
+            warn_text = (
+                f"⚠️ <b>This file will be deleted in {t_str}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "📌 Forward it to Saved Messages or share it now\n"
+                "📌 Once deleted, search again"
+            )
+        else:
+            # Support both {minutes} (legacy) and {seconds}/{time}
+            try:
+                warn_text = warn_text.format(
+                    minutes=max(1, seconds // 60),
+                    seconds=seconds,
+                    time=t_str,
+                )
+            except Exception:
+                pass
 
         warn_msg = None
         try:
@@ -219,9 +247,9 @@ async def _auto_delete_with_warning(
             pass
 
         # Sleep
-        await asyncio.sleep(minutes * 60)
+        await asyncio.sleep(seconds)
 
-        # Delete both
+        # Delete file + warning
         try:
             await client.delete_messages(int(chat_id), int(msg_id))
         except Exception:
