@@ -9,32 +9,6 @@
 #   • groups/series/handler.py
 #   • groups/shared/callbacks.py  (sr:more pagination)
 #
-# Public API:
-#   show_file_list(message_or_status, query, hits, sid, cfg)
-#       → sends or edits the file list
-#
-#   build_file_list_kb(sid, hits, page, cfg, bot_username)
-#       → InlineKeyboardMarkup
-#
-#   clean_display_name(hit)
-#       → user-friendly short name (no @tags, no extension)
-#
-#   build_file_list_text(query, total, page, total_pages)
-#       → header text
-#
-# FILE BUTTON FORMAT:
-#   📦 {size} · {quality} · {clean_title}
-#
-#   Examples:
-#     📦 100 MB · 720P · Karnan 2021
-#     📦 850 MB · 1080P · Karnan 2021
-#     📦 1.4 GB · 1080P · Karnan 2021
-#
-# SORTED SMALL → BIG (configurable via cfg.per_row)
-# 10 files per page (per_page from cfg, capped 15)
-# Deep-link buttons to PM:  https://t.me/{bot}?start=file_{sid}_{idx}
-# Fallback callback (no bot username):  sr:file:{sid}:{idx}
-#
 # ============================================================
 
 from __future__ import annotations
@@ -64,7 +38,6 @@ logger = logging.getLogger(__name__)
 _PER_PAGE_DEFAULT = 10
 _PER_PAGE_MAX = 15
 
-# Regex patterns for name cleaning
 _RE_EXT = re.compile(
     r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mpg|mpeg)$",
     re.IGNORECASE,
@@ -99,16 +72,6 @@ _RE_SPACES = re.compile(r"\s+")
 # ============================================================
 
 def clean_display_name(hit: Dict[str, Any], max_len: int = 34) -> str:
-    """
-    Return a short user-friendly name from a hit.
-    Rules:
-      • Prefer hit['title'] or hit['series_title']
-      • Fall back to cleaned file_name
-      • Strip extension, @handles, URLs, bracket groups, junk tokens
-      • Keep year if present
-      • Cap length
-    """
-    # Try a real title first
     raw = (
         hit.get("title")
         or hit.get("series_title")
@@ -119,41 +82,23 @@ def clean_display_name(hit: Dict[str, Any], max_len: int = 34) -> str:
         return "file"
 
     t = str(raw)
-
-    # Strip file extension
     t = _RE_EXT.sub("", t)
-
-    # Strip URLs (whole matches)
     t = _RE_URL.sub(" ", t)
-
-    # Strip @handles
     t = _RE_HANDLE.sub(" ", t)
-
-    # Strip bracketed groups [YTS], {GROUP}, (EXTRA)
     t = _RE_BRACKETS.sub(" ", t)
-
-    # Strip junk tokens
     t = _RE_JUNK.sub(" ", t)
-
-    # Replace separators with space
     t = _RE_SEPARATORS.sub(" ", t)
-
-    # Collapse whitespace
     t = _RE_SPACES.sub(" ", t).strip(" -_.|·")
 
     if not t:
-        # Ultra-fallback: take file_name up to first dot
         fallback = str(hit.get("file_name") or "file")
         t = fallback.split(".")[0]
         t = _RE_SPACES.sub(" ", t).strip()
 
-    # Add year if missing and available
     year = hit.get("year")
     if year and str(year) not in t:
-        # Avoid dup year
         t = f"{t} {year}"
 
-    # Cap length
     if len(t) > max_len:
         t = t[: max_len - 1].rstrip() + "…"
 
@@ -165,12 +110,6 @@ def clean_display_name(hit: Dict[str, Any], max_len: int = 34) -> str:
 # ============================================================
 
 def build_button_label(hit: Dict[str, Any]) -> str:
-    """
-    One-line label for a file button.
-
-    Format:  📦 {size} · {quality} · {clean_name}
-    Example: 📦 850 MB · 1080P · Karnan 2021
-    """
     size = FM.size_short(hit.get("file_size") or 0)
     quality = str(hit.get("quality") or "").upper()
     name = clean_display_name(hit, max_len=34)
@@ -182,7 +121,6 @@ def build_button_label(hit: Dict[str, Any]) -> str:
 
     label = " · ".join(parts)
 
-    # Telegram button label cap (soft 64 chars)
     if len(label) > 60:
         label = label[:57] + "…"
     return label
@@ -198,9 +136,6 @@ def build_file_list_text(
     page: int = 1,
     total_pages: int = 1,
 ) -> str:
-    """
-    Header message above the file list.
-    """
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         F.DIV, "",
@@ -230,22 +165,11 @@ def build_file_list_kb(
     per_row: int,
     bot_username: str = "",
 ) -> Tuple[InlineKeyboardMarkup, int, int]:
-    """
-    Build the file-list keyboard.
-
-    Returns: (keyboard, total_pages, page)
-
-    Notes:
-      • Deep-link buttons when bot_username is set (preferred)
-      • Fallback to sr:file:{sid}:{idx} callback when not set
-      • Pagination via sr:more:{sid} callback (page-based)
-    """
     total = len(hits)
     per_page = max(1, min(_PER_PAGE_MAX, int(per_page or _PER_PAGE_DEFAULT)))
     per_row = max(1, min(3, int(per_row or 1)))
 
     if total == 0:
-        # Empty → just a close button
         return (
             InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -271,7 +195,6 @@ def build_file_list_kb(
         global_idx = start + i
         label = build_button_label(h)
 
-        # Prefer deep-link (real button, works even if user hasn't started bot)
         if bot_username:
             deep = (
                 f"https://t.me/{bot_username}"
@@ -291,7 +214,6 @@ def build_file_list_kb(
     if row:
         rows.append(row)
 
-    # Pagination row
     nav: List[InlineKeyboardButton] = []
     if page > 1:
         nav.append(InlineKeyboardButton(
@@ -306,7 +228,6 @@ def build_file_list_kb(
     if nav:
         rows.append(nav)
 
-    # Close button
     rows.append([InlineKeyboardButton(
         f"{F.EMO['cross']} {F.sc('close')}",
         callback_data="sr:cancel",
@@ -316,7 +237,7 @@ def build_file_list_kb(
 
 
 # ============================================================
-# SECTION 6 — SHOW FILE LIST (send or edit)
+# SECTION 6 — SHOW FILE LIST
 # ============================================================
 
 async def show_file_list(
@@ -328,14 +249,7 @@ async def show_file_list(
     client: Optional[Client] = None,
     page: int = 1,
 ) -> bool:
-    """
-    Send (or edit) the file list message.
-
-    target: Message (send new) or status Message (edit)
-    client: used to fetch bot username for deep-links
-    """
     try:
-        # Sort by the delivery step setting (not a top-level key)
         flow = cfg.get("flow") or {}
         fd = flow.get("file_delivery") or {}
         mode = str(fd.get("sort_order", "small_to_big") or "small_to_big")
@@ -343,7 +257,6 @@ async def show_file_list(
             mode = "small_to_big"
         sorted_hits = SEARCH.sort_hits(hits, mode=mode)
 
-        # Resolve bot username
         bot_username = ""
         if client is not None:
             try:
@@ -356,7 +269,6 @@ async def show_file_list(
                 except Exception:
                     bot_username = ""
 
-        # Per-page and per-row from the nested `search` section
         s_cfg = cfg.get("search") or {}
         try:
             per_page = int(
@@ -370,8 +282,6 @@ async def show_file_list(
         except (TypeError, ValueError):
             per_row = 1
 
-        # Max items — from the delivery step (default 15, capped by _PER_PAGE_MAX
-        # times pages). If 0/unset → no cap.
         try:
             max_items = int(fd.get("max_items", 15) or 15)
         except (TypeError, ValueError):
@@ -399,17 +309,17 @@ async def show_file_list(
         )
 
         try:
+            await target.edit_text(
+                text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return True
+        except Exception as e_edit:
+            if "not modified" in str(e_edit).lower():
+                return True
             try:
-                await target.edit_text(
-                    text,
-                    reply_markup=kb,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except Exception as e_edit:
-                if "not modified" in str(e_edit).lower():
-                    return True
-                # Can't edit (media message, deleted, etc.) → fall back
                 await target.reply_text(
                     text,
                     reply_markup=kb,
@@ -417,9 +327,14 @@ async def show_file_list(
                     disable_web_page_preview=True,
                 )
                 return True
-        except Exception as e:
-            logger.debug(f"[DELIVERY] show: {e}")
-            return False
+            except Exception as e_reply:
+                logger.debug(f"[DELIVERY] reply: {e_reply}")
+                return False
+
+    except Exception as e:
+        logger.debug(f"[DELIVERY] show_file_list: {e}")
+        return False
+
 
 # ============================================================
 # SECTION 7 — SESSION CREATION
@@ -431,10 +346,6 @@ async def create_session(
     query: str,
     hits: List[Dict[str, Any]],
 ) -> str:
-    """
-    Create a media_search session for these hits.
-    Returns sid or "" on failure.
-    """
     try:
         from media_search import sessions as _sess_mod
         from media_search.normalizer import normalize
@@ -461,7 +372,6 @@ def build_empty_card(
     query: str,
     reason: str = "not_found",
 ) -> Tuple[str, InlineKeyboardMarkup]:
-    """Message shown when nothing found."""
     if reason == "incomplete":
         title = "DBs unreachable"
         detail = "Try again in a moment."
@@ -497,16 +407,9 @@ def build_autodelete_warning(
     title: str = "",
     count: int = 1,
 ) -> str:
-    """
-    Build the "this will be deleted" warning text.
-    seconds — how long until deletion
-    title   — movie/series name (optional)
-    count   — number of files about to be sent
-    """
     if seconds <= 0:
         return ""
 
-    # Human-friendly time
     if seconds < 60:
         t_str = f"{seconds}s"
     elif seconds < 3600:
@@ -543,16 +446,6 @@ def build_autodelete_warning(
 
 
 def read_autodelete_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return auto-delete settings for this group, in a form the
-    delivery code can use directly.
-
-    {
-      "enabled": bool,       # overall
-      "seconds": int,        # 0 = off
-      "warn_first": bool,    # send warning before files
-    }
-    """
     ad = cfg.get("auto_delete") or {}
     enabled = bool(ad.get("bot_messages", True))
     try:
@@ -575,17 +468,13 @@ def read_autodelete_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 __all__ = [
-    # Name + label helpers
     "clean_display_name",
     "build_button_label",
     "build_file_list_text",
-    # Keyboards
     "build_file_list_kb",
-    # High-level
     "show_file_list",
     "create_session",
     "build_empty_card",
-    # Auto-delete
     "build_autodelete_warning",
     "read_autodelete_cfg",
 ]
