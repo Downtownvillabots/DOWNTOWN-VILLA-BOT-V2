@@ -783,6 +783,147 @@ async def cmd_maintenance(client: Client, message: Message):
         logger.exception(f"[GROUPS] maint: {e}")
         await message.reply_text(f"❌ {e}")
 
+# ============================================================
+# SECTION 8b — GROUP DEFAULT TEMPLATE (bot admins only)
+# ============================================================
+#
+# /savegroupdefault   (in a group, bot admin)  → save this group's
+#                       config as the global template for new groups
+# /showgroupdefault   (in PM, bot admin)       → view template summary
+# /resetgroupdefault  (in PM, bot admin)       → reset to code defaults
+
+@Client.on_message(
+    filters.command("savegroupdefault") & filters.group,
+    group=-8500,
+)
+async def cmd_save_group_default(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    chat_id = message.chat.id
+    try:
+        cfg = await S.get_config(chat_id, use_cache=False)
+        ok = await S.save_default_template(cfg)
+    except Exception as e:
+        logger.exception(f"[GROUPS] save default: {e}")
+        return await message.reply_text(f"❌ {e}")
+
+    if not ok:
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('save failed')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    await message.reply_text(
+        "\n".join([
+            f"{F.EMO['check']} <b>{F.fb('DEFAULT TEMPLATE SAVED')}</b>",
+            F.DIV, "",
+            f"👥 {F.sc('source group')} · "
+            f"<code>{message.chat.id}</code>",
+            "",
+            f"📌 {F.sc('every new group will inherit this config')}",
+            f"📌 {F.sc('existing groups are unchanged')}",
+            f"📌 {F.sc('reset a group to apply the new defaults')}",
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@Client.on_message(
+    filters.command("showgroupdefault") & filters.private,
+    group=-8500,
+)
+async def cmd_show_group_default(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        tpl = await S.get_default_template()
+        is_custom = await S.has_custom_template()
+    except Exception as e:
+        return await message.reply_text(f"❌ {e}")
+
+    source = "🟢 custom" if is_custom else "⚪ code defaults"
+
+    ad = tpl.get("auto_delete") or {}
+    flow = tpl.get("flow") or {}
+    spell = flow.get("spell_check") or {}
+    sugg = flow.get("suggestions") or {}
+    fd = flow.get("file_delivery") or {}
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"🌐 <b>{F.fb('DEFAULT TEMPLATE')}</b>",
+        F.DIV, "",
+        f"📦 {F.sc('source')} · <b>{source}</b>",
+        "",
+        F.DIV_S, "",
+        f"🎬 {F.sc('content mode')} · "
+        f"<code>{tpl.get('content_mode', 'both')}</code>",
+        f"⏱️ {F.sc('auto-delete')} · "
+        f"<code>{ad.get('bot_timer', 600)}s</code>",
+        f"🎯 {F.sc('spell threshold')} · "
+        f"<code>{spell.get('threshold', 82)}</code>",
+        f"💡 {F.sc('suggestion min score')} · "
+        f"<code>{sugg.get('min_score', 45)}</code>",
+        f"📡 {F.sc('provider')} · "
+        f"<code>{sugg.get('provider', 'both')}</code>",
+        f"📊 {F.sc('sort')} · "
+        f"<code>{fd.get('sort_order', 'small_to_big')}</code>",
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('save template')} · "
+        f"<code>/savegroupdefault</code> (in a group)",
+        f"📌 {F.sc('reset template')} · "
+        f"<code>/resetgroupdefault</code>",
+    ]
+
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@Client.on_message(
+    filters.command("resetgroupdefault") & filters.private,
+    group=-8500,
+)
+async def cmd_reset_group_default(client: Client, message: Message):
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        ok = await S.reset_default_template()
+    except Exception as e:
+        return await message.reply_text(f"❌ {e}")
+
+    if not ok:
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('reset failed')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    await message.reply_text(
+        "\n".join([
+            f"{F.EMO['check']} <b>{F.fb('TEMPLATE RESET')}</b>",
+            F.DIV, "",
+            f"📌 {F.sc('new groups will use code defaults')}",
+            f"📌 {F.sc('existing groups are unchanged')}",
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 
 # ============================================================
 # SECTION 9 — /admin → 👥 Groups LIST (PM only)
@@ -898,5 +1039,8 @@ __all__ = [
     "cmd_unfilter",
     "cmd_filters",
     "cmd_maintenance",
+    "cmd_save_group_default",
+    "cmd_show_group_default",
+    "cmd_reset_group_default",
     "start_group_settings",
 ]
