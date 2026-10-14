@@ -140,7 +140,23 @@ def _sess_chat_id(uid: int) -> Optional[int]:
         return int(cid)
     except (TypeError, ValueError):
         return None
-
+        
+def _sanitize_import(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Whitelist-merge for restore. Keeps only DEFAULT_CFG keys."""
+    if not isinstance(cfg, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    strip = {
+        "chat_id", "_id", "title", "username",
+        "created_at", "updated_at", "stats",
+    }
+    for k, v in cfg.items():
+        if k in strip:
+            continue
+        if k not in S.DEFAULT_CFG:
+            continue
+        out[k] = v
+    return out
 
 def _has_pending(uid: int) -> bool:
     return _sess_get(uid) is not None
@@ -653,6 +669,125 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── FLOW: NO-OP (section label rows) ──
         if action == "flow_noop":
             return await q.answer()
+
+                # ── RESTORE ALL: CONFIRM ──
+        if action == "rstall_do":
+            if not _is_bot_admin(uid):
+                return await q.answer(
+                    "⛔ Admin only", show_alert=True,
+                )
+
+            sess = _sess_get(uid) or {}
+            payload = sess.get("payload") or {}
+            if not isinstance(payload, dict) or not payload:
+                return await q.answer(
+                    "⚠️ Session expired", show_alert=True,
+                )
+
+            # Execute restore
+            from datetime import datetime
+            now = datetime.utcnow()
+            applied = 0
+            failed = 0
+            coll = S._coll()
+
+            if coll is None:
+                return await q.answer(
+                    "❌ DB error", show_alert=True,
+                )
+
+            for cid_str, entry in payload.items():
+                try:
+                    cid = int(cid_str)
+                except (TypeError, ValueError):
+                    failed += 1
+                    continue
+
+                if not isinstance(entry, dict):
+                    failed += 1
+                    continue
+
+                raw_cfg = entry.get("config") or entry
+                clean = _sanitize_import(raw_cfg)
+                if not clean:
+                    failed += 1
+                    continue
+
+                try:
+                    existing = await S.get_config(
+                        cid, use_cache=False,
+                    )
+                except Exception:
+                    existing = {}
+
+                doc = {
+                    "chat_id": cid,
+                    "title": existing.get("title"),
+                    "username": existing.get("username"),
+                    "created_at": existing.get("created_at", now),
+                    "updated_at": now,
+                    "stats": existing.get("stats") or {
+                        "searches_today": 0,
+                        "results_found": 0,
+                        "not_found": 0,
+                        "files_sent": 0,
+                        "updated_at": now,
+                    },
+                }
+
+                template = await S.get_default_template()
+                merged = dict(template)
+                for k, v in clean.items():
+                    merged[k] = v
+
+                for k in (
+                    "chat_id", "_id", "title", "username",
+                    "created_at", "updated_at", "stats",
+                ):
+                    merged.pop(k, None)
+
+                doc.update(merged)
+
+                try:
+                    await coll.replace_one(
+                        {"chat_id": cid}, doc, upsert=True,
+                    )
+                    S._cache_invalidate(cid)
+                    applied += 1
+                except Exception as e:
+                    logger.debug(f"[GROUPS] restore {cid}: {e}")
+                    failed += 1
+
+            _sess_drop(uid)
+
+            text = "\n".join([
+                f"{F.EMO['check']} <b>{F.fb('RESTORE DONE')}</b>",
+                F.DIV, "",
+                f"✅ {F.sc('applied')} · <b>{applied}</b>",
+                f"❌ {F.sc('failed')} · <b>{failed}</b>",
+            ])
+            try:
+                await q.message.edit_text(
+                    text, parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return await q.answer("✅ Restored")
+
+        # ── RESTORE ALL: CANCEL ──
+        if action == "rstall_no":
+            _sess_drop(uid)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            return await q.answer("❌ Cancelled")
+
+        # ── FLOW: NO-OP (section label rows) ──
+        if action == "flow_noop":
+            return await q.answer()
+
+        
 
         # ── CAPTION: EDIT SESSION ──
         if action == "cap":
