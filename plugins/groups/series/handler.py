@@ -1629,6 +1629,56 @@ async def series_delivery_start(client: Client, message: Message):
         f"q={quality} files={len(hits)} chat={chat_id}"
     )
 
+    # ── Verify gate (before delivering anything) ──
+    if chat_id:
+        try:
+            cfg_v = await S.get_config(chat_id)
+            v_cfg = cfg_v.get("verify") or {}
+            if v_cfg.get("enabled") and v_cfg.get("shortener_url"):
+                from plugins.groups.shared import verify as V
+                if not await V.is_verified(uid, chat_id):
+                    # Build shortener target
+                    bot_username = ""
+                    try:
+                        me = await client.identity()
+                        bot_username = me.username or ""
+                    except Exception:
+                        try:
+                            me = await client.get_me()
+                            bot_username = me.username or ""
+                        except Exception:
+                            bot_username = ""
+                    if not bot_username:
+                        bot_username = str(
+                            getattr(CFG, "BOT_USERNAME", "") or ""
+                        ).lstrip("@")
+
+                    if bot_username:
+                        target = (
+                            f"https://t.me/{bot_username}"
+                            f"?start=v_{{url}}"
+                        )
+                        vtext, vkb = await V.build_verify_card(
+                            client, cfg_v, chat_id, uid, target,
+                        )
+                        if vtext and vkb:
+                            try:
+                                await message.reply_text(
+                                    vtext,
+                                    reply_markup=vkb,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True,
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    f"[SERIES-H] verify card: {e}"
+                                )
+                            try:
+                                await DL.mark_used(token)
+                            except Exception:
+                                pass
+                            return
+
     if not hits:
         try:
             await message.reply_text(
