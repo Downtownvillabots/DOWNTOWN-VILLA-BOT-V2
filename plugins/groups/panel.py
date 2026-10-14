@@ -220,16 +220,48 @@ async def render_search(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     on_search = cfg.get("search_enabled", True)
     on_pm = cfg.get("pm_search_enabled", True)
 
+    # Cooldown value
+    try:
+        cd = int((cfg.get("search") or {}).get("cooldown_seconds", 3) or 0)
+    except (TypeError, ValueError):
+        cd = 3
+    cd = max(0, min(300, cd))
+
+    cd_str = "OFF" if cd == 0 else f"{cd}s"
+
     text = "\n".join([
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"{F.EMO['search']} <b>{F.fb('SEARCH SETTINGS')}</b>",
         DIV, "",
         _line("🔎", "group search", _on(on_search)),
         _line("💬", "pm search", _on(on_pm)),
+        _line("⏱️", "cooldown", cd_str),
         "",
         DIV_S,
         f"📌 {F.sc('pm search = answer text sent to bot pm')}",
+        f"📌 {F.sc('cooldown = wait time between two searches')}",
+        "",
+        DIV_S, "",
+        f"📊 {F.sc('top groups share an equal cooldown of')} "
+        f"<b>3s</b>",
     ])
+
+    # Cooldown preset row(s)
+    cd_row1: List[InlineKeyboardButton] = []
+    for n in (0, 1, 2, 3):
+        mark = "✅ " if n == cd else ""
+        label = "OFF" if n == 0 else f"{n}s"
+        cd_row1.append(InlineKeyboardButton(
+            f"{mark}{label}",
+            callback_data=f"ga:cd:{n}",
+        ))
+    cd_row2: List[InlineKeyboardButton] = []
+    for n in (5, 10, 20, 30):
+        mark = "✅ " if n == cd else ""
+        cd_row2.append(InlineKeyboardButton(
+            f"{mark}{n}s",
+            callback_data=f"ga:cd:{n}",
+        ))
 
     rows = [
         [InlineKeyboardButton(
@@ -238,6 +270,12 @@ async def render_search(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(
             f"💬 {F.sc('pm search')} · {'🟢' if on_pm else '🔴'}",
             callback_data="ga:tog:pm_search_enabled")],
+        [InlineKeyboardButton(
+            f"⏱️ {F.sc('cooldown')} · {cd_str}",
+            callback_data="ga:search_noop",
+        )],
+        cd_row1,
+        cd_row2,
         _back_close("ga:back")[0],
     ]
     return "\n".join(text), _kb(rows)
