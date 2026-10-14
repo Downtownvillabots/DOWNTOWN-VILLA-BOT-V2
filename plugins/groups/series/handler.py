@@ -669,11 +669,24 @@ def safe_caption(template: str, ctx: Dict[str, Any], fallback: str) -> str:
         return fallback
 
 
-def build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMarkup]:
-    if not buttons:
-        return None
+def build_extra_kb(
+    buttons: List[Dict[str, Any]],
+    *,
+    per_row: int = 2,
+    add_share: bool = True,
+    title: str = "",
+) -> Optional[InlineKeyboardMarkup]:
+    """
+    Build reply_markup for a series batch.
+
+    Layout: custom buttons (per_row) → share → none.
+    """
+    per_row = max(1, min(3, int(per_row or 2)))
+
     rows: List[List[InlineKeyboardButton]] = []
-    for b in buttons:
+    row_buf: List[InlineKeyboardButton] = []
+
+    for b in buttons or []:
         if not isinstance(b, dict):
             continue
         if not b.get("enabled", True):
@@ -691,9 +704,33 @@ def build_extra_kb(buttons: List[Dict[str, Any]]) -> Optional[InlineKeyboardMark
                 url = f"https://{url}"
             else:
                 continue
-        rows.append([InlineKeyboardButton(name, url=url)])
-    return InlineKeyboardMarkup(rows) if rows else None
+        row_buf.append(InlineKeyboardButton(name, url=url))
+        if len(row_buf) >= per_row:
+            rows.append(row_buf)
+            row_buf = []
+    if row_buf:
+        rows.append(row_buf)
 
+    # Share button
+    if add_share:
+        share_target = (
+            getattr(CFG, "UPDATE_CHNL_LNK", None)
+            or getattr(CFG, "BOT_LINK", None)
+            or "https://t.me/"
+        )
+        share_title = title or "check this"
+        try:
+            from urllib.parse import quote as _q
+            share_url = (
+                f"https://t.me/share/url?"
+                f"url={_q(share_target, safe='')}&"
+                f"text={_q(share_title, safe='')}"
+            )
+        except Exception:
+            share_url = "https://t.me/"
+        rows.append([InlineKeyboardButton("📤 SHARE", url=share_url)])
+
+    return InlineKeyboardMarkup(rows) if rows else None
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 9 — DB SEARCH
@@ -1542,6 +1579,7 @@ async def series_delivery_start(client: Client, message: Message):
     caption_tpl = ""
     custom_buttons: List[Dict[str, Any]] = []
     auto_delete_sec = 0
+    cfg: Dict[str, Any] = {}
     
     if chat_id:
         try:
@@ -1558,8 +1596,18 @@ async def series_delivery_start(client: Client, message: Message):
         except Exception as e:
             logger.warning(f"[SERIES-H] cfg load: {e}")
 
-    custom_kb = build_extra_kb(custom_buttons)
+    # Respect buttons_per_row from group config
+    try:
+        per_row_btns = int(cfg.get("buttons_per_row", 2) or 2)
+    except Exception:
+        per_row_btns = 2
 
+    custom_kb = build_extra_kb(
+        custom_buttons,
+        per_row=per_row_btns,
+        add_share=True,
+        title=title,
+    )
     # ── Intro card ──
     try:
         intro_lines = [
