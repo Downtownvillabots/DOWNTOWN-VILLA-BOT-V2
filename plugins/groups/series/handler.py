@@ -1383,10 +1383,18 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
             if mode == "movie":
                 return
 
-            if not cooldown_ok(uid):
-                return
-            cleanup_cooldown()
+            cd_secs = await SEARCH.get_cooldown_seconds(
+                chat_id, default=COOLDOWN,
+            )
 
+            if cd_secs > 0:
+                _now = time.time()
+                _last = _last_seen.get(int(uid), 0)
+                if _now - _last < cd_secs:
+                    return
+                _last_seen[int(uid)] = _now
+
+            cleanup_cooldown()
             try:
                 message.stop_propagation()
             except Exception:
