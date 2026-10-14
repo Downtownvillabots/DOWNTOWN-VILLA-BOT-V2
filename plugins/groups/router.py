@@ -1283,12 +1283,15 @@ async def group_router(client: Client, q: CallbackQuery):
 
         # ── STATS RESET ──
         if action == "stats_reset":
-            sess = _sess_get(uid) or {}
             chat_id = _sess_chat_id(uid)
             if not chat_id:
-                return await q.answer("❌")
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
             if not await _is_group_admin(client, chat_id, uid):
                 return await q.answer("⛔ Admin only", show_alert=True)
+
             from datetime import datetime
             await S.save_field(chat_id, "stats", {
                 "searches_today": 0,
