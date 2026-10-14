@@ -424,6 +424,41 @@ async def sr_sug(client: Client, q: CallbackQuery):
             )
             return
 
+        # ── Check requests.enabled before offering the flow ──
+        chat_id = q.message.chat.id if q.message.chat else 0
+        requests_enabled = True
+        try:
+            cfg_check = await S.get_config(chat_id)
+            req_cfg = cfg_check.get("requests") or {}
+            requests_enabled = bool(req_cfg.get("enabled", True))
+        except Exception:
+            requests_enabled = True
+
+        if not requests_enabled:
+            # Tell the user requests are disabled
+            try:
+                await q.message.edit_text(
+                    "\n".join([
+                        f"{F.EMO['cross']} <b>{F.fb('NO RESULTS')}</b>",
+                        F.DIV, "",
+                        f"🎬 <b>{F.sc(title[:60])}</b>",
+                        "",
+                        f"📌 {F.sc('requests are disabled in this group')}",
+                        f"📌 {F.sc('please contact the admin directly')}",
+                    ]),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            f"{F.EMO['cross']} {F.sc('close')}",
+                            callback_data="sr:cancel",
+                        ),
+                    ]]),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+            return
+
         # ── No hits → request flow ──
         await _send_request_flow(
             client=client,
