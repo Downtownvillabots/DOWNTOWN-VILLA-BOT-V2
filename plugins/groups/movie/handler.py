@@ -129,10 +129,18 @@ async def movie_group_entry(client: Client, message: Message):
             # This group is series-only; do not respond here
             return
 
-        # ── GATE 4: cooldown ──
+        # ── GATE 4: cooldown (per-group) ──
         uid = message.from_user.id
-        if not _cooldown_ok(uid):
-            return
+        cd_secs = await SEARCH.get_cooldown_seconds(chat_id, default=COOLDOWN)
+
+        # Skip entirely if disabled
+        if cd_secs > 0:
+            now = time.time()
+            last = _last_seen.get(uid, 0)
+            if now - last < cd_secs:
+                return
+            _last_seen[uid] = now
+
         _cleanup_cooldown()
 
         # ── Claim the message ──
