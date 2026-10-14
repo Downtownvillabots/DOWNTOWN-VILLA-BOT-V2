@@ -438,7 +438,7 @@ async def group_router(client: Client, q: CallbackQuery):
             return await q.answer()
 
         # ── SET CONTENT MODE ──
-        if action == "set":
+        
         if action == "set":
             sub = parts[2] if len(parts) > 2 else ""
             val = parts[3] if len(parts) > 3 else ""
