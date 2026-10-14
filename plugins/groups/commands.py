@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pyrogram import Client, filters
@@ -923,6 +924,289 @@ async def cmd_reset_group_default(client: Client, message: Message):
         parse_mode=ParseMode.HTML,
     )
 
+# ============================================================
+# SECTION 8c — GROUP STATS (bot admins only)
+# ============================================================
+
+def _fmt_num(n: Any) -> str:
+    """Pretty-print a number with thousand separators."""
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _read_stats(doc: Dict[str, Any]) -> Dict[str, int]:
+    """Pull the 4 counters out of a group doc."""
+    st = doc.get("stats") or {}
+    def _i(k):
+        try:
+            return int(st.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return {
+        "searches_today": _i("searches_today"),
+        "results_found":  _i("results_found"),
+        "not_found":      _i("not_found"),
+        "files_sent":     _i("files_sent"),
+    }
+
+
+@Client.on_message(
+    filters.command(["groupstats", "gstats"]) & filters.private,
+    group=-8500,
+)
+async def cmd_groupstats(client: Client, message: Message):
+    """Show stats for all groups, or one specific group."""
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Parse optional chat_id argument ──
+    args = (message.text or "").split()
+    target_cid: Optional[int] = None
+    if len(args) >= 2:
+        try:
+            target_cid = int(args[1])
+        except (ValueError, TypeError):
+            return await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['cross']} <b>{F.fb('INVALID CHAT ID')}</b>",
+                    F.DIV, "",
+                    "ᴜꜱᴀɢᴇ:",
+                    "• <code>/groupstats</code> — all groups",
+                    "• <code>/groupstats -100123456789</code> — one group",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+
+    # ── Fetch all groups ──
+    try:
+        docs = await S.list_groups(limit=100)
+    except Exception as e:
+        logger.exception(f"[GROUPS] stats list: {e}")
+        return await message.reply_text(f"❌ {e}")
+
+    if not docs:
+        return await message.reply_text(
+            "\n".join([
+                f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+                f"📊 <b>{F.fb('GROUP STATS')}</b>",
+                F.DIV, "",
+                f"⚪ {F.sc('no groups registered yet')}",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Specific group ──
+    if target_cid is not None:
+        target_doc = None
+        for d in docs:
+            try:
+                if int(d.get("chat_id") or 0) == target_cid:
+                    target_doc = d
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        if not target_doc:
+            return await message.reply_text(
+                "\n".join([
+                    f"{F.EMO['cross']} <b>{F.fb('GROUP NOT FOUND')}</b>",
+                    F.DIV, "",
+                    f"🆔 <code>{target_cid}</code>",
+                    f"📌 {F.sc('not registered in the bot')}",
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+
+        title = str(target_doc.get("title") or target_cid)[:60]
+        st = _read_stats(target_doc)
+
+        # Success rate (found / total searches)
+        searches = st["searches_today"]
+        found = st["results_found"]
+        if searches > 0:
+            rate = (found / searches) * 100
+            rate_str = f"{rate:.1f}%"
+        else:
+            rate_str = "—"
+
+        lines = [
+            f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+            f"📊 <b>{F.fb('GROUP STATS')}</b>",
+            F.DIV, "",
+            f"👥 <b>{F.sc(title)}</b>",
+            f"🆔 <code>{target_cid}</code>",
+            "",
+            F.DIV_S, "",
+            f"🔎 {F.sc('searches')} · <b>{_fmt_num(searches)}</b>",
+            f"✅ {F.sc('results found')} · "
+            f"<b>{_fmt_num(found)}</b>",
+            f"❌ {F.sc('not found')} · "
+            f"<b>{_fmt_num(st['not_found'])}</b>",
+            f"📤 {F.sc('files sent')} · "
+            f"<b>{_fmt_num(st['files_sent'])}</b>",
+            "",
+            F.DIV_S, "",
+            f"📈 {F.sc('success rate')} · <b>{rate_str}</b>",
+            "",
+            F.DIV_S,
+            f"♻️ {F.sc('reset')} · "
+            f"<code>/resetgroupstats {target_cid}</code>",
+        ]
+        return await message.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    # ── All groups ──
+    # Aggregate + collect per-group
+    totals = {
+        "searches_today": 0,
+        "results_found": 0,
+        "not_found": 0,
+        "files_sent": 0,
+    }
+    entries: List[Dict[str, Any]] = []
+    for d in docs:
+        st = _read_stats(d)
+        for k in totals:
+            totals[k] += st[k]
+        entries.append({
+            "chat_id": int(d.get("chat_id") or 0),
+            "title": str(d.get("title") or d.get("chat_id"))[:40],
+            **st,
+        })
+
+    # Top 10 by searches
+    entries.sort(key=lambda x: x["searches_today"], reverse=True)
+    top = entries[:10]
+
+    # Overall success rate
+    if totals["searches_today"] > 0:
+        overall_rate = (
+            totals["results_found"] / totals["searches_today"]
+        ) * 100
+        overall_rate_str = f"{overall_rate:.1f}%"
+    else:
+        overall_rate_str = "—"
+
+    lines = [
+        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"📊 <b>{F.fb('GROUP STATS')}</b>",
+        F.DIV, "",
+        f"📈 <b>{F.sc('TOTALS')}</b>",
+        "",
+        f"👥 {F.sc('groups')} · <b>{len(entries)}</b>",
+        f"🔎 {F.sc('searches')} · "
+        f"<b>{_fmt_num(totals['searches_today'])}</b>",
+        f"✅ {F.sc('results found')} · "
+        f"<b>{_fmt_num(totals['results_found'])}</b>",
+        f"❌ {F.sc('not found')} · "
+        f"<b>{_fmt_num(totals['not_found'])}</b>",
+        f"📤 {F.sc('files sent')} · "
+        f"<b>{_fmt_num(totals['files_sent'])}</b>",
+        "",
+        f"📈 {F.sc('success rate')} · <b>{overall_rate_str}</b>",
+        "",
+        F.DIV_S, "",
+        f"🏆 <b>{F.sc('TOP GROUPS')}</b>",
+        f"<i>{F.sc('by searches today')}</i>",
+        "",
+    ]
+
+    for i, e in enumerate(top, 1):
+        if e["searches_today"] == 0 and e["files_sent"] == 0:
+            continue
+        lines.append(
+            f"<b>{i:02d}.</b> {F.sc(e['title'])} "
+            f"· <code>{_fmt_num(e['searches_today'])}</code> 🔎 "
+            f"· <code>{_fmt_num(e['files_sent'])}</code> 📤"
+        )
+
+    if all(
+        e["searches_today"] == 0 and e["files_sent"] == 0
+        for e in entries
+    ):
+        lines.append(f"⚪ {F.sc('no activity yet')}")
+
+    lines += [
+        "",
+        F.DIV_S,
+        f"📌 {F.sc('per-group')} · "
+        f"<code>/groupstats -1001234567890</code>",
+        f"📌 {F.sc('reset')} · "
+        f"<code>/resetgroupstats -1001234567890</code>",
+    ]
+
+    await message.reply_text(
+        "\n".join(lines)[:4000],
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+@Client.on_message(
+    filters.command("resetgroupstats") & filters.private,
+    group=-8500,
+)
+async def cmd_reset_groupstats(client: Client, message: Message):
+    """Zero out one group's stats counters."""
+    if not message.from_user or not _is_bot_admin(message.from_user.id):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('bot admins only')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    args = (message.text or "").split()
+    if len(args) < 2:
+        return await message.reply_text(
+            "\n".join([
+                "ᴜꜱᴀɢᴇ: <code>/resetgroupstats -1001234567890</code>",
+                "",
+                f"📌 {F.sc('get the id from')} "
+                f"<code>/groupstats</code>",
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        cid = int(args[1])
+    except (ValueError, TypeError):
+        return await message.reply_text(
+            f"{F.EMO['cross']} {F.sc('invalid chat id')}",
+            parse_mode=ParseMode.HTML,
+        )
+
+    try:
+        now = datetime.utcnow()
+        await S.save_field(cid, "stats", {
+            "searches_today": 0,
+            "results_found": 0,
+            "not_found": 0,
+            "files_sent": 0,
+            "updated_at": now,
+        })
+    except Exception as e:
+        logger.exception(f"[GROUPS] reset stats: {e}")
+        return await message.reply_text(f"❌ {e}")
+
+    await message.reply_text(
+        "\n".join([
+            f"{F.EMO['check']} <b>{F.fb('STATS RESET')}</b>",
+            F.DIV, "",
+            f"🆔 <code>{cid}</code>",
+            "",
+            f"📌 {F.sc('all counters set to 0')}",
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 
 
 # ============================================================
@@ -1042,5 +1326,7 @@ __all__ = [
     "cmd_save_group_default",
     "cmd_show_group_default",
     "cmd_reset_group_default",
+    "cmd_groupstats",
+    "cmd_reset_groupstats",
     "start_group_settings",
 ]
