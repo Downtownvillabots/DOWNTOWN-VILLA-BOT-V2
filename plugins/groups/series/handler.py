@@ -290,8 +290,17 @@ async def step_auto_skip(chat_id: int, key: str) -> bool:
 
 
 async def wizard_steps(chat_id: int) -> List[str]:
+    """Return the enabled wizard steps in default order."""
+    try:
+        order = await SFLOW.get_step_order(chat_id)
+        enabled = await SFLOW.get_enabled_steps(chat_id)
+        out = [k for k in order if k in enabled and k != "base_search"
+               and k != "spell_check" and k != "suggestions"]
+        if out:
+            return out
+    except Exception as e:
+        logger.debug(f"[SERIES-H] wizard_steps: {e}")
     return ["language", "season", "episode", "quality", "file_delivery"]
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 5 — VIEWS
@@ -1826,6 +1835,16 @@ async def render_language(
     if not ordered:
         ordered = ["English", "Hindi", "Tamil", "Telugu", "Malayalam"]
 
+    # ✅ FIX: cap languages, prioritising ones with local files
+    max_items_langs = await get_max_items(chat_id, "language", 12)
+    max_items_langs = max(1, min(30, max_items_langs))
+
+    if len(ordered) > max_items_langs:
+        local_set = set(local)
+        with_local = [l for l in ordered if l in local_set]
+        without_local = [l for l in ordered if l not in local_set]
+        ordered = (with_local + without_local)[:max_items_langs]
+
     c["ordered_langs"] = ordered
     c["local_langs"] = local
     sess_set(uid, chosen=c)
@@ -1835,10 +1854,9 @@ async def render_language(
         return await advance(client, target, uid, "language")
 
     per_row = await get_per_row(chat_id, "language", 2)
-    max_items = await get_max_items(chat_id, "language", 12)
 
     text = view_languages(c.get("title"), c.get("year"))
-    kb = kb_languages(ordered, local, per_row, max_items)
+    kb = kb_languages(ordered, local, per_row, max_items_langs)
     poster = poster_url(c.get("poster"), "w500")
 
     await render(client, chat_id, target.id, text, kb, poster)
@@ -1903,6 +1921,16 @@ async def render_season(
     if not merged:
         return await advance(client, target, uid, "season")
 
+    # ✅ FIX: cap seasons, prioritising ones that HAVE local files
+    max_items_seasons = await get_max_items(chat_id, "season", 15)
+    max_items_seasons = max(1, min(50, max_items_seasons))
+    if len(merged) > max_items_seasons:
+        with_local = [s for s in merged if local_map.get(s["season"])]
+        without_local = [s for s in merged if not local_map.get(s["season"])]
+        combined = (with_local + without_local)[:max_items_seasons]
+        # Re-sort numerically so display order stays sane
+        merged = sorted(combined, key=lambda x: x["season"])
+
     c["filtered_hits"] = filtered
     c["local_seasons"] = local_map
     c["merged_seasons"] = merged
@@ -1913,10 +1941,9 @@ async def render_season(
         return await advance(client, target, uid, "season")
 
     per_row = await get_per_row(chat_id, "season", 1)
-    max_items = await get_max_items(chat_id, "season", 15)
 
     text = view_seasons(c.get("title"), c.get("year"))
-    kb = kb_seasons(merged, local_map, per_row, max_items)
+    kb = kb_seasons(merged, local_map, per_row, max_items_seasons)
 
     await render(client, chat_id, target.id, text, kb, None)
 
@@ -1959,6 +1986,20 @@ async def render_episode(
     if not all_eps:
         return await advance(client, target, uid, "episode")
 
+    # ✅ FIX: cap by admin's max_items, prioritising LOCAL episodes
+    #         (so users always see files they can grab, even if
+    #         TMDB has more episodes than the cap allows).
+    per_row = await get_per_row(chat_id, "episode", 4)
+    max_items = await get_max_items(chat_id, "episode", 30)
+    max_items = max(1, min(100, max_items))
+
+    if len(all_eps) > max_items:
+        local_set = set(int(e) for e in local_eps)
+        local_sorted = sorted(e for e in all_eps if e in local_set)
+        other_sorted = sorted(e for e in all_eps if e not in local_set)
+        combined = local_sorted + other_sorted
+        all_eps = sorted(combined[:max_items])
+
     c["season_episodes"] = all_eps
     c["local_eps"] = local_eps
     sess_set(uid, chosen=c)
@@ -1966,9 +2007,6 @@ async def render_episode(
     if len(all_eps) == 1 and await step_auto_skip(chat_id, "episode"):
         sess_set(uid, selected_episode=all_eps[0])
         return await advance(client, target, uid, "episode")
-
-    per_row = await get_per_row(chat_id, "episode", 4)
-    max_items = await get_max_items(chat_id, "episode", 30)
 
     # Read per_page from the episode step config (defaults 10)
     try:
@@ -1981,9 +2019,10 @@ async def render_episode(
     # Page from session (defaults 1, reset on new search)
     page = int(c.get("ep_page", 1) or 1)
 
-    text = view_episodes(
-        c.get("title"), season_i, len(season_hits or filtered),
-    )
+    # Show episode count (capped) instead of raw file count
+    local_only = len(set(int(e) for e in local_eps))
+    text = view_episodes(c.get("title"), season_i, local_only)
+
     kb = kb_episodes(
         all_eps, season_i, local_eps,
         per_row=per_row, max_items=max_items,
