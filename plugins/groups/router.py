@@ -319,6 +319,11 @@ async def group_router(client: Client, q: CallbackQuery):
         # ── NAVIGATE SECTION ──
         if action == "s":
             section = parts[2] if len(parts) > 2 else ""
+            section_arg = parts[3] if len(parts) > 3 else ""
+
+            # For "flow", an extra arg selects the flow_type
+            if section == "flow" and section_arg in ("movie", "series"):
+                _sess_set(uid, flow_type=section_arg)
 
             chat_id = _sess_chat_id(uid)
             if not chat_id:
@@ -329,6 +334,12 @@ async def group_router(client: Client, q: CallbackQuery):
 
             if not await _is_group_admin(client, chat_id, uid):
                 return await q.answer("⛔ Admin only", show_alert=True)
+
+            if section == "flow":
+                ftype = (_sess_get(uid) or {}).get("flow_type", "movie")
+                text, kb = await P.render_flow(chat_id, ftype)
+                await _safe_edit(q, text, kb)
+                return await q.answer()
 
             result = await _render_section(section, chat_id)
             if result is None:
@@ -380,19 +391,34 @@ async def group_router(client: Client, q: CallbackQuery):
             return await q.answer("❓")
 
         # ── FLOW: OPEN STEP ──
+        # Two shapes:
+        #   ga:flow:{key}                  (from render_flow)
+        #   ga:flow:{flow_type}:{key}      (from step_advanced back button)
         if action == "flow":
-            key = parts[2] if len(parts) > 2 else ""
-            sess = _sess_get(uid) or {}
             chat_id = _sess_chat_id(uid)
-            if not chat_id or not key:
-                return await q.answer("❌")
+            if not chat_id:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
             if not await _is_group_admin(client, chat_id, uid):
                 return await q.answer("⛔ Admin only", show_alert=True)
 
-            text, kb = await P.render_flow_step(chat_id, key)
+            # Detect shape
+            if len(parts) >= 4 and parts[2] in ("movie", "series"):
+                ftype = parts[2]
+                key = parts[3]
+                _sess_set(uid, flow_type=ftype)
+            else:
+                key = parts[2] if len(parts) > 2 else ""
+                ftype = "movie"
+
+            if not key:
+                return await q.answer("❌")
+
+            text, kb = await P.render_flow_step(chat_id, key, ftype)
             await _safe_edit(q, text, kb)
             return await q.answer()
-
         # ── FLOW: TOGGLE STEP ──
         if action == "flow_tog":
             key = parts[2] if len(parts) > 2 else ""
@@ -434,11 +460,10 @@ async def group_router(client: Client, q: CallbackQuery):
             await _safe_edit(q, text, kb)
             return
 
-                # ── FLOW: OPEN ADVANCED ──
+         # ── FLOW: OPEN ADVANCED ──
         if action == "flow_adv":
-            key = parts[2] if len(parts) > 2 else ""
             chat_id = _sess_chat_id(uid)
-            if not chat_id or not key:
+            if not chat_id:
                 return await q.answer(
                     "⚠️ Session expired — reopen the panel",
                     show_alert=True,
@@ -446,10 +471,22 @@ async def group_router(client: Client, q: CallbackQuery):
             if not await _is_group_admin(client, chat_id, uid):
                 return await q.answer("⛔ Admin only", show_alert=True)
 
-            text, kb = await P.render_flow_step_advanced(chat_id, key)
+            # Detect shape: ga:flow_adv:{key} or ga:flow_adv:{ftype}:{key}
+            if len(parts) >= 4 and parts[2] in ("movie", "series"):
+                ftype = parts[2]
+                key = parts[3]
+            else:
+                key = parts[2] if len(parts) > 2 else ""
+                ftype = (_sess_get(uid) or {}).get("flow_type", "movie")
+
+            if not key:
+                return await q.answer("❌")
+
+            text, kb = await P.render_flow_step_advanced(
+                chat_id, key, ftype,
+            )
             await _safe_edit(q, text, kb)
             return await q.answer()
-
         # ── FLOW: SET ADVANCED FIELD ─
         if action == "flow_set":
             # ga:flow_set:{step_key}:{field}:{value}
@@ -501,6 +538,115 @@ async def group_router(client: Client, q: CallbackQuery):
             )
             await q.answer(f"{'🟢' if not cur else '🔴'}")
             text, kb = await P.render_flow_step_advanced(chat_id, key)
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── FLOW: SWITCH TAB (movie / series) ──
+        if action == "flow_tab":
+            ftype = parts[2] if len(parts) > 2 else "movie"
+            if ftype not in ("movie", "series"):
+                ftype = "movie"
+            chat_id = _sess_chat_id(uid)
+            if not chat_id:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            # Remember the tab for this user
+            _sess_set(uid, flow_type=ftype)
+
+            text, kb = await P.render_flow(chat_id, ftype)
+            await _safe_edit(q, text, kb)
+            return await q.answer()
+
+        # ── FLOW: MOVE STEP UP ──
+        if action == "flow_up":
+            ftype = parts[2] if len(parts) > 2 else "movie"
+            try:
+                idx = int(parts[3])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            chat_id = _sess_chat_id(uid)
+            if not chat_id:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            cfg = await S.get_config(chat_id)
+            order = list(P._resolve_flow_order(cfg, ftype))
+
+            if 0 < idx < len(order):
+                order[idx - 1], order[idx] = order[idx], order[idx - 1]
+                flow_order = dict(cfg.get("flow_order") or {})
+                flow_order[ftype] = order
+                await S.save_field(chat_id, "flow_order", flow_order)
+                await q.answer("⬆️")
+            else:
+                await q.answer("⚠️ top")
+
+            text, kb = await P.render_flow(chat_id, ftype)
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── FLOW: MOVE STEP DOWN ──
+        if action == "flow_down":
+            ftype = parts[2] if len(parts) > 2 else "movie"
+            try:
+                idx = int(parts[3])
+            except (ValueError, IndexError):
+                return await q.answer("❌")
+            chat_id = _sess_chat_id(uid)
+            if not chat_id:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            cfg = await S.get_config(chat_id)
+            order = list(P._resolve_flow_order(cfg, ftype))
+
+            if 0 <= idx < len(order) - 1:
+                order[idx], order[idx + 1] = order[idx + 1], order[idx]
+                flow_order = dict(cfg.get("flow_order") or {})
+                flow_order[ftype] = order
+                await S.save_field(chat_id, "flow_order", flow_order)
+                await q.answer("⬇️")
+            else:
+                await q.answer("⚠️ bottom")
+
+            text, kb = await P.render_flow(chat_id, ftype)
+            await _safe_edit(q, text, kb)
+            return
+
+        # ── FLOW: RESET ORDER ──
+        if action == "flow_rst_order":
+            ftype = parts[2] if len(parts) > 2 else "movie"
+            if ftype not in ("movie", "series"):
+                ftype = "movie"
+            chat_id = _sess_chat_id(uid)
+            if not chat_id:
+                return await q.answer(
+                    "⚠️ Session expired — reopen the panel",
+                    show_alert=True,
+                )
+            if not await _is_group_admin(client, chat_id, uid):
+                return await q.answer("⛔ Admin only", show_alert=True)
+
+            cfg = await S.get_config(chat_id)
+            flow_order = dict(cfg.get("flow_order") or {})
+            flow_order[ftype] = []
+            await S.save_field(chat_id, "flow_order", flow_order)
+            await q.answer("♻️ order reset")
+
+            text, kb = await P.render_flow(chat_id, ftype)
             await _safe_edit(q, text, kb)
             return
 
