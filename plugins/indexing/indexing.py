@@ -571,26 +571,24 @@ async def _build_step_direction() -> Tuple[str, InlineKeyboardMarkup]:
 # ============================================================
 
 async def _build_step_range() -> Tuple[str, InlineKeyboardMarkup]:
-    from plugins.indexing.worker import MAX_PROBE_ID
-
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"📍 <b>{F.fb('STEP 4/6 — RANGE')}</b>",
         F.DIV, "",
         f"{F.EMO['info']} {F.sc('where to begin scanning')}",
         "",
-        f"📦 {F.sc('full scan')}  — scan the full configured message ID range",
-        f"📍 {F.sc('from first')} — start at msg id 1",
-        f"📍 {F.sc('from last')}  — scan backward from ID {MAX_PROBE_ID}",
+        f"📦 {F.sc('full scan')} — newest post → oldest post",
+        f"📍 {F.sc('from first')} — oldest post → newest post",
+        f"📍 {F.sc('from last')} — newest post → oldest post",
         f"✏️ {F.sc('custom')}     — enter a specific msg id",
         "",
         F.DIV_S,
-        f"💡 {F.sc('full scan checks every message ID up to the configured limit')}",
-        f"📌 INDEXING_MAX_ID · <code>{MAX_PROBE_ID}</code>",
+        f"📌 {F.sc('at start, the bot posts one marker in the channel')}",
+        f"💡 {F.sc('the marker message id sets the scan end automatically')}",
     ]
     rows = [
         [InlineKeyboardButton(
-            f"📦 {F.sc('FULL SCAN — EVERY FILE')}",
+            f"📦 {F.sc('FULL SCAN — NEWEST TO OLDEST')}",
             callback_data=f"{PFX}:pick_range:full",
         )],
         [
@@ -790,7 +788,7 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     ]
 
     if data.get("range") == "full":
-        lines.append(f"   📦 {F.sc('FULL SCAN — full configured ID range')}")
+        lines.append(f"   📦 {F.sc('FULL SCAN — newest post to oldest post')}")
     elif data.get("range") == "custom":
         lines.append(f"   📌 {F.sc('start at')} · "
                      f"<code>{data.get('start_msg_id', '?')}</code>")
@@ -1148,11 +1146,11 @@ async def router_handler(client: Client, q: CallbackQuery):
             if arg == "full":
                 _update_step(uid,
                              range="full",
-                             direction="forward",
-                             start_msg_id=1)
+                             direction="backward",
+                             start_msg_id=None)
                 text, kb = await _build_step_metadata_source(uid)
                 await _safe_edit(q, text, kb)
-                return await q.answer("📦 Full scan")
+                return await q.answer("📦 Newest to oldest")
 
             if arg == "first":
                 _update_step(uid, range=arg, direction="forward")

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 import uuid
 from datetime import datetime
@@ -41,12 +40,6 @@ MAX_RUNTIME = 24 * 3600
 FLOOD_HARD_SLEEP = 3600
 MAX_BATCH_SIZE = 100
 
-try:
-    MAX_PROBE_ID = int(os.getenv("INDEXING_MAX_ID", "250000"))
-except (TypeError, ValueError):
-    MAX_PROBE_ID = 250000
-MAX_PROBE_ID = max(1000, MAX_PROBE_ID)
-
 SUMMARY_EVERY = 100
 
 # Guard so we only create indexes once per boot
@@ -68,6 +61,7 @@ STATE: Dict[str, Any] = {
     "direction": "backward",
     "range_mode": "last",
     "start_msg_id": None,
+    "latest_message_id": 0,
     "metadata_source": "both",
     "batch_size": 200,
     "concurrency": 20,
@@ -129,6 +123,7 @@ def status() -> Dict[str, Any]:
         "mode": STATE["mode"],
         "direction": STATE["direction"],
         "range_mode": STATE["range_mode"],
+        "latest_message_id": STATE["latest_message_id"],
         "metadata_source": STATE["metadata_source"],
         "job_id": STATE["job_id"],
         "total_messages": STATE["total_messages"],
@@ -171,7 +166,9 @@ async def start_worker(
 
     range_mode = str(range_mode or "last").lower()
     direction = str(direction or "backward").lower()
-    if range_mode in {"full", "first"}:
+    if range_mode == "full":
+        direction = "backward"
+    elif range_mode == "first":
         direction = "forward"
     elif range_mode == "last":
         direction = "backward"
@@ -204,6 +201,7 @@ async def start_worker(
             "direction": str(direction),
             "range_mode": str(range_mode),
             "start_msg_id": int(start_msg_id) if start_msg_id else None,
+            "latest_message_id": 0,
             "metadata_source": str(metadata_source or "both"),
             "batch_size": max(10, min(MAX_BATCH_SIZE, int(batch_size))),
             "concurrency": max(1, min(100, int(concurrency))),
@@ -379,6 +377,23 @@ async def _run() -> None:
             await _finalize("error")
             return
 
+        try:
+            marker = await C.send_message(
+                STATE["channel_id"],
+                f"📚 Indexing started. This message marks the newest scan point. "
+                f"Job: {STATE['job_id']}",
+            )
+            STATE["latest_message_id"] = int(marker.id)
+            logger.info(
+                f"[INDEX-WORKER] 📍 scan marker posted: "
+                f"message_id={STATE['latest_message_id']}"
+            )
+        except Exception as e:
+            STATE["last_error"] = f"cannot post scan marker: {e}"
+            logger.error(f"[INDEX-WORKER] ❌ cannot post scan marker: {e}")
+            await _finalize("error")
+            return
+
         # Range
         start_id, end_id = _resolve_range()
         STATE["start_msg_id"] = start_id
@@ -391,6 +406,18 @@ async def _run() -> None:
             f"[INDEX-WORKER] 📊 range: {start_id} → {end_id} "
             f"({total_ids} IDs)"
         )
+        if STATE["run_id"]:
+            try:
+                from plugins.indexing import state as ST
+                await ST.update_job(STATE["run_id"], {
+                    "channel_title": STATE["channel_title"],
+                    "latest_message_id": STATE["latest_message_id"],
+                    "start_message_id": start_id,
+                    "current_message_id": start_id,
+                    "end_message_id": end_id,
+                })
+            except Exception as e:
+                logger.warning(f"[INDEX-WORKER] save scan range: {e}")
 
         await _walk_messages(C, start_id, end_id)
         await _finalize()
@@ -424,14 +451,15 @@ def _resolve_range() -> Tuple[int, int]:
     range_mode = STATE["range_mode"]
     direction = STATE["direction"]
     user_start = STATE["start_msg_id"]
+    latest_id = max(1, int(STATE["latest_message_id"] or 1))
 
-    if range_mode == "last":
-        return MAX_PROBE_ID, 1
-    if range_mode in {"first", "full"}:
-        return 1, MAX_PROBE_ID
+    if range_mode in {"last", "full"}:
+        return latest_id, 1
+    if range_mode == "first":
+        return 1, latest_id
 
     start = max(1, int(user_start or 1))
-    end = MAX_PROBE_ID if direction == "forward" else 1
+    end = latest_id if direction == "forward" else 1
 
     return (start, end)
 
