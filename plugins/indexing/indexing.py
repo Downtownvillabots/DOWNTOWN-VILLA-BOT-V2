@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+from html import escape as html_escape
 import logging
 import time
 from datetime import datetime
@@ -222,7 +223,8 @@ async def _build_live_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarku
 
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     scanned = int(w.get("scanned_ids", 0))
-    max_seen = int(w.get("current_message_id", 0))
+    total = int(w.get("total_messages", 0))
+    current_id = int(w.get("current_message_id", 0))
     saved = int(w.get("saved", 0))
     dup = int(w.get("duplicate_id", 0))
     checked = int(w.get("dups_checked", 0))
@@ -231,26 +233,25 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     movies = int(w.get("movies", 0))
     series = int(w.get("series", 0))
     processed = int(w.get("processed", 0))
+    eta_text = "paused" if w.get("paused") else w.get("eta_text", "—")
 
     started = w.get("started_at") or 0
     elapsed_str = "—"
     if started:
         elapsed_str = FM.duration_short(time.time() - started)
 
-    if max_seen > 0:
-        pct = min(95.0, (scanned / max(1, max_seen + 500)) * 100)
-    elif scanned > 0:
-        pct = min(60.0, (scanned / 1000) * 60.0)
-    else:
-        pct = 0.0
+    pct = min(100.0, scanned / max(1, total) * 100) if total else 0.0
 
     bar = P.bar(pct, "indexing", width=14, show_percent=False)
+    last_error = str(w.get("last_error") or w.get("fetch_error") or "")
 
     return [
         F.DIV_S,
         f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
         F.DIV_S, "",
         f"<code>{bar}</code> {pct:.0f}%",
+        f"📍 {F.sc('message id')} · <code>{current_id:,}</code> / "
+        f"<code>{total:,}</code>",
         "",
         f"📡 {F.sc('channel')} · "
         f"<code>{str(w.get('channel_title', '?'))[:30]}</code>",
@@ -266,13 +267,17 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
         f"🔍 {F.sc('checked')} · <b>{FM.num(checked)}</b>",
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
+        f"🪪 {F.sc('no file id')} · "
+        f"<b>{FM.num(int(w.get('skipped_no_file_id', 0)))}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
         "",
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
         f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
         "",
-        f"⚡ {F.sc('speed')} · <b>{w.get('speed', 0):.1f}/s</b>",
-        f"⏱️ {F.sc('eta')} · <b>{w.get('eta_text', '—')}</b>",
+        f"⚡ {F.sc('scan speed')} · <b>{w.get('speed', 0):.1f} IDs/s</b>",
+        f"⏱️ {F.sc('eta')} · <b>{eta_text}</b>",
+        *([f"⚠️ {F.sc('last error')} · "
+           f"<code>{html_escape(last_error[:180])}</code>"] if last_error else []),
         "",
     ]
 
@@ -703,7 +708,7 @@ async def _build_step_advanced(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     rows = []
 
     batch_row = []
-    for n in (50, 100, 200, 500):
+    for n in (25, 50, 100):
         mark = "✅ " if batch == n else ""
         batch_row.append(InlineKeyboardButton(
             f"{mark}{n}",
@@ -1149,7 +1154,12 @@ async def router_handler(client: Client, q: CallbackQuery):
                 await _safe_edit(q, text, kb)
                 return await q.answer("📦 Full scan")
 
-            _update_step(uid, range=arg)
+            if arg == "first":
+                _update_step(uid, range=arg, direction="forward")
+            elif arg == "last":
+                _update_step(uid, range=arg, direction="backward")
+            else:
+                _update_step(uid, range=arg)
             text, kb = await _build_step_metadata_source(uid)
             await _safe_edit(q, text, kb)
             return await q.answer()

@@ -71,12 +71,20 @@ _RE_QUALITY = re.compile(
 )
 _RE_YEAR = re.compile(r"\b(19[3-9]\d|20[0-4]\d)\b")
 _RE_SEASON_EP = re.compile(
-    r"(?:(?<![A-Za-z])S(\d{1,2})\s*[\s._-]?\s*E(\d{1,3})"
-    r"|(?<![A-Za-z])(\d{1,2})x(\d{1,3}))",
+    r"(?:(?<![A-Za-z])S(?P<s_season>\d{1,2})\s*[\s._-]?"
+    r"E(?P<s_episode>\d{1,3})"
+    r"|(?<![A-Za-z])(?P<x_season>\d{1,2})x(?P<x_episode>\d{1,3})"
+    r"|\bSeason[\s._-]*(?P<word_season>\d{1,2})"
+    r"(?:[\s._-]*Episode[\s._-]*(?P<word_episode>\d{1,3}))?"
+    r"|(?<![A-Za-z])S(?P<only_season>\d{1,2})(?![A-Za-z0-9]))",
     re.IGNORECASE,
 )
 _RE_EXT = re.compile(
     r"\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mpg|mpeg)$",
+    re.IGNORECASE,
+)
+_RE_SUBTITLE = re.compile(
+    r"\b(?:subs?|subtitles?|softsubs?|hardsubs?|esubs?)\b",
     re.IGNORECASE,
 )
 
@@ -462,9 +470,10 @@ def _build_record(
         "episode": parsed["episode"],
         "quality": parsed["quality"] or "UNKNOWN",
         "codec": parsed["codec"] or None,
-        "audio_languages": parsed["languages"],
-        "languages": parsed["languages"],
-        "subtitle_languages": [],
+        "audio_languages": parsed["audio_languages"],
+        "languages": parsed["audio_languages"],
+        "subtitle_languages": parsed["subtitle_languages"],
+        "has_subtitle": parsed["has_subtitle"],
 
         # ── Provenance ──
         "source_channel_id": source_channel_id,
@@ -504,6 +513,9 @@ def _parse(text: str) -> Dict[str, Any]:
         "quality": None,
         "codec": None,
         "languages": [],
+        "audio_languages": [],
+        "subtitle_languages": [],
+        "has_subtitle": False,
     }
     if not text:
         return out
@@ -520,12 +532,35 @@ def _parse(text: str) -> Dict[str, Any]:
 
     m = _RE_SEASON_EP.search(t)
     if m:
-        g = m.groups()
-        out["season"] = int(g[0] or g[2])
-        out["episode"] = int(g[1] or g[3])
+        groups = m.groupdict()
+        season = next(
+            (value for key, value in groups.items()
+             if key.endswith("season") and value is not None),
+            None,
+        )
+        episode = next(
+            (value for key, value in groups.items()
+             if key.endswith("episode") and value is not None),
+            None,
+        )
+        out["season"] = int(season) if season is not None else None
+        out["episode"] = int(episode) if episode is not None else None
         out["type"] = "series"
+    else:
+        try:
+            from plugins.indexing.classify import classify
+            if classify(text=t) == "series":
+                out["type"] = "series"
+        except Exception as e:
+            logger.debug(f"[PIPELINE] series classification failed: {e}")
 
     out["languages"] = _extract_languages(t)
+    out["subtitle_languages"] = _extract_subtitle_languages(t)
+    out["audio_languages"] = [
+        language for language in out["languages"]
+        if language not in out["subtitle_languages"]
+    ]
+    out["has_subtitle"] = bool(_RE_SUBTITLE.search(t))
     out["codec"] = _extract_codec(t)
 
     title = t
@@ -554,6 +589,23 @@ def _extract_languages(text: str) -> List[str]:
         if len(alias) < 3:
             continue
         if re.search(rf"\b{re.escape(alias)}\b", low):
+            if name not in found:
+                found.append(name)
+    return found
+
+
+def _extract_subtitle_languages(text: str) -> List[str]:
+    found: List[str] = []
+    marker = r"(?:subs?|subtitles?|softsubs?|hardsubs?|esubs?)"
+    for alias, name in _LANGS.items():
+        if len(alias) < 3:
+            continue
+        language = re.escape(alias)
+        patterns = (
+            rf"\b{language}\b[\s._-]*{marker}\b",
+            rf"\b{marker}[\s._-]*{language}\b",
+        )
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns):
             if name not in found:
                 found.append(name)
     return found

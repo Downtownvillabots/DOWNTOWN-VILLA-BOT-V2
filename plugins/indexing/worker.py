@@ -40,11 +40,12 @@ CHECKPOINT_EVERY = 25
 PROGRESS_UPDATE_EVERY = 5.0
 MAX_RUNTIME = 24 * 3600
 FLOOD_HARD_SLEEP = 3600
+MAX_BATCH_SIZE = 100
 
 try:
-    MAX_PROBE_ID = int(os.getenv("INDEXING_MAX_ID", "100000"))
+    MAX_PROBE_ID = int(os.getenv("INDEXING_MAX_ID", "250000"))
 except (TypeError, ValueError):
-    MAX_PROBE_ID = 100000
+    MAX_PROBE_ID = 250000
 MAX_PROBE_ID = max(1000, MAX_PROBE_ID)
 
 SUMMARY_EVERY = 100
@@ -107,6 +108,9 @@ STATE: Dict[str, Any] = {
 
 _task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
+_scan_started_at = 0.0
+_speed_sample_at = 0.0
+_speed_sample_ids = 0
 
 
 # ============================================================
@@ -146,6 +150,7 @@ def status() -> Dict[str, Any]:
         "started_at": STATE["started_at"],
         "finished_at": STATE["finished_at"],
         "last_error": STATE["last_error"],
+        "fetch_error": STATE["fetch_error"],
     }
 
 
@@ -194,7 +199,7 @@ async def start_worker(
             "range_mode": str(range_mode),
             "start_msg_id": int(start_msg_id) if start_msg_id else None,
             "metadata_source": str(metadata_source or "both"),
-            "batch_size": max(10, min(1000, int(batch_size))),
+            "batch_size": max(10, min(MAX_BATCH_SIZE, int(batch_size))),
             "concurrency": max(1, min(100, int(concurrency))),
             "delay": max(0.0, min(5.0, float(delay))),
             "skip_duplicate": True,
@@ -412,17 +417,13 @@ def _resolve_range() -> Tuple[int, int]:
     direction = STATE["direction"]
     user_start = STATE["start_msg_id"]
 
-    if range_mode == "custom" and user_start:
-        start = max(1, int(user_start))
-    elif range_mode == "last":
-        start = MAX_PROBE_ID
-    else:
-        start = 1
+    if range_mode == "last":
+        return MAX_PROBE_ID, 1
+    if range_mode in {"first", "full"}:
+        return 1, MAX_PROBE_ID
 
-    if direction == "forward":
-        end = MAX_PROBE_ID
-    else:
-        end = 1
+    start = max(1, int(user_start or 1))
+    end = MAX_PROBE_ID if direction == "forward" else 1
 
     return (start, end)
 
@@ -432,6 +433,8 @@ def _resolve_range() -> Tuple[int, int]:
 # ============================================================
 
 async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
+    global _scan_started_at, _speed_sample_at, _speed_sample_ids
+
     direction = STATE["direction"]
     batch_size = STATE["batch_size"]
 
@@ -444,8 +447,11 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 
     next_id = start_id
     last_checkpoint = start_id
-    last_progress_update = 0.0
+    last_progress_update = time.time()
     start_time = time.time()
+    _scan_started_at = time.monotonic()
+    _speed_sample_at = _scan_started_at
+    _speed_sample_ids = STATE["scanned_ids"]
     batch_num = 0
     consecutive_failures = 0
 
@@ -506,6 +512,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             STATE["fetch_error"] = None
         consecutive_failures = 0
         STATE["scanned_ids"] += len(batch)
+        STATE["current_message_id"] = batch[-1]
 
         if batch_num <= 3 or batch_num % 10 == 0:
             logger.info(
@@ -530,6 +537,8 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 
         if STATE["delay"] > 0:
             await asyncio.sleep(STATE["delay"])
+
+    _update_speed()
 
 
 # ============================================================
@@ -576,11 +585,6 @@ async def _process_batch(C: Client, batch: List[int]) -> Optional[bool]:
             STATE["failed"] += 1
             STATE["last_error"] = str(result)[:200]
             logger.error(f"[INDEX-WORKER] message task failed: {result}")
-
-    try:
-        STATE["current_message_id"] = max(m.id for m in valid)
-    except Exception:
-        pass
 
     return True
 
@@ -658,6 +662,10 @@ async def _handle_message(C: Client, msg) -> None:
         else:
             STATE["failed"] += 1
             STATE["last_error"] = str(result.get("reason") or "?")[:200]
+            logger.error(
+                f"[INDEX-WORKER] ❌ save failed msg={msg.id}: "
+                f"{STATE['last_error']}"
+            )
 
         if STATE["processed"] % SUMMARY_EVERY == 0:
             logger.info(
@@ -697,13 +705,43 @@ async def _is_exact_duplicate(file_id: str) -> bool:
 
 
 def _update_speed() -> None:
+    global _speed_sample_at, _speed_sample_ids
+
     try:
-        if not STATE["started_at"]:
+        if not _scan_started_at:
             return
-        elapsed = max(0.001, time.time() - STATE["started_at"])
-        STATE["speed"] = STATE["processed"] / elapsed
+        now = time.monotonic()
+        elapsed = max(0.001, now - _speed_sample_at)
+        scanned = int(STATE["scanned_ids"])
+        delta = max(0, scanned - _speed_sample_ids)
+        instantaneous_speed = delta / elapsed
+        if instantaneous_speed > 0:
+            previous_speed = float(STATE.get("speed") or 0.0)
+            STATE["speed"] = (
+                instantaneous_speed if previous_speed <= 0
+                else previous_speed * 0.65 + instantaneous_speed * 0.35
+            )
+
+        _speed_sample_at = now
+        _speed_sample_ids = scanned
+
+        remaining = max(
+            0, int(STATE["total_messages"]) - int(STATE["scanned_ids"]),
+        )
+        if remaining == 0:
+            STATE["eta_seconds"] = 0.0
+            STATE["eta_text"] = "done"
+        elif STATE["paused"] or STATE["flood_until"] > time.time():
+            STATE["eta_text"] = "paused"
+        elif STATE["speed"] > 0:
+            eta_seconds = remaining / STATE["speed"]
+            STATE["eta_seconds"] = eta_seconds
+            STATE["eta_text"] = FM.duration_short(max(1, int(eta_seconds)))
+        else:
+            STATE["eta_seconds"] = 0.0
+            STATE["eta_text"] = "calculating…"
     except Exception:
-        pass
+        logger.exception("[INDEX-WORKER] progress estimate failed")
 
 
 async def _save_checkpoint(current_msg_id: int) -> None:
