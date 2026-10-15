@@ -5,9 +5,8 @@
 # Bots cannot use messages.GetHistory (BOT_METHOD_INVALID).
 # We walk message IDs via get_messages(...) — bot-safe.
 #
-# Duplicate detection checks EVERY online shard directly,
-# trying every relevant key (_id, fingerprint, file_id,
-# file_unique_id). No bloom shortcut.
+# Duplicate detection checks EVERY online shard directly by
+# the Telegram file_id stored as both _id and file_id.
 #
 # Indexes are auto-created on first run.
 #

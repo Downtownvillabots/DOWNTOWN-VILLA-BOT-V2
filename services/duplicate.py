@@ -146,10 +146,14 @@ async def load_from_db(limit: int = BLOOM_MAX) -> int:
                 continue
             try:
                 cursor = entry.db["media_files"].find(
-                    {}, {"_id": 1}
+                    {}, {"_id": 1, "fingerprint": 1, "file_id": 1}
                 ).limit(limit)
                 async for doc in cursor:
-                    fp = str(doc.get("_id") or "")
+                    fp = (
+                        str(doc.get("fingerprint") or "")
+                        or compute_fingerprint(doc.get("file_id"))
+                        or str(doc.get("_id") or "")
+                    )
                     if fp:
                         _bloom_add(fp)
                         loaded += 1

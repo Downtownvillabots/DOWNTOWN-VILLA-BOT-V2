@@ -109,8 +109,12 @@ async def cmd_dbg(client: Client, message: Message):
                 f"   fp(sample.file_id) = <code>{real_fp}</code>"
             )
             lines.append(
-                f"   sample._id == fp? "
-                f"<b>{str(sample.get('_id')) == real_fp}</b>"
+                f"   sample._id == file_id? "
+                f"<b>{str(sample.get('_id')) == str(sample.get('file_id'))}</b>"
+            )
+            lines.append(
+                f"   fingerprint matches? "
+                f"<b>{str(sample.get('fingerprint')) == real_fp}</b>"
             )
     except Exception as e:
         lines.append(f"   ❌ {e}")

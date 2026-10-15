@@ -318,11 +318,15 @@ async def save_file(
             return (True, -1)
         record["shard_index"] = shard_index
         record["shard_label"] = shard_label
+        document_fields = {
+            key: value for key, value in record.items() if key != "_id"
+        }
+        document_id = str(file_id)
 
         try:
             await target_db["media_files"].update_one(
-                {"_id": fingerprint},
-                {"$set": record},
+                {"_id": document_id},
+                {"$set": document_fields},
                 upsert=True,
             )
         except Exception as e:
@@ -352,11 +356,11 @@ async def save_file(
                 _cached_shard_at = time.time()
                 shard_label = entry.label
                 shard_index = entry.index
-                record["shard_index"] = shard_index
-                record["shard_label"] = shard_label
+                document_fields["shard_index"] = shard_index
+                document_fields["shard_label"] = shard_label
                 await target_db["media_files"].update_one(
-                    {"_id": fingerprint},
-                    {"$set": record},
+                    {"_id": document_id},
+                    {"$set": document_fields},
                     upsert=True,
                 )
             except Exception as e2:
@@ -443,7 +447,7 @@ def _build_record(
         normalized_title = _normalize(title_clean)
 
     rec: Dict[str, Any] = {
-        "_id": fingerprint,
+        "_id": str(getattr(media, "file_id", "")),
         "fingerprint": fingerprint,
 
         "file_id": getattr(media, "file_id", None),
