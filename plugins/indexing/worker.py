@@ -169,6 +169,13 @@ async def start_worker(
 ) -> bool:
     global _task
 
+    range_mode = str(range_mode or "last").lower()
+    direction = str(direction or "backward").lower()
+    if range_mode in {"full", "first"}:
+        direction = "forward"
+    elif range_mode == "last":
+        direction = "backward"
+
     logger.info(
         f"[INDEX-WORKER] ▶️ start_worker — "
         f"channel={channel_id} mode={mode} dir={direction} "
@@ -324,6 +331,7 @@ async def _run() -> None:
         if C is None:
             STATE["last_error"] = "client not ready"
             logger.error("[INDEX-WORKER] ❌ client None")
+            await _finalize("error")
             return
         logger.info("[INDEX-WORKER] ✅ client ready")
 
@@ -368,6 +376,7 @@ async def _run() -> None:
         except Exception as e:
             STATE["last_error"] = f"cannot access channel: {e}"
             logger.error(f"[INDEX-WORKER] ❌ cannot access: {e}")
+            await _finalize("error")
             return
 
         # Range
