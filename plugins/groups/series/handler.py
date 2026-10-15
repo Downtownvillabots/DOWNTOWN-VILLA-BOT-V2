@@ -1566,7 +1566,7 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
 
 @Client.on_message(
     filters.private & filters.command("start"),
-    group=-100000,
+    group=5,
 )
 async def series_delivery_start(client: Client, message: Message):
     if not message.from_user:
@@ -1691,31 +1691,45 @@ async def series_delivery_start(client: Client, message: Message):
                             getattr(CFG, "BOT_USERNAME", "") or ""
                         ).lstrip("@")
 
-                    if bot_username:
-                        target = (
-                            f"https://t.me/{bot_username}"
-                            f"?start=v_{{url}}"
+                    if not bot_username:
+                        raise RuntimeError(
+                            "cannot create verification link without bot username"
                         )
-                        vtext, vkb = await V.build_verify_card(
-                            client, cfg_v, chat_id, uid, target,
+
+                    target = (
+                        f"https://t.me/{bot_username}"
+                        f"?start=v_{{url}}"
+                    )
+                    vtext, vkb = await V.build_verify_card(
+                        client, cfg_v, chat_id, uid, target,
+                    )
+                    if not vtext or not vkb:
+                        raise RuntimeError("verification card could not be built")
+
+                    await message.reply_text(
+                        vtext,
+                        reply_markup=vkb,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    try:
+                        await DL.mark_used(token)
+                    except Exception:
+                        logger.exception(
+                            f"[SERIES-H] failed to mark verification token used"
                         )
-                        if vtext and vkb:
-                            try:
-                                await message.reply_text(
-                                    vtext,
-                                    reply_markup=vkb,
-                                    parse_mode=ParseMode.HTML,
-                                    disable_web_page_preview=True,
-                                )
-                            except Exception as e:
-                                logger.debug(
-                                    f"[SERIES-H] verify card: {e}"
-                                )
-                            try:
-                                await DL.mark_used(token)
-                            except Exception:
-                                pass
-                            return
+                    return
+
+        except Exception as e:
+            logger.exception(f"[SERIES-H] verify gate failed; delivery blocked: {e}")
+            try:
+                await message.reply_text(
+                    "⚠️ Verification is temporarily unavailable. "
+                    "Please try again later.",
+                )
+            except Exception:
+                logger.exception("[SERIES-H] could not report verification failure")
+            return
 
     if not hits:
         try:
@@ -1872,10 +1886,27 @@ async def series_delivery_start(client: Client, message: Message):
                         caption=caption, reply_markup=custom_kb,
                         parse_mode=ParseMode.HTML,
                     )
+                except UserIsBlocked:
+                    logger.warning(f"[SERIES-H] user blocked — stopping")
+                    try:
+                        from services.users import mark_user_blocked
+                        await mark_user_blocked(uid)
+                    except Exception:
+                        logger.exception(
+                            f"[SERIES-H] failed to mark user {uid} inactive"
+                        )
+                    break
                 except Exception as e2:
                     logger.warning(f"[SERIES-H] retry: {e2}")
             except UserIsBlocked:
                 logger.warning(f"[SERIES-H] user blocked — stopping")
+                try:
+                    from services.users import mark_user_blocked
+                    await mark_user_blocked(uid)
+                except Exception:
+                    logger.exception(
+                        f"[SERIES-H] failed to mark user {uid} inactive"
+                    )
                 break
             except Exception as e:
                 logger.warning(
@@ -2611,7 +2642,7 @@ def _dedupe_episodes(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 cur_size = 0
             if size and (cur_size == 0 or size < cur_size):
                 by_ep[key] = f
-    out = list(by_ep.values())
+    out = [by_ep[key] for key in sorted(by_ep)]
     out.extend(no_ep)
     return out
 
@@ -3118,6 +3149,13 @@ async def cb_gsreq(client: Client, q: CallbackQuery):
             logger.info(f"[SERIES-H] notified {user_id} · {action}")
         except UserIsBlocked:
             logger.info("[SERIES-H] user blocked")
+            try:
+                from services.users import mark_user_blocked
+                await mark_user_blocked(user_id)
+            except Exception:
+                logger.exception(
+                    f"[SERIES-H] failed to mark user {user_id} inactive"
+                )
         except Exception as e:
             logger.warning(f"[SERIES-H] DM fail: {e}")
 

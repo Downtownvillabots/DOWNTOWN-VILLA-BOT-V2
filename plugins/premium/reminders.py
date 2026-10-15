@@ -240,7 +240,8 @@ async def _send_reminder(
         STATE["reminders_sent_total"] += 1
         logger.info(f"[PREM-REMIND] sent {kind} → {uid}")
     except UserIsBlocked:
-        pass
+        from services.users import mark_user_blocked
+        await mark_user_blocked(uid)
     except FloodWait as e:
         await asyncio.sleep(e.value + 2)
     except Exception as e:

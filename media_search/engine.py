@@ -106,7 +106,7 @@ class SearchEngine:
         # ── Cache lookup ──
         cache_key = self._cache_key(norm, use_year, kind)
         try:
-            from plugins.search import instant_cache as IC
+            from media_search import instant_cache as IC
             cached = IC.get(cache_key)
             if cached:
                 result.hits = [
@@ -184,7 +184,7 @@ class SearchEngine:
         # ── Cache store ──
         if deduped:
             try:
-                from plugins.search import instant_cache as IC
+                from media_search import instant_cache as IC
                 IC.set(
                     cache_key,
                     {
@@ -413,10 +413,20 @@ class SearchEngine:
 
     def invalidate(self, norm: str = "") -> int:
         try:
-            from plugins.search import instant_cache as IC
+            from media_search import instant_cache as IC
             if not norm:
                 return IC.clear()
-            return IC.invalidate_prefix("search|")
+            normalized, _, _ = parse_query(norm)
+            if not normalized:
+                return 0
+            return sum(
+                int(
+                    IC.invalidate_prefix(
+                        self._cache_key(normalized, None, kind)
+                    ) or 0
+                )
+                for kind in ("movie", "series", "any")
+            )
         except Exception:
             return 0
 

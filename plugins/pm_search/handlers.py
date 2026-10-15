@@ -77,6 +77,16 @@ def _drop_session(sid: str) -> None:
     _sessions.pop(sid, None)
 
 
+def _sort_hits_for_panel(
+    hits: List[Any],
+    cfg: Dict[str, Any],
+) -> List[Any]:
+    order = str(cfg.get("sort_order", "small_to_big") or "small_to_big")
+    if order not in ("small_to_big", "big_to_small"):
+        order = "small_to_big"
+    return PN.sort_hits(hits, order)
+
+
 # ============================================================
 # PM TEXT HANDLER
 # ============================================================
@@ -156,6 +166,7 @@ async def _do_search(
         logger.exception(f"[PM-SEARCH] quick_search: {e}")
 
     if hits:
+        hits = _sort_hits_for_panel(hits, cfg)
         sid = _new_session(uid, query, hits)
         meta = None
         if cfg.get("show_poster", True) or cfg.get("show_rating", True):
@@ -194,6 +205,7 @@ async def _do_search(
             hits2 = []
 
         if hits2:
+            hits2 = _sort_hits_for_panel(hits2, cfg)
             sid = _new_session(uid, corrected, hits2)
             meta = None
             try:
@@ -451,6 +463,7 @@ async def pms_router(client: Client, q: CallbackQuery):
                 hits = []
 
             if hits:
+                hits = _sort_hits_for_panel(hits, cfg)
                 new_sid = _new_session(uid, query_text, hits)
                 meta = {
                     "title": title,
@@ -515,6 +528,7 @@ async def show_results_for_request(
         if not hits:
             return False
 
+        hits = _sort_hits_for_panel(hits, cfg)
         sid = _new_session(user_id, q_text, hits)
         meta = None
         if cfg.get("show_poster", True):

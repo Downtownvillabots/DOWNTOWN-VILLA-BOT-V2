@@ -69,14 +69,29 @@ _MEM_DROP = 1000
 
 
 def _mem_put(token: str, doc: dict) -> None:
-    _MEM_CACHE[str(token)] = dict(doc)
+    cached = dict(doc)
+    expires_at = cached.get("expires_at")
+    if isinstance(expires_at, datetime):
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        cached["_expires_at"] = expires_at.timestamp()
+    else:
+        cached["_expires_at"] = time.time() + TTL_SECONDS
+    _MEM_CACHE[str(token)] = cached
     if len(_MEM_CACHE) > _MEM_CAP:
         for k in list(_MEM_CACHE.keys())[:_MEM_DROP]:
             _MEM_CACHE.pop(k, None)
 
 
 def _mem_get(token: str):
-    return _MEM_CACHE.get(str(token))
+    key = str(token)
+    cached = _MEM_CACHE.get(key)
+    if cached is None:
+        return None
+    if cached.get("_expires_at", 0) <= time.time():
+        _MEM_CACHE.pop(key, None)
+        return None
+    return cached
 
 
 def _mem_drop(token: str) -> None:

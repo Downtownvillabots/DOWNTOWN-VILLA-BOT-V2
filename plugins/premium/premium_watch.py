@@ -519,13 +519,20 @@ async def _deliver_episode(
             )
         except FloodWait as e:
             await asyncio.sleep(e.value + 2)
-            sent = await client.send_cached_media(
-                chat_id=uid,
-                file_id=file_id,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
+            try:
+                sent = await client.send_cached_media(
+                    chat_id=uid,
+                    file_id=file_id,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            except UserIsBlocked:
+                from services.users import mark_user_blocked
+                await mark_user_blocked(uid)
+                return False
         except UserIsBlocked:
+            from services.users import mark_user_blocked
+            await mark_user_blocked(uid)
             return False
 
         if not sent:

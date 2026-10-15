@@ -75,7 +75,6 @@ DEFAULT_CFG: Dict[str, Any] = {
 
     "welcome_enabled": False,
     "welcome_text": None,
-    "welcome_buttons": [],
     "welcome_auto_delete": True,
     "welcome_delete_after": 600,
 

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -38,6 +39,28 @@ from utils import fonts as F
 from utils import format as FM
 
 logger = logging.getLogger(__name__)
+
+
+def register_handlers(client: Client) -> int:
+    from pyrogram.handlers.handler import Handler
+
+    registered = 0
+    for name, callback in globals().items():
+        handlers = getattr(callback, "handlers", None)
+        if not isinstance(handlers, list):
+            continue
+        for handler, group in handlers:
+            if isinstance(handler, Handler) and isinstance(group, int):
+                client.add_handler(handler, group)
+                logger.info(
+                    f"[START] registered {type(handler).__name__} "
+                    f"{name} in group {group}"
+                )
+                registered += 1
+
+    if not registered:
+        raise RuntimeError("No core start-router handlers were registered")
+    return registered
 
 
 # ============================================================
@@ -181,36 +204,15 @@ async def _check_banned(message: Message) -> bool:
 # SECTION 5 — USER REGISTRATION
 # ============================================================
 
-async def _register_user(message: Message) -> None:
+async def _register_user(message: Message) -> Tuple[bool, bool]:
     if not message.from_user:
-        return
+        return False, False
     try:
-        from database import db_registry
-        from datetime import datetime
-        db = db_registry.get_user_db()
-        if db is None:
-            return
-        uid = message.from_user.id
-        await db["users"].update_one(
-            {"user_id": uid},
-            {
-                "$set": {
-                    "user_id": uid,
-                    "username": message.from_user.username or "",
-                    "first_name": message.from_user.first_name or "",
-                    "last_name": message.from_user.last_name or "",
-                    "language_code": message.from_user.language_code or "",
-                    "last_seen": datetime.utcnow(),
-                },
-                "$setOnInsert": {
-                    "created_at": datetime.utcnow(),
-                    "is_premium": False,
-                },
-            },
-            upsert=True,
-        )
+        from services.users import register_user
+        return await register_user(message.from_user)
     except Exception as e:
-        logger.debug(f"[START] register: {e}")
+        logger.exception(f"[START] user registration failed: {e}")
+        return False, False
 
 
 # ============================================================
@@ -218,15 +220,14 @@ async def _register_user(message: Message) -> None:
 # ============================================================
 
 def _welcome_text(first_name: str = "") -> str:
-    name = first_name.strip() or F.sc("friend")
+    name = html.escape(first_name.strip()) or F.sc("friend")
     return "\n".join([
-        f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
+        f"{F.EMO['brand']} <b>{F.fb('WELCOME TO DOWNTOWN VILLA')}</b>",
         F.DIV, "",
-        f"{F.EMO['spark']} {F.sc('welcome')} <b>{name}</b>",
+        f"{F.EMO['spark']} {F.sc('hello')} <b>{name}</b>!",
         "",
-        f"{F.EMO['search']} {F.sc('search in the group')}",
-        f"{F.EMO['send']} {F.sc('files arrive here in pm')}",
-        f"{F.EMO['crown']} {F.sc('premium members get extra features')}",
+        f"{F.EMO['search']} {F.sc('send a movie or series name in our group to search')}",
+        f"{F.EMO['send']} {F.sc('your requested files will be delivered here in private')}",
         "",
         F.DIV,
         f"{F.EMO['rocket']} <i>{F.sc('happy watching!')}</i>",
@@ -235,6 +236,16 @@ def _welcome_text(first_name: str = "") -> str:
 
 def _welcome_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"{F.EMO['users']} {F.sc('join our group')}",
+                url=config.GRP_LNK or "https://t.me/",
+            ),
+            InlineKeyboardButton(
+                f"{F.EMO['channel']} {F.sc('join our channel')}",
+                url=config.UPDATE_CHNL_LNK or "https://t.me/",
+            ),
+        ],
         [
             InlineKeyboardButton(
                 f"{F.EMO['search']} {F.sc('how to search')}",
@@ -247,10 +258,6 @@ def _welcome_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                f"{F.EMO['channel']} {F.sc('updates')}",
-                url=config.UPDATE_CHNL_LNK or "https://t.me/",
-            ),
-            InlineKeyboardButton(
                 f"{F.EMO['users']} {F.sc('support')}",
                 url=config.SUPPORT_CHAT or "https://t.me/",
             ),
@@ -261,14 +268,15 @@ def _welcome_kb() -> InlineKeyboardMarkup:
 async def _send_welcome(message: Message) -> None:
     name = message.from_user.first_name if message.from_user else ""
     try:
-        await message.reply_text(
+        sent = await message.reply_text(
             _welcome_text(name),
             reply_markup=_welcome_kb(),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        logger.info(f"[START] welcome sent message_id={sent.id}")
     except Exception as e:
-        logger.debug(f"[START] welcome: {e}")
+        logger.exception(f"[START] failed to send welcome: {e}")
 
 
 # ============================================================
@@ -373,8 +381,17 @@ async def _handle_file(client, message, prefix, extra):
                             setattr(self, k, v)
                 hit = _H(hit_data)
 
+            try:
+                setattr(hit, "source_chat_id", int(doc.get("chat_id") or 0))
+            except (AttributeError, TypeError, ValueError):
+                pass
+
             ok, err = await DEL.delivery.send_file(client, uid, hit)
             logger.info(f"[FILE] delivered ok={ok} err={err}")
+            if not ok:
+                await message.reply_text(
+                    err or "❌ I couldn't send that file. Please try again.",
+                )
             await DL.mark_used(raw)
             return True
 
@@ -416,8 +433,17 @@ async def _handle_file(client, message, prefix, extra):
         except Exception:
             hit = data
 
+        try:
+            setattr(hit, "source_chat_id", int(session.chat_id))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
         ok, err = await DEL.delivery.send_file(client, uid, hit)
         logger.info(f"[FILE] session delivery ok={ok} err={err}")
+        if not ok:
+            await message.reply_text(
+                err or "❌ I couldn't send that file. Please try again.",
+            )
         return True
 
     except Exception as e:
@@ -604,10 +630,17 @@ async def _handle_deliver(client, message, prefix, extra):
                                 parse_mode=ParseMode.HTML,
                             )
                             logger.info(f"[DELIVER] ✅ M1-retry ep={ep}")
+                        except UserIsBlocked:
+                            logger.warning("[DELIVER] user blocked")
+                            from services.users import mark_user_blocked
+                            await mark_user_blocked(uid)
+                            break
                         except Exception as e2:
                             logger.warning(f"[DELIVER] M1-retry: {type(e2).__name__}: {e2}")
                     except UserIsBlocked:
                         logger.warning(f"[DELIVER] user blocked")
+                        from services.users import mark_user_blocked
+                        await mark_user_blocked(uid)
                         break
                     except Exception as e:
                         logger.warning(f"[DELIVER] M1 fail: {type(e).__name__}: {e}")
@@ -859,7 +892,6 @@ async def _handle_watch_order(client, message, prefix, extra):
 # ============================================================
 
 register_route("file",    _handle_file)
-register_route("deliver", _handle_deliver)
 register_route("req",     _handle_request)
 register_route("prem",    _handle_premium)
 register_route("ref",     _handle_referral)
@@ -873,17 +905,24 @@ register_route("wo",      _handle_watch_order)
 
 @Client.on_message(
     filters.command("start") & filters.private,
-    group=-9000,
+    group=-10000,
 )
 async def start_router(client: Client, message: Message):
     with rocket.timer("start.route", log=False):
         try:
+            logger.info(
+                f"[START] received from uid="
+                f"{message.from_user.id if message.from_user else 'unknown'}"
+            )
+            try:
+                message.stop_propagation()
+            except Exception:
+                pass
+
             if await _check_maintenance(message):
                 return
             if await _check_banned(message):
                 return
-
-            await _register_user(message)
 
             text = message.text or ""
             prefix, extra = parse_payload(text)
@@ -892,6 +931,52 @@ async def start_router(client: Client, message: Message):
 
             if not prefix:
                 await _send_welcome(message)
+
+            is_new_user, was_reactivated = await _register_user(message)
+            if is_new_user or was_reactivated:
+                try:
+                    from plugins import log_channel as LC
+                    if is_new_user:
+                        user = message.from_user
+                        await LC.log_new_user(
+                            user_id=user.id,
+                            username=user.username or "",
+                            first_name=user.first_name or "",
+                            last_name=user.last_name or "",
+                            language_code=user.language_code or "",
+                            is_premium=bool(getattr(user, "is_premium", False)),
+                            via_link=bool(
+                                message.command and len(message.command) > 1
+                                and message.command[1].startswith("ref_")
+                            ),
+                        )
+                    else:
+                        await LC.log_event(
+                            "✅",
+                            "USER ACTIVE AGAIN",
+                            [f"👤 user id · <code>{message.from_user.id}</code>"],
+                        )
+                except Exception:
+                    logger.exception("[START] failed to log user status change")
+
+            if not prefix:
+                return
+
+            # Special payloads handled by other modules
+            if prefix == "v":
+                try:
+                    from plugins.groups.shared import verify
+                    await verify.verify_start_handler(client, message)
+                except Exception as e:
+                    logger.exception(f"[START] v_ error: {e}")
+                return
+
+            if prefix == "deliver":
+                try:
+                    from plugins.groups.series import handler as sh
+                    await sh.series_delivery_start(client, message)
+                except Exception as e:
+                    logger.exception(f"[START] deliver_ error: {e}")
                 return
 
             handler = _routes.get(prefix)

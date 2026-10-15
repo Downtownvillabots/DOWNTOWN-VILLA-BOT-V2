@@ -491,6 +491,17 @@ async def start_bot() -> None:
         logger.exception(f"[BOOT] client boot failed: {e}")
         return
 
+    try:
+        from core import start_router
+        handler_count = start_router.register_handlers(bot)
+        logger.info(
+            f"[BOOT] ✅ registered {handler_count} core start-router handlers"
+        )
+    except Exception:
+        logger.exception("[BOOT] ❌ core start-router handler registration failed")
+        await shutdown_client()
+        raise
+
     # Set bot for log channel
     try:
         from plugins import log_channel as LC

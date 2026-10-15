@@ -187,9 +187,15 @@ async def send_file(
                 reply_markup=kb,
                 parse_mode=ParseMode.HTML,
             )
+        except UserIsBlocked:
+            from services.users import mark_user_blocked
+            await mark_user_blocked(user_id)
+            return False
         except Exception:
             return False
     except UserIsBlocked:
+        from services.users import mark_user_blocked
+        await mark_user_blocked(user_id)
         return False
     except Exception as e:
         logger.exception(f"[PM-DELIVER] send: {e}")
@@ -205,19 +211,26 @@ async def send_file(
         pass
 
     # ── Auto-delete with warning ──
-    # Read from the current auto_delete schema
-    ad = cfg.get("auto_delete") or {}
-    if ad.get("bot_messages", False):
+    # Support nested group settings and PM Search's flat minute settings.
+    ad = cfg.get("auto_delete")
+    if isinstance(ad, dict):
+        enabled = bool(ad.get("bot_messages", False))
         try:
             seconds = int(ad.get("bot_timer", 600) or 0)
         except (TypeError, ValueError):
             seconds = 0
-        if seconds > 0:
-            asyncio.create_task(
-                _auto_delete_with_warning(
-                    client, user_id, sent.id, seconds, cfg
-                )
+    else:
+        enabled = bool(cfg.get("auto_delete_enabled", False))
+        try:
+            seconds = int(cfg.get("auto_delete_minutes", 10) or 0) * 60
+        except (TypeError, ValueError):
+            seconds = 0
+    if enabled and seconds > 0:
+        asyncio.create_task(
+            _auto_delete_with_warning(
+                client, user_id, sent.id, seconds, cfg
             )
+        )
     return True
 
 

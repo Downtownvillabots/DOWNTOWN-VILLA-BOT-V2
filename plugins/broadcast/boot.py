@@ -34,10 +34,6 @@ async def _bc_boot(client: Client, message: Message):
 async def _bc_lazy_boot(client: Client, message: Message):
     AD.start(client)
     CL.start()
-    try:
-        message.stop_propagation()
-    except Exception:
-        pass
 
 
 __all__ = []

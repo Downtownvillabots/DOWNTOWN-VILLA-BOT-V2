@@ -179,7 +179,8 @@ async def _handle_updated(client, q, req, token):
                 disable_web_page_preview=True,
             )
         except UserIsBlocked:
-            pass
+            from services.users import mark_user_blocked
+            await mark_user_blocked(user_id)
         except Exception as e:
             logger.debug(f"[REQ] DM updated: {e}")
 

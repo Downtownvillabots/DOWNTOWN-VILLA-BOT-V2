@@ -82,15 +82,12 @@ async def get_all_users() -> List[int]:
 
 
 async def delete_user(user_id: int) -> None:
-    c = _users_coll()
-    if c is None:
-        return
+    """Soft-disable a user that can no longer receive bot messages."""
     try:
-        await c.delete_many(
-            {"$or": [{"id": int(user_id)}, {"user_id": int(user_id)}]}
-        )
-    except Exception:
-        pass
+        from services.users import mark_user_blocked
+        await mark_user_blocked(user_id)
+    except Exception as e:
+        logger.exception(f"[BC] failed to mark user {user_id} inactive: {e}")
 
 
 # ─── Groups ───

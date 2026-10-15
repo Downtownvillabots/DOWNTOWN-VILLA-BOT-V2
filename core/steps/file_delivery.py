@@ -151,10 +151,17 @@ class FileDeliveryStep(BaseStep):
                     )
                     if sent and sent.id:
                         sent_ids.append(sent.id)
+                except UserIsBlocked:
+                    logger.info(f"[DELIVERY] user {target} blocked bot")
+                    from services.users import mark_user_blocked
+                    await mark_user_blocked(target)
+                    break
                 except Exception as e2:
                     logger.debug(f"[DELIVERY] retry failed: {e2}")
             except UserIsBlocked:
                 logger.info(f"[DELIVERY] user {target} blocked bot")
+                from services.users import mark_user_blocked
+                await mark_user_blocked(target)
                 break
             except Exception as e:
                 logger.debug(f"[DELIVERY] file {i}: {e}")

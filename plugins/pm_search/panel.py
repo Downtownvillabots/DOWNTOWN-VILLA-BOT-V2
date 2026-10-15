@@ -28,7 +28,10 @@ def sort_hits(hits: List[Any], order: str) -> List[Any]:
     try:
         return sorted(
             hits,
-            key=lambda h: int(getattr(h, "file_size", 0) or 0),
+            key=lambda h: int(
+                (h.get("file_size") if isinstance(h, dict)
+                 else getattr(h, "file_size", 0)) or 0
+            ),
             reverse=reverse,
         )
     except Exception:
@@ -97,8 +100,16 @@ def file_buttons(
     row: List[InlineKeyboardButton] = []
 
     for i, h in enumerate(hits):
-        q = str(getattr(h, "quality", "") or "").upper()
-        s = FM.size_short(getattr(h, "file_size", 0))
+        quality = (
+            h.get("quality") if isinstance(h, dict)
+            else getattr(h, "quality", "")
+        )
+        file_size = (
+            h.get("file_size", 0) if isinstance(h, dict)
+            else getattr(h, "file_size", 0)
+        )
+        q = str(quality or "").upper()
+        s = FM.size_short(file_size)
         label = f"📁 {offset + i + 1}"
         if q:
             label += f" · {q}"

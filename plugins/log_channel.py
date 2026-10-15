@@ -592,45 +592,6 @@ async def log_event(
 # AUTO HOOKS (fires on events)
 # ============================================================
 
-# ── NEW USER (first /start) ──
-@Client.on_message(filters.command("start") & filters.private, group=-9999)
-async def _hook_new_user(client: Client, message: Message):
-    try:
-        global _bot
-        if _bot is None:
-            _bot = client
-
-        if not message.from_user:
-            return
-
-        # Check if user is new (query DB)
-        try:
-            from database import db_registry
-            db = db_registry.get_user_db()
-            if db is None:
-                return
-            uid = message.from_user.id
-            existing = await db["users"].find_one({"user_id": uid})
-            # Only log if truly new
-            if not existing:
-                await log_new_user(
-                    user_id=uid,
-                    username=message.from_user.username or "",
-                    first_name=message.from_user.first_name or "",
-                    last_name=message.from_user.last_name or "",
-                    language_code=message.from_user.language_code or "",
-                    is_premium=bool(getattr(message.from_user, "is_premium", False)),
-                    via_link=bool(
-                        message.command and len(message.command) > 1
-                        and message.command[1].startswith("ref_")
-                    ),
-                )
-        except Exception:
-            pass
-    except Exception as e:
-        logger.debug(f"[LOG] new user hook: {e}")
-
-
 # ── NEW GROUP / NEW CHANNEL (chat member updated) ──
 @Client.on_chat_member_updated(group=-9998)
 async def _hook_member_update(client: Client, update: ChatMemberUpdated):

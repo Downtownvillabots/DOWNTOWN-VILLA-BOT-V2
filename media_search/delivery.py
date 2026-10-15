@@ -74,6 +74,7 @@ class Delivery:
             kb = self._build_buttons(hit, cfg=cfg)
 
             sent = None
+            send_error = ""
             try:
                 sent = await client.send_cached_media(
                     chat_id=uid,
@@ -86,21 +87,63 @@ class Delivery:
                 wait = int(getattr(e, "value", 30) or 30)
                 logger.warning(f"[DELIVERY] flood {wait}s")
                 await asyncio.sleep(wait + 2)
-                sent = await client.send_cached_media(
-                    chat_id=uid,
-                    file_id=file_id,
-                    caption=caption,
-                    reply_markup=kb,
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    sent = await client.send_cached_media(
+                        chat_id=uid,
+                        file_id=file_id,
+                        caption=caption,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except UserIsBlocked:
+                    await _mark_user_blocked(uid)
+                    return False, "⚠️ Please unblock the bot first"
+                except Exception as e:
+                    send_error = str(e)
+                    logger.warning(f"[DELIVERY] cached-media retry failed: {e}")
             except UserIsBlocked:
+                await _mark_user_blocked(uid)
                 return False, "⚠️ Please unblock the bot first"
             except Exception as e:
-                logger.exception(f"[DELIVERY] send: {e}")
-                return False, f"❌ {type(e).__name__}"
+                send_error = str(e)
+                logger.warning(f"[DELIVERY] cached-media send failed: {e}")
 
             if sent is None:
-                return False, "❌ Could not send file"
+                source_chat = (
+                    _get(hit, "source_channel_id")
+                    or _get(hit, "chat_id")
+                )
+                source_message = (
+                    _get(hit, "source_message_id")
+                    or _get(hit, "message_id")
+                )
+                if source_chat and source_message:
+                    try:
+                        sent = await client.copy_message(
+                            chat_id=uid,
+                            from_chat_id=int(source_chat),
+                            message_id=int(source_message),
+                            caption=caption,
+                            reply_markup=kb,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except UserIsBlocked:
+                        await _mark_user_blocked(uid)
+                        return False, "⚠️ Please unblock the bot first"
+                    except Exception as e:
+                        logger.exception(
+                            f"[DELIVERY] source-message copy failed: {e}"
+                        )
+                        send_error = str(e)
+
+            if sent is None:
+                logger.error(
+                    "[DELIVERY] unable to deliver file "
+                    f"(cached media error: {send_error or 'unknown'})"
+                )
+                return False, (
+                    "❌ I couldn't send that file. Please try another result."
+                )
 
             # ── Track delivery event ──
             try:
@@ -313,6 +356,14 @@ def _url_escape(s: str) -> str:
 # ============================================================
 
 delivery = Delivery()
+
+
+async def _mark_user_blocked(user_id: int) -> None:
+    try:
+        from services.users import mark_user_blocked
+        await mark_user_blocked(user_id)
+    except Exception:
+        logger.exception(f"[DELIVERY] failed to mark user {user_id} inactive")
 
 
 # ============================================================

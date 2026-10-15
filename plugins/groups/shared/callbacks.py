@@ -476,6 +476,10 @@ async def sr_sug(client: Client, q: CallbackQuery):
             except (TypeError, ValueError):
                 max_items = 15
             max_items = max(1, min(30, max_items))
+            hits = SEARCH.sort_hits(
+                hits,
+                mode=_read_sort_mode(cfg_tmp),
+            )
             if len(hits) > max_items:
                 hits = hits[:max_items]
 

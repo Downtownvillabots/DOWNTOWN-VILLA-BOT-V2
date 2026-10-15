@@ -317,7 +317,7 @@ async def build_verify_card(
 
 @Client.on_message(
     filters.private & filters.command("start"),
-    group=-100001,
+    group=6,
 )
 async def verify_start_handler(client: Client, message: Message):
     if not message.from_user:

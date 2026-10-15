@@ -301,6 +301,10 @@ async def _deliver_files(
     except (TypeError, ValueError):
         max_items = 15
     max_items = max(1, min(30, max_items))
+    sort_mode = str(fd.get("sort_order", "small_to_big") or "small_to_big")
+    if sort_mode not in ("small_to_big", "big_to_small"):
+        sort_mode = "small_to_big"
+    hits = SEARCH.sort_hits(hits, mode=sort_mode)
     if len(hits) > max_items:
         hits = hits[:max_items]
 
