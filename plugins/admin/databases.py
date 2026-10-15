@@ -548,66 +548,87 @@ confirms = Confirmations()
 
 
 # ============================================================
-# SECTION 11b — FILE ID GROUPS ACROSS MEDIA SHARDS
+# SECTION 11b — TELEGRAM FILE IDENTITY ACROSS MEDIA SHARDS
 # ============================================================
 
-async def _media_file_id_groups(entries):
-    """Yield sorted file_id groups while keeping only one cursor head per shard."""
+async def _scan_media_file_identity_duplicates(entries, remove: bool = False):
+    """Find repeated file_id/file_unique_id identities across all MEDIA shards."""
     offline = [entry.label for entry in entries if not entry.online]
     if offline:
-        raise RuntimeError(
-            f"MEDIA shard(s) offline: {', '.join(offline)}"
-        )
-    pipeline = [
-        {"$match": {"file_id": {"$type": "string", "$ne": ""}}},
-        {"$sort": {"file_id": 1, "_id": 1}},
-        {"$group": {
-            "_id": "$file_id",
-            "count": {"$sum": 1},
-            "keeper_id": {"$first": "$_id"},
-        }},
-        {"$sort": {"_id": 1}},
-    ]
-    cursors = []
-    heads = {}
+        raise RuntimeError(f"MEDIA shard(s) offline: {', '.join(offline)}")
 
-    async def advance(cursor_index):
-        try:
-            heads[cursor_index] = await cursors[cursor_index].__anext__()
-        except StopAsyncIteration:
-            heads.pop(cursor_index, None)
+    seen_file_ids = set()
+    seen_unique_ids = set()
+    duplicate_ids: Dict[int, List[Any]] = {}
+    per_shard: Dict[int, Dict[str, Any]] = {}
+    total_duplicates = 0
 
-    try:
-        for entry in entries:
-            cursors.append(entry.db["media_files"].aggregate(
-                pipeline, allowDiskUse=True,
-            ))
+    for entry in entries:
+        collection = entry.db["media_files"]
+        cursor = collection.find(
+            {},
+            {"_id": 1, "file_id": 1, "file_unique_id": 1},
+        ).sort("_id", 1)
+        async for doc in cursor:
+            file_id = doc.get("file_id")
+            unique_id = doc.get("file_unique_id")
+            file_id = file_id if isinstance(file_id, str) else ""
+            document_id = doc.get("_id")
+            document_id = document_id if isinstance(document_id, str) else ""
+            unique_id = unique_id if isinstance(unique_id, str) else ""
+            file_id_values = {identity for identity in (file_id, document_id) if identity}
+            if not file_id_values and not unique_id:
+                continue
 
-        await asyncio.gather(*(advance(i) for i in range(len(cursors))))
-        while heads:
-            file_id = min(row["_id"] for row in heads.values())
-            group = []
-            for cursor_index, row in list(heads.items()):
-                if row["_id"] == file_id:
-                    entry = entries[cursor_index]
-                    group.append((entry, row["count"], row["keeper_id"]))
-                    await advance(cursor_index)
-            yield file_id, group
-    finally:
-        await asyncio.gather(
-            *(cursor.close() for cursor in cursors),
-            return_exceptions=True,
-        )
+            is_duplicate = (
+                bool(file_id_values & seen_file_ids)
+                or (bool(unique_id) and unique_id in seen_unique_ids)
+            )
+            seen_file_ids.update(file_id_values)
+            if unique_id:
+                seen_unique_ids.add(unique_id)
+
+            if not is_duplicate:
+                continue
+
+            total_duplicates += 1
+            shard = per_shard.setdefault(entry.index, {
+                "name": entry.label,
+                "duplicates": 0,
+                "deleted": 0,
+            })
+            shard["duplicates"] += 1
+            if remove:
+                duplicate_ids.setdefault(entry.index, []).append(doc["_id"])
+
+    deleted = 0
+    if remove:
+        entries_by_index = {entry.index: entry for entry in entries}
+        for index, ids in duplicate_ids.items():
+            entry = entries_by_index[index]
+            for offset in range(0, len(ids), 500):
+                result = await entry.db["media_files"].delete_many({
+                    "_id": {"$in": ids[offset:offset + 500]},
+                })
+                count = int(result.deleted_count)
+                per_shard[index]["deleted"] += count
+                deleted += count
+
+    return {
+        "duplicates": total_duplicates,
+        "deleted": deleted,
+        "per_shard": list(per_shard.values()),
+    }
 
 
 # ============================================================
-# SECTION 12 — DUPLICATE SCAN (file_id)
+# SECTION 12 — DUPLICATE SCAN (Telegram file identity)
 # ============================================================
 
 async def duplicate_scan(cat: str, index: int) -> Dict[str, Any]:
     """Scan indexed files across all online MEDIA shards."""
     if cat != "media":
-        return {"ok": False, "reason": "File ID scans are for MEDIA databases"}
+        return {"ok": False, "reason": "File identity scans are for MEDIA databases"}
     if not stats._find_entry(cat, index):
         return {"ok": False, "reason": "DB not found"}
 
@@ -615,25 +636,17 @@ async def duplicate_scan(cat: str, index: int) -> Dict[str, Any]:
     if not entries:
         return {"ok": False, "reason": "No MEDIA databases are online"}
 
-    per_shard: Dict[int, Dict[str, Any]] = {}
-    total = 0
     try:
-        async for _file_id, group in _media_file_id_groups(entries):
-            if sum(count for _, count, _ in group) < 2:
-                continue
-            total += 1
-            for entry, _, _ in group:
-                item = per_shard.setdefault(entry.index, {
-                    "name": entry.label, "dupes": 0, "key": "file_id",
-                })
-                item["dupes"] += 1
+        result = await _scan_media_file_identity_duplicates(entries)
     except Exception as e:
         errors.record("dup:media:media_files", str(e))
         return {"ok": False, "reason": "MEDIA file scan failed"}
 
     return {
-        "ok": True, "total": total,
-        "per_collection": list(per_shard.values()), "key_used": ["file_id"],
+        "ok": True,
+        "total": result["duplicates"],
+        "per_collection": result["per_shard"],
+        "key_used": ["file_id", "file_unique_id"],
     }
 
 
@@ -651,22 +664,23 @@ async def do_dup_scan_coll(cat: str, index: int, name: str):
 
     result: Dict[str, List[Dict[str, Any]]] = {}
     scan_error = False
-    try:
-        pipeline = [
-            {"$match": {
-                "file_id": {"$type": "string", "$ne": ""},
-            }},
-            {"$group": {"_id": "$file_id", "n": {"$sum": 1}}},
-            {"$match": {"n": {"$gt": 1}}},
-            {"$sort": {"n": -1}},
-            {"$limit": 10},
-        ]
-        r = await entry.db[name].aggregate(pipeline).to_list(length=10)
-        if r:
-            result["file_id"] = r
-    except Exception as e:
-        errors.record(f"dup_coll:{name}:file_id", str(e))
-        scan_error = True
+    for key in ("file_id", "file_unique_id"):
+        try:
+            pipeline = [
+                {"$match": {
+                    key: {"$type": "string", "$ne": ""},
+                }},
+                {"$group": {"_id": f"${key}", "n": {"$sum": 1}}},
+                {"$match": {"n": {"$gt": 1}}},
+                {"$sort": {"n": -1}},
+                {"$limit": 10},
+            ]
+            rows = await entry.db[name].aggregate(pipeline).to_list(length=10)
+            if rows:
+                result[key] = rows
+        except Exception as e:
+            errors.record(f"dup_coll:{name}:{key}", str(e))
+            scan_error = True
 
     lines = [
         _header(), "",
@@ -1568,16 +1582,16 @@ async def view_dups(cat: str, index: int):
         F.DIV, "",
         f"🗄️ {F.sc('target')} · {cat.upper()} DB {index:02d}",
         f"🏷️ {F.sc('cluster')} · <code>{esc(info['label'])}</code>",
-        f"📦 {F.sc('scope')} · <code>media_files / same file_id</code>",
+        f"📦 {F.sc('scope')} · <code>media_files / Telegram file identity</code>",
         "",
         F.DIV_S,
         f"🔍 {F.sc('scan status')} · <b>{F.sc('ready')}</b>",
         F.DIV_S,
         "",
         f"Press <b>{F.sc('start scan')}</b> to scan media_files across all online MEDIA shards.",
-        f"Key checked · <code>file_id</code>",
+        f"Keys checked · <code>file_id</code> OR <code>file_unique_id</code>",
         "",
-        f"⚠️ {F.sc('scan is read-only. Clear removes extra media_files records across all online MEDIA shards, keeping one per file_id, after 3-step confirmation.')}",
+        f"⚠️ {F.sc('scan is read-only. Clear removes extra media_files records matching file_id OR file_unique_id across all online MEDIA shards, keeping one record per Telegram file identity, after 3-step confirmation.')}",
     ]
     return "\n".join(lines), kb_dups(cat, index)
 
@@ -1598,16 +1612,15 @@ async def view_dup_scan(cat: str, index: int):
 
     lines.append(f"📦 {F.sc('scope')} · <code>media_files / all online MEDIA shards</code>")
     lines.append(
-        f"🧹 {F.sc('duplicate groups')} · <code>{FM.num(result['total'])}</code>")
+        f"🧹 {F.sc('duplicate records')} · <code>{FM.num(result['total'])}</code>")
     lines.append("")
 
     if result["per_collection"]:
         lines.append(f"<b>{F.fb('AFFECTED MEDIA SHARDS')}</b>")
         for pc in result["per_collection"][:20]:
-            k = pc.get("key") or "?"
             lines.append(
                 f"• <code>{esc(pc['name'])}</code> · "
-                f"<b>{FM.num(pc['dupes'])}</b> · <i>{k}</i>"
+                f"<b>{FM.num(pc['duplicates'])}</b> · <i>file identity</i>"
             )
     else:
         lines.append(f"🟢 {F.sc('no duplicates found')}")
@@ -1615,10 +1628,10 @@ async def view_dup_scan(cat: str, index: int):
     return "\n".join(lines), kb_dups(cat, index)
 
 
-async def remove_file_id_duplicates(
+async def remove_file_identity_duplicates(
     cat: str, index: int, actor_id: int = 0,
 ) -> Dict[str, Any]:
-    """Keep one indexed media record per file_id across all MEDIA shards."""
+    """Keep one record per Telegram file identity across all MEDIA shards."""
     if cat != "media":
         return {
             "ok": False,
@@ -1631,41 +1644,30 @@ async def remove_file_id_duplicates(
     if not entries:
         return {"ok": False, "reason": "No MEDIA databases are online"}
 
-    result: Dict[str, Any] = {
-        "ok": True, "groups": 0, "deleted": 0, "per_collection": [],
-    }
-    per_shard: Dict[int, Dict[str, Any]] = {}
     try:
-        async for file_id, group in _media_file_id_groups(entries):
-            if sum(count for _, count, _ in group) < 2:
-                continue
-            result["groups"] += 1
-            keeper_entry, _, _ = group[0]
-            for entry, _, shard_keeper_id in group:
-                selector = {"file_id": file_id}
-                if entry is keeper_entry:
-                    selector["_id"] = {"$ne": shard_keeper_id}
-                deletion = await entry.db["media_files"].delete_many(selector)
-                if deletion.deleted_count:
-                    item = per_shard.setdefault(entry.index, {
-                        "name": entry.label, "groups": 0, "deleted": 0,
-                    })
-                    item["groups"] += 1
-                    item["deleted"] += deletion.deleted_count
-                    result["deleted"] += deletion.deleted_count
+        result = await _scan_media_file_identity_duplicates(
+            entries,
+            remove=True,
+        )
     except Exception as e:
         errors.record("dedupe:media:media_files", str(e))
-        result["ok"] = False
-
-    result["per_collection"] = list(per_shard.values())
+        return {"ok": False, "reason": "MEDIA file deduplication failed"}
 
     cache.invalidate()
     audit.log(
-        actor_id, "deduplicate_file_ids",
+        actor_id, "deduplicate_telegram_file_identities",
         target="media:all-online-shards",
-        result=f"groups={result['groups']} deleted={result['deleted']}",
+        result=(
+            f"duplicates={result['duplicates']} "
+            f"deleted={result['deleted']}"
+        ),
     )
-    return result
+    return {
+        "ok": True,
+        "duplicate_records": result["duplicates"],
+        "deleted": result["deleted"],
+        "per_collection": result["per_shard"],
+    }
 
 
 # ============================================================
@@ -2218,7 +2220,7 @@ async def db_router(client: Client, q: CallbackQuery):
                 f"⚠️ <b>{F.fb('DUPLICATE REMOVAL — STEP 1/3')}</b>\n"
                 f"{F.DIV}\n\n"
                 f"🎯 {F.sc('target')} · all online MEDIA shards\n\n"
-                f"{F.sc('duplicate records in media_files with the same file_id will be deleted across all online MEDIA shards; one record per file_id will be kept.')}\n\n"
+                f"{F.sc('duplicate records in media_files matching file_id OR file_unique_id will be deleted across all online MEDIA shards; one record per Telegram file identity will be kept.')}\n\n"
                 f"{F.sc('continue?')}"
             )
             kb = InlineKeyboardMarkup([
@@ -2356,25 +2358,25 @@ async def db_router(client: Client, q: CallbackQuery):
                 await q.answer("🧹 Deduplicating indexed files across MEDIA shards…")
                 await _edit(
                     q,
-                    f"🧹 <b>{F.fb('FILE ID DEDUPLICATION IN PROGRESS')}</b>\n"
+                    f"🧹 <b>{F.fb('TELEGRAM FILE DEDUPLICATION IN PROGRESS')}</b>\n"
                     f"{F.DIV}\n\n"
-                    f"{F.sc('checking media_files across all online MEDIA shards; one record per file_id will be kept.')}",
+                    f"{F.sc('checking media_files across all online MEDIA shards using file_id OR file_unique_id; one record per Telegram file identity will be kept.')}",
                     None,
                 )
-                result = await remove_file_id_duplicates(
+                result = await remove_file_identity_duplicates(
                     payload["cat"], payload["index"], q.from_user.id,
                 )
                 if result.get("ok"):
                     text_lines = [
-                        f"🧹 <b>{F.fb('FILE ID DEDUPLICATION COMPLETE')}</b>",
+                        f"🧹 <b>{F.fb('TELEGRAM FILE DEDUPLICATION COMPLETE')}</b>",
                         F.DIV, "",
                         f"🎯 {F.sc('target')} · all online MEDIA shards",
-                        f"🧩 {F.sc('duplicate file IDs')} · "
-                        f"<b>{FM.num(result['groups'])}</b>",
+                        f"🧩 {F.sc('duplicate file records')} · "
+                        f"<b>{FM.num(result['duplicate_records'])}</b>",
                         f"🗑️ {F.sc('extra records removed')} · "
                         f"<b>{FM.num(result['deleted'])}</b>",
                         "",
-                        f"✅ {F.sc('one record was retained for every file_id')}",
+                        f"✅ {F.sc('one record was retained per Telegram file identity')}",
                     ]
                     for item in result["per_collection"][:20]:
                         text_lines.append(
@@ -2384,7 +2386,7 @@ async def db_router(client: Client, q: CallbackQuery):
                     text = "\n".join(text_lines)
                 else:
                     text = (
-                        f"❌ <b>{F.fb('FILE ID DEDUPLICATION INCOMPLETE')}</b>\n"
+                        f"❌ <b>{F.fb('TELEGRAM FILE DEDUPLICATION INCOMPLETE')}</b>\n"
                         f"{F.DIV}\n\n"
                         f"{F.sc('some indexed files could not be processed; see database errors in the admin panel.')}"
                     )
