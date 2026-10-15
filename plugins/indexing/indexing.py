@@ -223,11 +223,13 @@ async def _build_live_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarku
 
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     scanned = int(w.get("scanned_ids", 0))
-    total = int(w.get("total_messages", 0))
     current_id = int(w.get("current_message_id", 0))
     saved = int(w.get("saved", 0))
     dup = int(w.get("duplicate_id", 0))
     checked = int(w.get("dups_checked", 0))
+    files_found = int(w.get("files_found", 0))
+    files_completed = int(w.get("files_completed", 0))
+    estimated_files = int(w.get("estimated_files_total", 0))
     skipped = int(w.get("skipped_no_media", 0))
     failed = int(w.get("failed", 0))
     movies = int(w.get("movies", 0))
@@ -240,7 +242,11 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     if started:
         elapsed_str = FM.duration_short(time.time() - started)
 
-    pct = min(100.0, scanned / max(1, total) * 100) if total else 0.0
+    file_target = max(files_found, files_completed, estimated_files)
+    pct = (
+        min(100.0, files_completed / file_target * 100)
+        if file_target else 0.0
+    )
 
     bar = P.bar(pct, "indexing", width=14, show_percent=False)
     last_error = str(w.get("last_error") or w.get("fetch_error") or "")
@@ -250,8 +256,10 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
         F.DIV_S, "",
         f"<code>{bar}</code> {pct:.0f}%",
-        f"📍 {F.sc('message id')} · <code>{current_id:,}</code> / "
-        f"<code>{total:,}</code>",
+        f"📁 {F.sc('files completed')} · <b>{FM.num(files_completed)}</b> / "
+        f"<b>~{FM.num(file_target)}</b>",
+        f"🔎 {F.sc('files found')} · <b>{FM.num(files_found)}</b>",
+        f"📍 {F.sc('current message id')} · <code>{current_id:,}</code>",
         "",
         f"📡 {F.sc('channel')} · "
         f"<code>{str(w.get('channel_title', '?'))[:30]}</code>",
@@ -259,7 +267,7 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
         f"⏱️ {F.sc('elapsed')} · <b>{elapsed_str}</b>",
         "",
-        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
+        f"📥 {F.sc('message IDs checked')} · <b>{FM.num(scanned)}</b>",
         f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
         "",
         F.DIV_S,
@@ -274,7 +282,8 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
         f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
         "",
-        f"⚡ {F.sc('scan speed')} · <b>{w.get('speed', 0):.1f} IDs/s</b>",
+        f"⚡ {F.sc('file rate')} · "
+        f"<b>{float(w.get('file_speed', 0) or 0) * 60:.1f} files/min</b>",
         f"⏱️ {F.sc('eta')} · <b>{eta_text}</b>",
         *([f"⚠️ {F.sc('last error')} · "
            f"<code>{html_escape(last_error[:180])}</code>"] if last_error else []),
@@ -305,7 +314,7 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
 
     bar = P.bar(100, "indexing", width=14, show_percent=False)
 
-    total_files = saved + dup + failed
+    total_files = int(w.get("files_completed", saved + dup + failed))
 
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -320,8 +329,10 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         f"⏱️ {F.sc('duration')} · <b>{FM.duration_short(duration)}</b>",
         "",
         F.DIV_S,
-        f"📥 {F.sc('scanned')} · <b>{FM.num(scanned)}</b>",
+        f"📥 {F.sc('message IDs checked')} · <b>{FM.num(scanned)}</b>",
         f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
+        f"📁 {F.sc('files found')} · "
+        f"<b>{FM.num(int(w.get('files_found', total_files)))}</b>",
         "",
         F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
@@ -955,11 +966,11 @@ async def _build_duplicates() -> Tuple[str, InlineKeyboardMarkup]:
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"🧹 <b>{F.fb('DUPLICATE CONTROL')}</b>",
         F.DIV, "",
-        f"{F.EMO['info']} {F.sc('duplicates = same file_id only')}",
+        f"{F.EMO['info']} {F.sc('duplicates = matching Telegram file identity')}",
         "",
         F.DIV_S,
         f"✅ {F.sc('import every file')}",
-        f"⏭️ {F.sc('skip only if file_id matches exactly')}",
+        f"⏭️ {F.sc('check file_id and file_unique_id across every media shard')}",
         f"🚫 {F.sc('never skip for missing metadata')}",
     ]
     rows = [[

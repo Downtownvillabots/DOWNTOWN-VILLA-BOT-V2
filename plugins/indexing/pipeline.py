@@ -215,8 +215,11 @@ async def process_message(
         except Exception:
             pass
 
-        from services.duplicate import file_id_lock
-        async with file_id_lock(str(media.file_id)):
+        from services.duplicate import file_identity_lock
+        async with file_identity_lock(
+            str(media.file_id),
+            str(getattr(media, "file_unique_id", None) or ""),
+        ):
             ok, code = await save_file(
                 media,
                 message=message,
@@ -235,7 +238,10 @@ async def process_message(
             return {"status": "saved", "record": record}
 
         if ok and code == 0:
-            return {"status": "duplicate", "reason": "same file_id"}
+            return {
+                "status": "duplicate",
+                "reason": "same file_id or file_unique_id",
+            }
         if ok and code == -1:
             return {"status": "skipped", "reason": "filtered by content mode"}
 
@@ -288,7 +294,11 @@ async def save_file(
             return (False, 2)
 
         try:
-            if await find_exact_file_id(str(file_id), entries):
+            if await find_exact_file_id(
+                str(file_id),
+                entries,
+                str(getattr(media, "file_unique_id", None) or ""),
+            ):
                 return (True, 0)
         except Exception as e:
             logger.error(f"[PIPELINE] duplicate check failed: {e}")
@@ -333,7 +343,11 @@ async def save_file(
             from pymongo.errors import DuplicateKeyError
             if isinstance(e, DuplicateKeyError):
                 try:
-                    if await find_exact_file_id(str(file_id), entries):
+                    if await find_exact_file_id(
+                        str(file_id),
+                        entries,
+                        str(getattr(media, "file_unique_id", None) or ""),
+                    ):
                         return (True, 0)
                 except Exception as check_error:
                     logger.error(
@@ -349,7 +363,11 @@ async def save_file(
                 f"[PIPELINE] write failed, re-picking shard: {e}"
             )
             try:
-                if await find_exact_file_id(str(file_id), entries):
+                if await find_exact_file_id(
+                    str(file_id),
+                    entries,
+                    str(getattr(media, "file_unique_id", None) or ""),
+                ):
                     return (True, 0)
                 entry, target_db = await _pick_shard_fill_first()
                 _cached_shard = (entry, target_db)
@@ -367,7 +385,11 @@ async def save_file(
                 from pymongo.errors import DuplicateKeyError
                 if isinstance(e2, DuplicateKeyError):
                     try:
-                        if await find_exact_file_id(str(file_id), entries):
+                        if await find_exact_file_id(
+                            str(file_id),
+                            entries,
+                            str(getattr(media, "file_unique_id", None) or ""),
+                        ):
                             return (True, 0)
                     except Exception as check_error:
                         logger.error(

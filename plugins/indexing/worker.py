@@ -80,6 +80,9 @@ STATE: Dict[str, Any] = {
     "scanned_ids": 0,
 
     "processed": 0,
+    "files_found": 0,
+    "files_completed": 0,
+    "estimated_files_total": 0,
     "saved": 0,
     "duplicate_id": 0,
     "dups_checked": 0,
@@ -90,6 +93,7 @@ STATE: Dict[str, Any] = {
     "series": 0,
 
     "speed": 0.0,
+    "file_speed": 0.0,
     "eta_seconds": 0.0,
     "eta_text": "—",
     "last_progress_at": 0.0,
@@ -130,6 +134,9 @@ def status() -> Dict[str, Any]:
         "current_message_id": STATE["current_message_id"],
         "scanned_ids": STATE["scanned_ids"],
         "processed": STATE["processed"],
+        "files_found": STATE["files_found"],
+        "files_completed": STATE["files_completed"],
+        "estimated_files_total": STATE["estimated_files_total"],
         "saved": STATE["saved"],
         "duplicate_id": STATE["duplicate_id"],
         "dups_checked": STATE["dups_checked"],
@@ -139,6 +146,7 @@ def status() -> Dict[str, Any]:
         "movies": STATE["movies"],
         "series": STATE["series"],
         "speed": STATE["speed"],
+        "file_speed": STATE["file_speed"],
         "eta_seconds": STATE["eta_seconds"],
         "eta_text": STATE["eta_text"],
         "started_at": STATE["started_at"],
@@ -221,6 +229,9 @@ async def start_worker(
             "end_message_id": 0,
             "scanned_ids": 0,
             "processed": 0,
+            "files_found": 0,
+            "files_completed": 0,
+            "estimated_files_total": 0,
             "saved": 0,
             "duplicate_id": 0,
             "dups_checked": 0,
@@ -230,6 +241,7 @@ async def start_worker(
             "movies": 0,
             "series": 0,
             "speed": 0.0,
+            "file_speed": 0.0,
             "eta_seconds": 0.0,
             "eta_text": "—",
             "last_progress_at": 0.0,
@@ -564,8 +576,10 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
             last_progress_update = time.time()
             _update_speed()
             logger.info(
-                f"[INDEX-WORKER] 📈 scanned={STATE['scanned_ids']} "
-                f"processed={STATE['processed']} saved={STATE['saved']} "
+                f"[INDEX-WORKER] 📈 scanned_ids={STATE['scanned_ids']} "
+                f"files={STATE['files_completed']}/"
+                f"{STATE['estimated_files_total']} "
+                f"found={STATE['files_found']} saved={STATE['saved']} "
                 f"dup={STATE['duplicate_id']} "
                 f"checked={STATE['dups_checked']} "
                 f"failed={STATE['failed']}"
@@ -634,6 +648,7 @@ async def _process_one(C: Client, msg, sem: asyncio.Semaphore) -> None:
 
 async def _handle_message(C: Client, msg) -> None:
     STATE["processed"] += 1
+    tracked_file = False
 
     try:
         media = _pick_media(msg)
@@ -646,6 +661,8 @@ async def _handle_message(C: Client, msg) -> None:
             STATE["skipped_no_file_id"] += 1
             return
 
+        tracked_file = True
+        STATE["files_found"] += 1
         STATE["dups_checked"] += 1
 
         try:
@@ -715,6 +732,9 @@ async def _handle_message(C: Client, msg) -> None:
         STATE["failed"] += 1
         STATE["last_error"] = str(e)[:200]
         logger.exception(f"[INDEX-WORKER] message handler failed: {e}")
+    finally:
+        if tracked_file:
+            STATE["files_completed"] += 1
 
 
 # ============================================================
@@ -750,32 +770,41 @@ def _update_speed() -> None:
         elapsed = max(0.001, now - _speed_sample_at)
         scanned = int(STATE["scanned_ids"])
         delta = max(0, scanned - _speed_sample_ids)
-        instantaneous_speed = delta / elapsed
-        if instantaneous_speed > 0:
-            previous_speed = float(STATE.get("speed") or 0.0)
-            STATE["speed"] = (
-                instantaneous_speed if previous_speed <= 0
-                else previous_speed * 0.65 + instantaneous_speed * 0.35
-            )
-
         _speed_sample_at = now
         _speed_sample_ids = scanned
 
-        remaining = max(
-            0, int(STATE["total_messages"]) - int(STATE["scanned_ids"]),
-        )
-        if remaining == 0:
+        scanned_total = int(STATE["scanned_ids"])
+        files_found = int(STATE["files_found"])
+        files_completed = int(STATE["files_completed"])
+        total_ids = int(STATE["total_messages"])
+        if scanned_total and files_found and total_ids:
+            estimated_total = max(
+                files_found,
+                (files_found * total_ids + scanned_total - 1) // scanned_total,
+            )
+        else:
+            estimated_total = files_completed
+        STATE["estimated_files_total"] = estimated_total
+
+        run_elapsed = max(0.001, now - _scan_started_at)
+        STATE["file_speed"] = files_completed / run_elapsed
+        STATE["speed"] = delta / elapsed
+        remaining_files = max(0, estimated_total - files_completed)
+        if scanned_total >= total_ids and total_ids > 0:
             STATE["eta_seconds"] = 0.0
             STATE["eta_text"] = "done"
         elif STATE["paused"] or STATE["flood_until"] > time.time():
             STATE["eta_text"] = "paused"
-        elif STATE["speed"] > 0:
-            eta_seconds = remaining / STATE["speed"]
+        elif remaining_files == 0 and files_found == 0:
+            STATE["eta_seconds"] = 0.0
+            STATE["eta_text"] = "waiting for files"
+        elif STATE["file_speed"] > 0:
+            eta_seconds = remaining_files / STATE["file_speed"]
             STATE["eta_seconds"] = eta_seconds
             STATE["eta_text"] = FM.duration_short(max(1, int(eta_seconds)))
         else:
             STATE["eta_seconds"] = 0.0
-            STATE["eta_text"] = "calculating…"
+            STATE["eta_text"] = "estimating file rate…"
     except Exception:
         logger.exception("[INDEX-WORKER] progress estimate failed")
 
@@ -807,6 +836,9 @@ async def _finalize(status: Optional[str] = None) -> None:
         await ST.set_status(STATE["run_id"], status, STATE["last_error"])
         await ST.update_stats(STATE["run_id"], {
             "processed": STATE["processed"],
+            "files_found": STATE["files_found"],
+            "files_completed": STATE["files_completed"],
+            "estimated_files_total": STATE["estimated_files_total"],
             "saved": STATE["saved"],
             "duplicate_id": STATE["duplicate_id"],
             "dups_checked": STATE["dups_checked"],

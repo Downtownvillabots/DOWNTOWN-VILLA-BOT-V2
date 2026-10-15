@@ -9,7 +9,7 @@
 #   • plugins/indexing/pipeline.py
 #   • plugins/indexing/worker.py
 #
-# Duplicate decisions use exact file_id queries across every MEDIA
+# Duplicate decisions query file_id and file_unique_id across every MEDIA
 # shard. The in-memory set is an optional cache, never an authority.
 #
 # ============================================================
@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+from contextlib import asynccontextmanager
 from typing import Any, Iterable, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -55,12 +56,39 @@ def file_id_lock(file_id: str) -> asyncio.Lock:
     return _file_id_locks[int.from_bytes(digest[:4], "big") % len(_file_id_locks)]
 
 
+@asynccontextmanager
+async def file_identity_lock(
+    file_id: str,
+    file_unique_id: Optional[str] = None,
+):
+    """Serialize indexing operations sharing either Telegram file identity."""
+    lock_indexes = set()
+    for identity in (file_id, file_unique_id or ""):
+        if identity:
+            digest = hashlib.sha256(identity.encode("utf-8")).digest()
+            lock_indexes.add(
+                int.from_bytes(digest[:4], "big") % len(_file_id_locks)
+            )
+
+    locks = [_file_id_locks[index] for index in sorted(lock_indexes)]
+    for lock in locks:
+        await lock.acquire()
+    try:
+        yield
+    finally:
+        for lock in reversed(locks):
+            lock.release()
+
+
 async def find_exact_file_id(
     file_id: str,
     entries: Optional[Iterable[Any]] = None,
+    file_unique_id: Optional[str] = None,
 ) -> bool:
-    """Search every online MEDIA shard by exact Telegram file_id."""
-    if not file_id:
+    """Search every MEDIA shard by Telegram file_id or stable unique ID."""
+    file_id = str(file_id or "")
+    file_unique_id = str(file_unique_id or "")
+    if not file_id and not file_unique_id:
         return False
 
     if entries is None:
@@ -73,18 +101,25 @@ async def find_exact_file_id(
     if not online_entries:
         raise RuntimeError("no online MEDIA shards available for duplicate check")
 
-    errors = []
     offline_labels = [entry.label for entry in media_entries if not getattr(entry, "online", False)]
     if offline_labels:
-        logger.debug(
-            "[DUPLICATE] skipping offline media shard(s): %s",
-            ", ".join(sorted(set(offline_labels))),
+        raise RuntimeError(
+            "cannot guarantee duplicate check; MEDIA shard(s) offline: "
+            + ", ".join(sorted(set(offline_labels)))
         )
 
+    queries = []
+    if file_id:
+        queries.extend(({"file_id": file_id}, {"_id": file_id}))
+    if file_unique_id:
+        queries.append({"file_unique_id": file_unique_id})
+    query = queries[0] if len(queries) == 1 else {"$or": queries}
+
+    errors = []
     for entry in online_entries:
         try:
             existing = await entry.db["media_files"].find_one(
-                {"file_id": file_id}, {"_id": 1},
+                query, {"_id": 1},
             )
             if existing:
                 return True
@@ -197,6 +232,7 @@ def stats() -> dict:
 __all__ = [
     "compute_fingerprint",
     "file_id_lock",
+    "file_identity_lock",
     "find_exact_file_id",
     "_bloom_check",
     "_bloom_add",
