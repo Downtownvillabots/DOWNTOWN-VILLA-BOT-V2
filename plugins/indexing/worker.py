@@ -47,12 +47,6 @@ except (TypeError, ValueError):
     MAX_PROBE_ID = 100000
 MAX_PROBE_ID = max(1000, MAX_PROBE_ID)
 
-try:
-    EMPTY_BATCH_LIMIT = int(os.getenv("INDEXING_EMPTY_BATCH_LIMIT", "5"))
-except (TypeError, ValueError):
-    EMPTY_BATCH_LIMIT = 5
-EMPTY_BATCH_LIMIT = max(2, EMPTY_BATCH_LIMIT)
-
 SUMMARY_EVERY = 100
 
 # Guard so we only create indexes once per boot
@@ -107,6 +101,7 @@ STATE: Dict[str, Any] = {
     "last_progress_at": 0.0,
 
     "last_error": None,
+    "fetch_error": None,
     "flood_until": 0.0,
 }
 
@@ -175,6 +170,10 @@ async def start_worker(
         f"channel={channel_id} mode={mode} dir={direction} "
         f"range={range_mode} meta={metadata_source}"
     )
+    if not skip_duplicate:
+        logger.warning(
+            "[INDEX-WORKER] duplicate skipping is mandatory; request ignored"
+        )
 
     async with _state_lock:
         if STATE["running"]:
@@ -198,7 +197,7 @@ async def start_worker(
             "batch_size": max(10, min(1000, int(batch_size))),
             "concurrency": max(1, min(100, int(concurrency))),
             "delay": max(0.0, min(5.0, float(delay))),
-            "skip_duplicate": bool(skip_duplicate),
+            "skip_duplicate": True,
             "auto_pause": bool(auto_pause),
             "owner": int(owner),
             "job_id": (
@@ -226,6 +225,7 @@ async def start_worker(
             "eta_text": "—",
             "last_progress_at": 0.0,
             "last_error": None,
+            "fetch_error": None,
             "flood_until": 0.0,
         })
 
@@ -447,8 +447,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
     last_progress_update = 0.0
     start_time = time.time()
     batch_num = 0
-    consecutive_empty = 0
-    seen_any = False
+    consecutive_failures = 0
 
     while not stop_when(next_id):
         if time.time() - start_time > MAX_RUNTIME:
@@ -486,25 +485,27 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
         batch_num += 1
 
         got_any = await _process_batch(C, batch)
-        STATE["scanned_ids"] += len(batch)
+        if got_any is None:
+            next_id -= step * len(batch)
+            if STATE["stop_requested"]:
+                if str(STATE.get("fetch_error") or "").startswith(
+                    "flood too long"
+                ):
+                    raise RuntimeError(STATE["fetch_error"])
+                break
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                raise RuntimeError(
+                    STATE.get("fetch_error")
+                    or "five consecutive message-fetch failures"
+                )
+            await asyncio.sleep(min(2 ** consecutive_failures, 30))
+            continue
 
-        if got_any:
-            consecutive_empty = 0
-            seen_any = True
-        else:
-            consecutive_empty += 1
-            if seen_any and consecutive_empty >= EMPTY_BATCH_LIMIT:
-                logger.info(
-                    f"[INDEX-WORKER] ⏹️ {consecutive_empty} empty "
-                    f"batches → stopping early"
-                )
-                break
-            if not seen_any and consecutive_empty >= EMPTY_BATCH_LIMIT * 3:
-                logger.warning(
-                    f"[INDEX-WORKER] ⚠️ {consecutive_empty} empty "
-                    f"from start → channel empty or IDs high"
-                )
-                break
+        if consecutive_failures:
+            STATE["fetch_error"] = None
+        consecutive_failures = 0
+        STATE["scanned_ids"] += len(batch)
 
         if batch_num <= 3 or batch_num % 10 == 0:
             logger.info(
@@ -535,7 +536,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 # BATCH
 # ============================================================
 
-async def _process_batch(C: Client, batch: List[int]) -> bool:
+async def _process_batch(C: Client, batch: List[int]) -> Optional[bool]:
     try:
         msgs = await C.get_messages(STATE["channel_id"], message_ids=batch)
         if not isinstance(msgs, list):
@@ -543,18 +544,22 @@ async def _process_batch(C: Client, batch: List[int]) -> bool:
     except FloodWait as e:
         wait = int(getattr(e, "value", 30) or 30)
         if wait > FLOOD_HARD_SLEEP:
-            STATE["last_error"] = f"flood too long ({wait}s)"
+            STATE["fetch_error"] = f"flood too long ({wait}s)"
             STATE["stop_requested"] = True
-            return False
+            return None
         STATE["flood_until"] = time.time() + wait
         if STATE["auto_pause"]:
             STATE["paused"] = True
-        return False
+        logger.warning(f"[INDEX-WORKER] flood wait {wait}s; retrying batch")
+        return None
     except RPCError as e:
-        STATE["last_error"] = str(e)[:200]
-        return False
-    except Exception:
-        return False
+        STATE["fetch_error"] = str(e)[:200]
+        logger.warning(f"[INDEX-WORKER] get_messages RPC failed: {e}")
+        return None
+    except Exception as e:
+        STATE["fetch_error"] = str(e)[:200]
+        logger.exception(f"[INDEX-WORKER] get_messages failed: {e}")
+        return None
 
     valid = [
         m for m in msgs
@@ -565,7 +570,12 @@ async def _process_batch(C: Client, batch: List[int]) -> bool:
 
     sem = asyncio.Semaphore(STATE["concurrency"])
     tasks = [_process_one(C, m, sem) for m in valid]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            STATE["failed"] += 1
+            STATE["last_error"] = str(result)[:200]
+            logger.error(f"[INDEX-WORKER] message task failed: {result}")
 
     try:
         STATE["current_message_id"] = max(m.id for m in valid)
@@ -596,19 +606,7 @@ async def _handle_message(C: Client, msg) -> None:
             STATE["skipped_no_file_id"] += 1
             return
 
-        if STATE["skip_duplicate"]:
-            STATE["dups_checked"] += 1
-            try:
-                file_unique_id = media.get("file_unique_id")
-                if await _is_exact_duplicate(file_id, file_unique_id):
-                    STATE["duplicate_id"] += 1
-                    logger.info(
-                        f"[INDEX-WORKER] ♻️ DUP msg={msg.id} "
-                        f"file_id={file_id[:30]}..."
-                    )
-                    return
-            except Exception as e:
-                logger.debug(f"[INDEX-WORKER] dup: {e}")
+        STATE["dups_checked"] += 1
 
         try:
             from plugins.indexing.pipeline import process_message
@@ -616,6 +614,7 @@ async def _handle_message(C: Client, msg) -> None:
                 msg,
                 mode="manual",
                 metadata_source=STATE["metadata_source"],
+                content_mode=STATE["mode"],
             )
         except Exception as e:
             logger.exception(f"[INDEX-WORKER] pipeline crash: {e}")
@@ -644,11 +643,17 @@ async def _handle_message(C: Client, msg) -> None:
                 f"type={rtype or 'unknown'} "
                 f"title='{str(title_dbg)[:60]}'"
             )
+        elif status == "duplicate":
+            STATE["duplicate_id"] += 1
+            logger.info(
+                f"[INDEX-WORKER] ♻️ DUP msg={msg.id} "
+                f"file_id={file_id[:30]}..."
+            )
         elif status == "skipped":
             reason = str(result.get("reason") or "")
             if "file_id" in reason:
                 STATE["skipped_no_file_id"] += 1
-            else:
+            elif "content mode" not in reason:
                 STATE["skipped_no_media"] += 1
         else:
             STATE["failed"] += 1
@@ -662,8 +667,10 @@ async def _handle_message(C: Client, msg) -> None:
                 f"fail={STATE['failed']}"
             )
 
-    except Exception:
+    except Exception as e:
         STATE["failed"] += 1
+        STATE["last_error"] = str(e)[:200]
+        logger.exception(f"[INDEX-WORKER] message handler failed: {e}")
 
 
 # ============================================================
@@ -672,80 +679,21 @@ async def _handle_message(C: Client, msg) -> None:
 
 def _pick_media(msg) -> Optional[Dict[str, Any]]:
     try:
-        if getattr(msg, "video", None):
-            v = msg.video
-            return {"file_id": v.file_id,
-                    "file_unique_id": v.file_unique_id}
-        if getattr(msg, "document", None):
-            d = msg.document
-            return {"file_id": d.file_id,
-                    "file_unique_id": d.file_unique_id}
-        if getattr(msg, "audio", None):
-            a = msg.audio
-            return {"file_id": a.file_id,
-                    "file_unique_id": a.file_unique_id}
-        if getattr(msg, "animation", None):
-            an = msg.animation
-            return {"file_id": an.file_id,
-                    "file_unique_id": an.file_unique_id}
+        for attr in (
+            "video", "document", "audio", "animation", "photo",
+            "voice", "video_note", "sticker",
+        ):
+            media = getattr(msg, attr, None)
+            if media:
+                return {"file_id": media.file_id}
     except Exception:
         pass
     return None
 
 
-async def _is_exact_duplicate(
-    file_id: str,
-    file_unique_id: Optional[str] = None,
-) -> bool:
-    """
-    Walk every online media shard, try every key:
-      _id, fingerprint, file_id, file_unique_id
-    """
-    if not file_id and not file_unique_id:
-        return False
-
-    fp: Optional[str] = None
-    try:
-        from services.duplicate import compute_fingerprint
-        fp = compute_fingerprint(file_id) if file_id else None
-    except Exception:
-        fp = None
-
-    queries: List[Dict[str, Any]] = []
-    if fp:
-        queries.append({"_id": fp})
-        queries.append({"fingerprint": fp})
-    if file_id:
-        queries.append({"file_id": file_id})
-    if file_unique_id:
-        queries.append({"file_unique_id": file_unique_id})
-
-    if not queries:
-        return False
-
-    try:
-        from database import db_registry
-        entries = db_registry.media_entries()
-    except Exception:
-        return False
-
-    for entry in entries:
-        if not entry.online:
-            continue
-        for q in queries:
-            try:
-                doc = await entry.db["media_files"].find_one(q, {"_id": 1})
-                if doc:
-                    key_name = list(q.keys())[0]
-                    logger.info(
-                        f"[INDEX-WORKER] ♻️ DUP hit "
-                        f"shard=DB{entry.index} key={key_name}"
-                    )
-                    return True
-            except Exception:
-                continue
-
-    return False
+async def _is_exact_duplicate(file_id: str) -> bool:
+    from services.duplicate import find_exact_file_id
+    return await find_exact_file_id(file_id)
 
 
 def _update_speed() -> None:

@@ -553,6 +553,11 @@ confirms = Confirmations()
 
 async def _media_file_id_groups(entries):
     """Yield sorted file_id groups while keeping only one cursor head per shard."""
+    offline = [entry.label for entry in entries if not entry.online]
+    if offline:
+        raise RuntimeError(
+            f"MEDIA shard(s) offline: {', '.join(offline)}"
+        )
     pipeline = [
         {"$match": {"file_id": {"$type": "string", "$ne": ""}}},
         {"$sort": {"file_id": 1, "_id": 1}},
@@ -574,10 +579,9 @@ async def _media_file_id_groups(entries):
 
     try:
         for entry in entries:
-            if entry.online:
-                cursors.append(entry.db["media_files"].aggregate(
-                    pipeline, allowDiskUse=True,
-                ))
+            cursors.append(entry.db["media_files"].aggregate(
+                pipeline, allowDiskUse=True,
+            ))
 
         await asyncio.gather(*(advance(i) for i in range(len(cursors))))
         while heads:
@@ -607,10 +611,7 @@ async def duplicate_scan(cat: str, index: int) -> Dict[str, Any]:
     if not stats._find_entry(cat, index):
         return {"ok": False, "reason": "DB not found"}
 
-    entries = sorted(
-        (e for e in stats._entries("media") if e.online),
-        key=lambda e: e.index,
-    )
+    entries = sorted(stats._entries("media"), key=lambda e: e.index)
     if not entries:
         return {"ok": False, "reason": "No MEDIA databases are online"}
 
@@ -1626,10 +1627,7 @@ async def remove_file_id_duplicates(
 
     if not stats._find_entry(cat, index):
         return {"ok": False, "reason": "DB not found"}
-    entries = sorted(
-        (e for e in stats._entries("media") if e.online),
-        key=lambda e: e.index,
-    )
+    entries = sorted(stats._entries("media"), key=lambda e: e.index)
     if not entries:
         return {"ok": False, "reason": "No MEDIA databases are online"}
 

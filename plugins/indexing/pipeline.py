@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
@@ -38,9 +37,14 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 _SUPPORTED = (
+    enums.MessageMediaType.PHOTO,
     enums.MessageMediaType.VIDEO,
     enums.MessageMediaType.AUDIO,
     enums.MessageMediaType.DOCUMENT,
+    enums.MessageMediaType.ANIMATION,
+    enums.MessageMediaType.VOICE,
+    enums.MessageMediaType.VIDEO_NOTE,
+    enums.MessageMediaType.STICKER,
 )
 
 SHARD_CACHE_TTL = 30.0
@@ -178,6 +182,7 @@ async def process_message(
     message,
     mode: str = "auto",
     metadata_source: str = "both",
+    content_mode: str = "both",
 ) -> Dict[str, Any]:
     try:
         mt = getattr(message, "media", None)
@@ -190,6 +195,8 @@ async def process_message(
         media = getattr(message, mt.value, None)
         if not media:
             return {"status": "skipped", "reason": "no media object"}
+        if not getattr(media, "file_id", None):
+            return {"status": "skipped", "reason": "missing file_id"}
 
         try:
             media.file_type = mt.value
@@ -200,21 +207,29 @@ async def process_message(
         except Exception:
             pass
 
-        ok, code = await save_file(
-            media,
-            message=message,
-            metadata_source=metadata_source,
-        )
+        from services.duplicate import file_id_lock
+        async with file_id_lock(str(media.file_id)):
+            ok, code = await save_file(
+                media,
+                message=message,
+                metadata_source=metadata_source,
+                content_mode=content_mode,
+            )
 
         if ok and code == 1:
-            rec = {
-                "file_id": getattr(media, "file_id", None),
-                "file_name": getattr(media, "file_name", None),
-            }
-            return {"status": "saved", "record": rec}
+            from services.duplicate import compute_fingerprint
+            record = _build_record(
+                media,
+                message,
+                compute_fingerprint(str(media.file_id)),
+                metadata_source,
+            )
+            return {"status": "saved", "record": record}
 
         if ok and code == 0:
             return {"status": "duplicate", "reason": "same file_id"}
+        if ok and code == -1:
+            return {"status": "skipped", "reason": "filtered by content mode"}
 
         return {"status": "error", "reason": f"save_file code={code}"}
 
@@ -231,6 +246,7 @@ async def save_file(
     media,
     message=None,
     metadata_source: str = "both",
+    content_mode: str = "both",
 ) -> Tuple[bool, int]:
     """
     Returns:
@@ -245,10 +261,13 @@ async def save_file(
         if not file_id:
             return (False, 2)
 
-        file_unique_id = getattr(media, "file_unique_id", None)
-        fingerprint = hashlib.md5(str(file_id).encode()).hexdigest()
+        from services.duplicate import compute_fingerprint, find_exact_file_id
+        fingerprint = compute_fingerprint(str(file_id))
+        if not fingerprint:
+            logger.error("[PIPELINE] failed to compute file_id fingerprint")
+            return (False, 2)
 
-        # ── 1. Duplicate check across EVERY online shard ──
+        # ── 1. Exact duplicate check across all configured MEDIA shards ──
         try:
             from database import db_registry
             entries = list(db_registry.media_entries())
@@ -260,28 +279,12 @@ async def save_file(
             logger.error("[PIPELINE] no media shards")
             return (False, 2)
 
-        queries: List[Dict[str, Any]] = [
-            {"_id": fingerprint},
-            {"fingerprint": fingerprint},
-            {"file_id": file_id},
-        ]
-        if file_unique_id:
-            queries.append({"file_unique_id": file_unique_id})
-
-        for entry in entries:
-            if not entry.online:
-                continue
-            for q in queries:
-                try:
-                    existing = await entry.db["media_files"].find_one(
-                        q, {"_id": 1}
-                    )
-                    if existing:
-                        return (True, 0)
-                except Exception as e:
-                    logger.debug(
-                        f"[PIPELINE] dup check '{entry.label}': {e}"
-                    )
+        try:
+            if await find_exact_file_id(str(file_id), entries):
+                return (True, 0)
+        except Exception as e:
+            logger.error(f"[PIPELINE] duplicate check failed: {e}")
+            return (False, 2)
 
         # ── 2. Pick target shard (fill-first, cached 30s) ──
         now = time.time()
@@ -300,6 +303,11 @@ async def save_file(
 
         # ── 3. Build record + upsert ──
         record = _build_record(media, message, fingerprint, metadata_source)
+        mode = str(content_mode or "both").lower()
+        if mode in {"movie", "movies"} and record["type"] != "movie":
+            return (True, -1)
+        if mode in {"series", "tv"} and record["type"] != "series":
+            return (True, -1)
         record["shard_index"] = shard_index
         record["shard_label"] = shard_label
 
@@ -310,6 +318,18 @@ async def save_file(
                 upsert=True,
             )
         except Exception as e:
+            from pymongo.errors import DuplicateKeyError
+            if isinstance(e, DuplicateKeyError):
+                try:
+                    if await find_exact_file_id(str(file_id), entries):
+                        return (True, 0)
+                except Exception as check_error:
+                    logger.error(
+                        f"[PIPELINE] duplicate recheck failed: {check_error}"
+                    )
+                logger.exception("[PIPELINE] duplicate-key write failed")
+                return (False, 2)
+
             # Cache stale → force re-pick and retry
             _cached_shard = None
             _cached_shard_at = 0.0
@@ -317,6 +337,8 @@ async def save_file(
                 f"[PIPELINE] write failed, re-picking shard: {e}"
             )
             try:
+                if await find_exact_file_id(str(file_id), entries):
+                    return (True, 0)
                 entry, target_db = await _pick_shard_fill_first()
                 _cached_shard = (entry, target_db)
                 _cached_shard_at = time.time()
@@ -330,6 +352,15 @@ async def save_file(
                     upsert=True,
                 )
             except Exception as e2:
+                from pymongo.errors import DuplicateKeyError
+                if isinstance(e2, DuplicateKeyError):
+                    try:
+                        if await find_exact_file_id(str(file_id), entries):
+                            return (True, 0)
+                    except Exception as check_error:
+                        logger.error(
+                            f"[PIPELINE] duplicate recheck failed: {check_error}"
+                        )
                 logger.exception(f"[PIPELINE] retry save failed: {e2}")
                 return (False, 2)
 
@@ -362,7 +393,11 @@ def _build_record(
     metadata_source: str,
 ) -> Dict[str, Any]:
     fname = str(getattr(media, "file_name", "") or "").strip()
-    caption = str(getattr(media, "caption", "") or "").strip()
+    caption = str(
+        getattr(media, "caption", None)
+        or getattr(message, "caption", "")
+        or ""
+    ).strip()
 
     if metadata_source == "filename":
         raw = fname
@@ -409,7 +444,10 @@ def _build_record(
         "file_size": int(getattr(media, "file_size", 0) or 0),
         "mime_type": getattr(media, "mime_type", None),
         "duration": int(getattr(media, "duration", 0) or 0),
-        "file_type": getattr(media, "file_type", None),
+        "file_type": (
+            getattr(media, "file_type", None)
+            or getattr(getattr(message, "media", None), "value", None)
+        ),
 
         # ── Search fields ──
         "title": title_clean,

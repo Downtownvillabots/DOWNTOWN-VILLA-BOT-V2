@@ -566,19 +566,22 @@ async def _build_step_direction() -> Tuple[str, InlineKeyboardMarkup]:
 # ============================================================
 
 async def _build_step_range() -> Tuple[str, InlineKeyboardMarkup]:
+    from plugins.indexing.worker import MAX_PROBE_ID
+
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"📍 <b>{F.fb('STEP 4/6 — RANGE')}</b>",
         F.DIV, "",
         f"{F.EMO['info']} {F.sc('where to begin scanning')}",
         "",
-        f"📦 {F.sc('full scan')}  — every file, oldest → newest",
+        f"📦 {F.sc('full scan')}  — scan the full configured message ID range",
         f"📍 {F.sc('from first')} — start at msg id 1",
-        f"📍 {F.sc('from last')}  — start at newest msg",
+        f"📍 {F.sc('from last')}  — scan backward from ID {MAX_PROBE_ID}",
         f"✏️ {F.sc('custom')}     — enter a specific msg id",
         "",
         F.DIV_S,
-        f"💡 {F.sc('full scan = best for first-time indexing')}",
+        f"💡 {F.sc('full scan checks every message ID up to the configured limit')}",
+        f"📌 INDEXING_MAX_ID · <code>{MAX_PROBE_ID}</code>",
     ]
     rows = [
         [InlineKeyboardButton(
@@ -678,7 +681,6 @@ async def _build_step_advanced(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     batch = int(data.get("batch_size", 100))
     conc = int(data.get("concurrency", 20))
     delay = float(data.get("delay", 0.3))
-    skip_dup = bool(data.get("skip_duplicate", True))
     auto_pause = bool(data.get("auto_pause", True))
     meta_src = str(data.get("metadata_source", "both"))
 
@@ -690,8 +692,7 @@ async def _build_step_advanced(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"⚡ {F.sc('concurrency')} · <b>{conc}</b>",
         f"⏱️ {F.sc('delay')} · <b>{delay}s</b>",
         f"📄 {F.sc('metadata')} · <b>{meta_src}</b>",
-        f"🧹 {F.sc('skip same file_id')} · "
-        f"{'🟢' if skip_dup else '🔴'}",
+        f"🧹 {F.sc('skip same file_id')} · 🟢",
         f"🛡️ {F.sc('auto-pause flood')} · "
         f"{'🟢' if auto_pause else '🔴'}",
         "",
@@ -729,16 +730,10 @@ async def _build_step_advanced(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         ))
     rows.append(delay_row)
 
-    rows.append([
-        InlineKeyboardButton(
-            f"{'🟢' if skip_dup else '🔴'} {F.sc('skip same file_id')}",
-            callback_data=f"{PFX}:toggle_skipdup",
-        ),
-        InlineKeyboardButton(
-            f"{'🟢' if auto_pause else '🔴'} {F.sc('auto-pause')}",
-            callback_data=f"{PFX}:toggle_autopause",
-        ),
-    ])
+    rows.append([InlineKeyboardButton(
+        f"{'🟢' if auto_pause else '🔴'} {F.sc('auto-pause')}",
+        callback_data=f"{PFX}:toggle_autopause",
+    )])
 
     rows.append([
         InlineKeyboardButton(
@@ -790,7 +785,7 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
     ]
 
     if data.get("range") == "full":
-        lines.append(f"   📦 {F.sc('FULL SCAN — every file')}")
+        lines.append(f"   📦 {F.sc('FULL SCAN — full configured ID range')}")
     elif data.get("range") == "custom":
         lines.append(f"   📌 {F.sc('start at')} · "
                      f"<code>{data.get('start_msg_id', '?')}</code>")
@@ -803,8 +798,7 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"📦 {F.sc('batch')} · <b>{data.get('batch_size', 100)}</b>",
         f"⚡ {F.sc('conc')} · <b>{data.get('concurrency', 20)}</b>",
         f"⏱️ {F.sc('delay')} · <b>{data.get('delay', 0.3)}s</b>",
-        f"🧹 {F.sc('skip same file_id')} · "
-        f"{'🟢' if data.get('skip_duplicate', True) else '🔴'}",
+        f"🧹 {F.sc('skip same file_id')} · 🟢",
         "",
         F.DIV_S,
         f"{F.EMO['spark']} <b>{F.sc('ready to start')}</b>",
@@ -1195,12 +1189,13 @@ async def router_handler(client: Client, q: CallbackQuery):
             return await q.answer()
 
         if action == "toggle_skipdup":
-            s = _get_step(uid)
-            cur = s.get("data", {}).get("skip_duplicate", True) if s else True
-            _update_step(uid, skip_duplicate=not cur)
+            _update_step(uid, skip_duplicate=True)
             text, kb = await _build_step_advanced(uid)
             await _safe_edit(q, text, kb)
-            return await q.answer("🔄")
+            return await q.answer(
+                "Same file_id entries are always skipped.",
+                show_alert=True,
+            )
 
         if action == "toggle_autopause":
             s = _get_step(uid)
@@ -1246,7 +1241,7 @@ async def router_handler(client: Client, q: CallbackQuery):
                     batch_size=int(data.get("batch_size", 100)),
                     concurrency=int(data.get("concurrency", 20)),
                     delay=float(data.get("delay", 0.3)),
-                    skip_duplicate=bool(data.get("skip_duplicate", True)),
+                    skip_duplicate=True,
                     auto_pause=bool(data.get("auto_pause", True)),
                     owner=uid,
                 )
@@ -1611,6 +1606,7 @@ async def _save_default_config(data: Dict[str, Any]) -> bool:
             return False
 
         clean = {k: data[k] for k in _DEFAULT_KEYS if k in data}
+        clean["skip_duplicate"] = True
         clean["updated_at"] = datetime.utcnow()
 
         await db["bot_settings"].update_one(

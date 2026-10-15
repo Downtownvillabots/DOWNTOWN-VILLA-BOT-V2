@@ -253,10 +253,6 @@ async def _handle(client: Client, message) -> None:
             STATE["skipped_no_file_id"] += 1
             return
 
-        if await _is_exact_duplicate(file_id):
-            STATE["duplicate_id"] += 1
-            return
-
         metadata_source = await _get_default_metadata_source()
 
         try:
@@ -297,7 +293,13 @@ async def _handle(client: Client, message) -> None:
         else:
             STATE["failed"] += 1
             STATE["last_error"] = str(result.get("reason") or "?")[:200]
+            logger.error(
+                f"[AUTO-INDEX] failed msg={getattr(message, 'id', '?')}: "
+                f"{STATE['last_error']}"
+            )
     except Exception as e:
+        STATE["failed"] += 1
+        STATE["last_error"] = str(e)[:200]
         logger.exception(f"[AUTO-INDEX] _handle: {e}")
 
 
@@ -337,6 +339,10 @@ def _has_media(message) -> bool:
             or getattr(message, "document", None)
             or getattr(message, "audio", None)
             or getattr(message, "animation", None)
+            or getattr(message, "photo", None)
+            or getattr(message, "voice", None)
+            or getattr(message, "video_note", None)
+            or getattr(message, "sticker", None)
         )
     except Exception:
         return False
@@ -344,42 +350,21 @@ def _has_media(message) -> bool:
 
 def _extract_file_id(message) -> Optional[str]:
     try:
-        if getattr(message, "video", None):
-            return message.video.file_id
-        if getattr(message, "document", None):
-            return message.document.file_id
-        if getattr(message, "audio", None):
-            return message.audio.file_id
-        if getattr(message, "animation", None):
-            return message.animation.file_id
+        for attr in (
+            "video", "document", "audio", "animation", "photo",
+            "voice", "video_note", "sticker",
+        ):
+            media = getattr(message, attr, None)
+            if media:
+                return media.file_id
     except Exception:
         pass
     return None
 
 
 async def _is_exact_duplicate(file_id: str) -> bool:
-    fp = None
-    try:
-        from services.duplicate import compute_fingerprint, _bloom_check
-        fp = compute_fingerprint(file_id)
-        if _bloom_check(fp):
-            return True
-    except Exception:
-        pass
-
-    try:
-        from database import db_registry
-        for entry in db_registry.media_entries():
-            try:
-                q = {"_id": fp} if fp else {"file_id": file_id}
-                exists = await entry.db["media_files"].find_one(q, {"_id": 1})
-                if exists:
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
+    from services.duplicate import find_exact_file_id
+    return await find_exact_file_id(file_id)
 
 
 def snapshot() -> Dict[str, Any]:

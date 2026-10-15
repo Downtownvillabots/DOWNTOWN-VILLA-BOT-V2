@@ -121,10 +121,7 @@ async def cmd_dbg(client: Client, message: Message):
     if sample.get("file_id"):
         try:
             from plugins.indexing.worker import _is_exact_duplicate
-            result = await _is_exact_duplicate(
-                str(sample["file_id"]),
-                str(sample.get("file_unique_id") or "") or None,
-            )
+            result = await _is_exact_duplicate(str(sample["file_id"]))
             lines.append(
                 f"   _is_exact_duplicate(sample) = "
                 f"<b>{result}</b> (expect: True)"
