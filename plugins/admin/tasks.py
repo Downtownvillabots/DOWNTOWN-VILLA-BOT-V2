@@ -726,7 +726,6 @@ async def build_cancel_confirm(tid: str) -> Tuple[str, InlineKeyboardMarkup]:
         F.DIV,
         "",
         f"📛 {F.sc('task')} · <b>{F.sc(name)}</b>",
-        f"🆔 <code>{tid}</code>",
         "",
         f"{F.EMO['warn']} {F.sc('this will stop the task')}",
         "",

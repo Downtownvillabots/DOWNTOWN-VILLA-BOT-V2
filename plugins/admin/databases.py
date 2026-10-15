@@ -548,52 +548,91 @@ confirms = Confirmations()
 
 
 # ============================================================
-# SECTION 12 — DUPLICATE SCAN (multi-key)
+# SECTION 11b — FILE ID GROUPS ACROSS MEDIA SHARDS
 # ============================================================
 
-async def duplicate_scan(cat: str, index: int,
-                         key: str = "file_id") -> Dict[str, Any]:
-    """Scan a database for duplicate values. Tries multiple keys."""
-    info = await stats.db_info(cat, index)
-    if not info or not info["online"]:
-        return {"ok": False, "reason": "DB offline"}
-    entry = stats._find_entry(cat, index)
-    if not entry:
-        return {"ok": False, "reason": "Entry missing"}
+async def _media_file_id_groups(entries):
+    """Yield sorted file_id groups while keeping only one cursor head per shard."""
+    pipeline = [
+        {"$match": {"file_id": {"$type": "string", "$ne": ""}}},
+        {"$sort": {"file_id": 1, "_id": 1}},
+        {"$group": {
+            "_id": "$file_id",
+            "count": {"$sum": 1},
+            "keeper_id": {"$first": "$_id"},
+        }},
+        {"$sort": {"_id": 1}},
+    ]
+    cursors = []
+    heads = {}
 
-    db = entry.db
+    async def advance(cursor_index):
+        try:
+            heads[cursor_index] = await cursors[cursor_index].__anext__()
+        except StopAsyncIteration:
+            heads.pop(cursor_index, None)
+
+    try:
+        for entry in entries:
+            if entry.online:
+                cursors.append(entry.db["media_files"].aggregate(
+                    pipeline, allowDiskUse=True,
+                ))
+
+        await asyncio.gather(*(advance(i) for i in range(len(cursors))))
+        while heads:
+            file_id = min(row["_id"] for row in heads.values())
+            group = []
+            for cursor_index, row in list(heads.items()):
+                if row["_id"] == file_id:
+                    entry = entries[cursor_index]
+                    group.append((entry, row["count"], row["keeper_id"]))
+                    await advance(cursor_index)
+            yield file_id, group
+    finally:
+        await asyncio.gather(
+            *(cursor.close() for cursor in cursors),
+            return_exceptions=True,
+        )
+
+
+# ============================================================
+# SECTION 12 — DUPLICATE SCAN (file_id)
+# ============================================================
+
+async def duplicate_scan(cat: str, index: int) -> Dict[str, Any]:
+    """Scan indexed files across all online MEDIA shards."""
+    if cat != "media":
+        return {"ok": False, "reason": "File ID scans are for MEDIA databases"}
+    if not stats._find_entry(cat, index):
+        return {"ok": False, "reason": "DB not found"}
+
+    entries = sorted(
+        (e for e in stats._entries("media") if e.online),
+        key=lambda e: e.index,
+    )
+    if not entries:
+        return {"ok": False, "reason": "No MEDIA databases are online"}
+
+    per_shard: Dict[int, Dict[str, Any]] = {}
     total = 0
-    per_coll: List[Dict[str, Any]] = []
-    keys_to_try = ["file_id", "file_unique_id", "_id"]
-
-    for name in info["collection_names"]:
-        coll_total = 0
-        coll_key = None
-        for k in keys_to_try:
-            try:
-                pipeline = [
-                    {"$match": {k: {"$exists": True, "$ne": None}}},
-                    {"$group": {"_id": f"${k}", "n": {"$sum": 1}}},
-                    {"$match": {"n": {"$gt": 1}}},
-                    {"$count": "g"},
-                ]
-                r = await db[name].aggregate(pipeline).to_list(length=1)
-                g = r[0]["g"] if r else 0
-                if g:
-                    coll_total += g
-                    coll_key = k
-            except Exception as e:
-                errors.record(f"dup:{name}:{k}", str(e))
-
-        if coll_total:
-            per_coll.append({
-                "name": name, "dupes": coll_total, "key": coll_key,
-            })
-            total += coll_total
+    try:
+        async for _file_id, group in _media_file_id_groups(entries):
+            if sum(count for _, count, _ in group) < 2:
+                continue
+            total += 1
+            for entry, _, _ in group:
+                item = per_shard.setdefault(entry.index, {
+                    "name": entry.label, "dupes": 0, "key": "file_id",
+                })
+                item["dupes"] += 1
+    except Exception as e:
+        errors.record("dup:media:media_files", str(e))
+        return {"ok": False, "reason": "MEDIA file scan failed"}
 
     return {
         "ok": True, "total": total,
-        "per_collection": per_coll, "key_used": keys_to_try,
+        "per_collection": list(per_shard.values()), "key_used": ["file_id"],
     }
 
 
@@ -610,20 +649,23 @@ async def do_dup_scan_coll(cat: str, index: int, name: str):
         )
 
     result: Dict[str, List[Dict[str, Any]]] = {}
-    for k in ("file_id", "file_unique_id", "_id"):
-        try:
-            pipeline = [
-                {"$match": {k: {"$exists": True, "$ne": None}}},
-                {"$group": {"_id": f"${k}", "n": {"$sum": 1}}},
-                {"$match": {"n": {"$gt": 1}}},
-                {"$sort": {"n": -1}},
-                {"$limit": 10},
-            ]
-            r = await entry.db[name].aggregate(pipeline).to_list(length=10)
-            if r:
-                result[k] = r
-        except Exception as e:
-            errors.record(f"dup_coll:{name}:{k}", str(e))
+    scan_error = False
+    try:
+        pipeline = [
+            {"$match": {
+                "file_id": {"$type": "string", "$ne": ""},
+            }},
+            {"$group": {"_id": "$file_id", "n": {"$sum": 1}}},
+            {"$match": {"n": {"$gt": 1}}},
+            {"$sort": {"n": -1}},
+            {"$limit": 10},
+        ]
+        r = await entry.db[name].aggregate(pipeline).to_list(length=10)
+        if r:
+            result["file_id"] = r
+    except Exception as e:
+        errors.record(f"dup_coll:{name}:file_id", str(e))
+        scan_error = True
 
     lines = [
         _header(), "",
@@ -633,6 +675,13 @@ async def do_dup_scan_coll(cat: str, index: int, name: str):
         f"🗄️ {F.sc('database')} · {cat.upper()} {index:02d}",
         "",
     ]
+    if scan_error:
+        lines.append(f"🔴 {F.sc('scan failed; see database errors')}")
+        return "\n".join(lines), InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"{F.EMO['back']} {F.sc('back')}",
+                callback_data=f"adm:dbc_coll:{cat}:{index}:{name}")]])
+
 
     if not result:
         lines.append(f"🟢 {F.sc('no duplicates found')}")
@@ -934,6 +983,13 @@ async def view_category(cat: str):
 # ============================================================
 
 def kb_db(cat, index):
+    search_row = [InlineKeyboardButton(
+        f"🔍 {F.sc('search')}",
+        callback_data=f"adm:dbc_search:{cat}:{index}")]
+    if cat == "media":
+        search_row.append(InlineKeyboardButton(
+            f"🧹 {F.sc('duplicates')}",
+            callback_data=f"adm:dbc_dups:{cat}:{index}"))
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -943,14 +999,7 @@ def kb_db(cat, index):
                 f"📊 {F.sc('statistics')}",
                 callback_data=f"adm:dbc_stats:{cat}:{index}"),
         ],
-        [
-            InlineKeyboardButton(
-                f"🔍 {F.sc('search')}",
-                callback_data=f"adm:dbc_search:{cat}:{index}"),
-            InlineKeyboardButton(
-                f"🧹 {F.sc('duplicates')}",
-                callback_data=f"adm:dbc_dups:{cat}:{index}"),
-        ],
+        search_row,
         [
             InlineKeyboardButton(
                 f"🧩 {F.sc('indexes')}",
@@ -1483,22 +1532,22 @@ async def view_cat_all(cat: str):
 # ============================================================
 
 def kb_dups(cat, index):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"🔍 {F.sc('start scan')}",
-            callback_data=f"adm:dbc_dup_scan:{cat}:{index}")],
-        [InlineKeyboardButton(
-            f"🗑️ {F.sc('remove duplicates')}",
-            callback_data=f"adm:dbc_dup_remove:{cat}:{index}")],
-        [
-            InlineKeyboardButton(
-                f"{F.EMO['refresh']} {F.sc('refresh')}",
-                callback_data=f"adm:dbc_dups:{cat}:{index}"),
-            InlineKeyboardButton(
-                f"{F.EMO['back']} {F.sc('back')}",
-                callback_data=f"adm:dbc_db:{cat}:{index}"),
-        ],
+    rows = [[InlineKeyboardButton(
+        f"🔍 {F.sc('start scan')}",
+        callback_data=f"adm:dbc_dup_scan:{cat}:{index}")]]
+    if cat == "media":
+        rows.append([InlineKeyboardButton(
+            f"🧹 {F.sc('clear duplicates')}",
+            callback_data=f"adm:dbc_dup_remove:{cat}:{index}")])
+    rows.append([
+        InlineKeyboardButton(
+            f"{F.EMO['refresh']} {F.sc('refresh')}",
+            callback_data=f"adm:dbc_dups:{cat}:{index}"),
+        InlineKeyboardButton(
+            f"{F.EMO['back']} {F.sc('back')}",
+            callback_data=f"adm:dbc_db:{cat}:{index}"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def view_dups(cat: str, index: int):
@@ -1518,22 +1567,22 @@ async def view_dups(cat: str, index: int):
         F.DIV, "",
         f"🗄️ {F.sc('target')} · {cat.upper()} DB {index:02d}",
         f"🏷️ {F.sc('cluster')} · <code>{esc(info['label'])}</code>",
-        f"📦 {F.sc('total records')} · <code>{FM.num(info['objects'])}</code>",
+        f"📦 {F.sc('scope')} · <code>media_files / same file_id</code>",
         "",
         F.DIV_S,
         f"🔍 {F.sc('scan status')} · <b>{F.sc('ready')}</b>",
         F.DIV_S,
         "",
-        f"Press <b>{F.sc('start scan')}</b> to scan for duplicates.",
-        f"Keys checked · <code>file_id</code> · <code>file_unique_id</code> · <code>_id</code>",
+        f"Press <b>{F.sc('start scan')}</b> to scan media_files across all online MEDIA shards.",
+        f"Key checked · <code>file_id</code>",
         "",
-        f"⚠️ {F.sc('scan is read-only. removal requires 3-step confirmation.')}",
+        f"⚠️ {F.sc('scan is read-only. Clear removes extra media_files records across all online MEDIA shards, keeping one per file_id, after 3-step confirmation.')}",
     ]
     return "\n".join(lines), kb_dups(cat, index)
 
 
 async def view_dup_scan(cat: str, index: int):
-    result = await duplicate_scan(cat, index, "file_id")
+    result = await duplicate_scan(cat, index)
     info = await stats.db_info(cat, index)
 
     lines = [
@@ -1546,14 +1595,13 @@ async def view_dup_scan(cat: str, index: int):
         lines.append(f"🔴 {F.sc('scan failed')} · {esc(result.get('reason'))}")
         return "\n".join(lines), kb_dups(cat, index)
 
-    total_docs = max(1, info["objects"])
-    lines.append(f"📦 {F.sc('scanned')} · <code>{FM.num(total_docs)}</code>")
+    lines.append(f"📦 {F.sc('scope')} · <code>media_files / all online MEDIA shards</code>")
     lines.append(
         f"🧹 {F.sc('duplicate groups')} · <code>{FM.num(result['total'])}</code>")
     lines.append("")
 
     if result["per_collection"]:
-        lines.append(f"<b>{F.fb('PER COLLECTION')}</b>")
+        lines.append(f"<b>{F.fb('AFFECTED MEDIA SHARDS')}</b>")
         for pc in result["per_collection"][:20]:
             k = pc.get("key") or "?"
             lines.append(
@@ -1564,6 +1612,62 @@ async def view_dup_scan(cat: str, index: int):
         lines.append(f"🟢 {F.sc('no duplicates found')}")
 
     return "\n".join(lines), kb_dups(cat, index)
+
+
+async def remove_file_id_duplicates(
+    cat: str, index: int, actor_id: int = 0,
+) -> Dict[str, Any]:
+    """Keep one indexed media record per file_id across all MEDIA shards."""
+    if cat != "media":
+        return {
+            "ok": False,
+            "reason": "File deduplication is limited to MEDIA databases",
+        }
+
+    if not stats._find_entry(cat, index):
+        return {"ok": False, "reason": "DB not found"}
+    entries = sorted(
+        (e for e in stats._entries("media") if e.online),
+        key=lambda e: e.index,
+    )
+    if not entries:
+        return {"ok": False, "reason": "No MEDIA databases are online"}
+
+    result: Dict[str, Any] = {
+        "ok": True, "groups": 0, "deleted": 0, "per_collection": [],
+    }
+    per_shard: Dict[int, Dict[str, Any]] = {}
+    try:
+        async for file_id, group in _media_file_id_groups(entries):
+            if sum(count for _, count, _ in group) < 2:
+                continue
+            result["groups"] += 1
+            keeper_entry, _, _ = group[0]
+            for entry, _, shard_keeper_id in group:
+                selector = {"file_id": file_id}
+                if entry is keeper_entry:
+                    selector["_id"] = {"$ne": shard_keeper_id}
+                deletion = await entry.db["media_files"].delete_many(selector)
+                if deletion.deleted_count:
+                    item = per_shard.setdefault(entry.index, {
+                        "name": entry.label, "groups": 0, "deleted": 0,
+                    })
+                    item["groups"] += 1
+                    item["deleted"] += deletion.deleted_count
+                    result["deleted"] += deletion.deleted_count
+    except Exception as e:
+        errors.record("dedupe:media:media_files", str(e))
+        result["ok"] = False
+
+    result["per_collection"] = list(per_shard.values())
+
+    cache.invalidate()
+    audit.log(
+        actor_id, "deduplicate_file_ids",
+        target="media:all-online-shards",
+        result=f"groups={result['groups']} deleted={result['deleted']}",
+    )
+    return result
 
 
 # ============================================================
@@ -1859,6 +1963,9 @@ async def db_router(client: Client, q: CallbackQuery):
     data = str(q.data)
     parts = data.split(":")
     chat_id = q.message.chat.id if q.message else 0
+    if q.message:
+        from plugins.admin.admin import suspend_panel
+        await suspend_panel(q.message.id)
 
     # Track current view for live refresh
     if parts[1] == "dbc_main":
@@ -2100,6 +2207,11 @@ async def db_router(client: Client, q: CallbackQuery):
         if parts[1] == "dbc_dup_remove":
             cat = parts[2]
             idx = int(parts[3])
+            if cat != "media":
+                return await q.answer(
+                    "File deduplication is available for MEDIA databases only.",
+                    show_alert=True,
+                )
             tok = f"dup:{cat}:{idx}:{int(time.time())}"
             confirms.start(q.from_user.id, tok, {
                 "action": "dup_remove", "cat": cat, "index": idx,
@@ -2107,8 +2219,8 @@ async def db_router(client: Client, q: CallbackQuery):
             text = (
                 f"⚠️ <b>{F.fb('DUPLICATE REMOVAL — STEP 1/3')}</b>\n"
                 f"{F.DIV}\n\n"
-                f"🎯 {F.sc('target')} · {cat.upper()} DB {idx:02d}\n\n"
-                f"{F.sc('this may delete database records.')}\n\n"
+                f"🎯 {F.sc('target')} · all online MEDIA shards\n\n"
+                f"{F.sc('duplicate records in media_files with the same file_id will be deleted across all online MEDIA shards; one record per file_id will be kept.')}\n\n"
                 f"{F.sc('continue?')}"
             )
             kb = InlineKeyboardMarkup([
@@ -2243,22 +2355,47 @@ async def db_router(client: Client, q: CallbackQuery):
                 return await q.answer(f"{F.EMO['check']} {F.sc('done')}")
 
             if action == "dup_remove":
-                audit.log(
-                    q.from_user.id, "duplicate_removal_safe_mode",
-                    target=f"{payload['cat']}:{payload['index']}",
-                    result="SAFE_MODE",
-                )
-                text = (
-                    f"⚠️ <b>{F.fb('DUPLICATE REMOVAL — SAFE MODE')}</b>\n"
+                await q.answer("🧹 Deduplicating indexed files across MEDIA shards…")
+                await _edit(
+                    q,
+                    f"🧹 <b>{F.fb('FILE ID DEDUPLICATION IN PROGRESS')}</b>\n"
                     f"{F.DIV}\n\n"
-                    f"{F.sc('removal is disabled to prevent data loss.')}"
+                    f"{F.sc('checking media_files across all online MEDIA shards; one record per file_id will be kept.')}",
+                    None,
                 )
+                result = await remove_file_id_duplicates(
+                    payload["cat"], payload["index"], q.from_user.id,
+                )
+                if result.get("ok"):
+                    text_lines = [
+                        f"🧹 <b>{F.fb('FILE ID DEDUPLICATION COMPLETE')}</b>",
+                        F.DIV, "",
+                        f"🎯 {F.sc('target')} · all online MEDIA shards",
+                        f"🧩 {F.sc('duplicate file IDs')} · "
+                        f"<b>{FM.num(result['groups'])}</b>",
+                        f"🗑️ {F.sc('extra records removed')} · "
+                        f"<b>{FM.num(result['deleted'])}</b>",
+                        "",
+                        f"✅ {F.sc('one record was retained for every file_id')}",
+                    ]
+                    for item in result["per_collection"][:20]:
+                        text_lines.append(
+                            f"• <code>{esc(item['name'])}</code> · "
+                            f"{FM.num(item['deleted'])} {F.sc('removed')}"
+                        )
+                    text = "\n".join(text_lines)
+                else:
+                    text = (
+                        f"❌ <b>{F.fb('FILE ID DEDUPLICATION INCOMPLETE')}</b>\n"
+                        f"{F.DIV}\n\n"
+                        f"{F.sc('some indexed files could not be processed; see database errors in the admin panel.')}"
+                    )
                 kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         f"{F.EMO['back']} {F.sc('back')}",
-                        callback_data="adm:dbc_main")]])
+                        callback_data=f"adm:dbc_dups:{payload['cat']}:{payload['index']}")]])
                 await _edit(q, text, kb)
-                return await q.answer(F.sc("safe mode"))
+                return
 
         # ─── CANCEL ───
         if parts[1] == "dbc_cancel":

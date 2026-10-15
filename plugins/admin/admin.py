@@ -21,9 +21,8 @@
 #   🔎 Missing          → missing finder
 #   🎯 Flow Editor      → search flow
 #   👥 Groups           → group settings
-#   🚫 Ban / Filter     → ban + filter
 #   🛠️ Maintenance      → toggle
-#   ⚙️ Settings         → bot config
+#   ⚙️ Settings         → settings shortcuts
 #   🔍 PM SEARCH        → pm settings
 #
 # Every panel has ❌ CANCEL button.
@@ -134,6 +133,14 @@ def register_panel(
 
 def unregister_panel(message_id: int) -> None:
     _panels.pop(message_id, None)
+    _panel_revisions[message_id] = _panel_revisions.get(message_id, 0) + 1
+    _last_refresh.pop(message_id, None)
+
+
+async def suspend_panel(message_id: int) -> None:
+    lock = _panel_locks.setdefault(message_id, asyncio.Lock())
+    async with lock:
+        unregister_panel(message_id)
 
 
 def active_panel_count() -> int:
@@ -411,10 +418,6 @@ def _render_main(chat_id: int = 0) -> tuple:
             ),
         ],
         [
-            InlineKeyboardButton(
-                f"🚫 {F.sc('ban / filter')}",
-                callback_data=cb("page", "ban"),
-            ),
             InlineKeyboardButton(
                 f"🛠️ {F.sc('maintenance')}",
                 callback_data=cb("page", "maintenance"),
@@ -937,6 +940,10 @@ async def admin_router(client: Client, q: CallbackQuery):
     parts = str(q.data).split(":")
     action = parts[1] if len(parts) > 1 else ""
 
+    # These callback namespaces are handled by their dedicated routers.
+    if action.startswith(("dbc_", "db_", "sv", "lg", "st", "tk")):
+        return
+
     # ────────── HOME ──────────
     if action == "home":
         chat_id = q.message.chat.id
@@ -1032,13 +1039,6 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
                 f"📌 {F.sc('or /flow to edit search flow per group')}",
             ])
             kb = _back_kb()
-        elif page == "ban":
-            text = "\n".join([
-                f"{F.EMO['warn']} <b>{F.fb('BAN / FILTER')}</b>",
-                F.DIV, "",
-                f"📌 {F.sc('coming soon')}",
-            ])
-            kb = _back_kb()
         elif page == "maintenance":
             text = "\n".join([
                 f"🛠️ <b>{F.fb('MAINTENANCE')}</b>",
@@ -1061,15 +1061,34 @@ async def _open_page(client: Client, q: CallbackQuery, page: str) -> None:
                 f"{F.EMO['gear']} <b>{F.fb('BOT SETTINGS')}</b>",
                 F.DIV, "",
                 f"{F.EMO['info']} {F.sc('edit settings via env')}",
-                f"{F.EMO['info']} {F.sc('or use /flow for search flows')}",
+                f"{F.EMO['info']} {F.sc('use the buttons below for live settings')}",
                 "",
                 F.DIV_S,
-                f"{F.EMO['spark']} <b>{F.sc('quick links')}</b>",
-                f"• /flow — search flow editor",
-                f"• /settings — per-group settings (in group)",
-                f"• /backup — backup panel",
             ])
-            kb = _back_kb()
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"👥 {F.sc('group settings')}",
+                    callback_data=cb("page", "groups"),
+                )],
+                [InlineKeyboardButton(
+                    f"🎯 {F.sc('flow editor')}",
+                    callback_data=cb("page", "flow"),
+                )],
+                [InlineKeyboardButton(
+                    f"💾 {F.sc('backup')}",
+                    callback_data=cb("mod", "backup"),
+                )],
+                [
+                    InlineKeyboardButton(
+                        f"{F.EMO['back']} {F.sc('back')}",
+                        callback_data=cb("home"),
+                    ),
+                    InlineKeyboardButton(
+                        f"{F.EMO['cross']} {F.sc('close')}",
+                        callback_data=cb("close"),
+                    ),
+                ],
+            ])
         else:
             text = f"❓ Unknown page: <code>{page}</code>"
             kb = _back_kb()
@@ -1216,6 +1235,20 @@ def _back_kb() -> InlineKeyboardMarkup:
 
 
 async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
+    if not q.message:
+        return
+    message_id = q.message.id
+    lock = _panel_locks.setdefault(message_id, asyncio.Lock())
+    async with lock:
+        _panel_revisions[message_id] = _panel_revisions.get(message_id, 0) + 1
+        panel = _panels.get(message_id)
+        if panel:
+            panel["builder"] = None
+            panel["last_text"] = text
+        await _safe_edit_unlocked(q, text, kb)
+
+
+async def _safe_edit_unlocked(q: CallbackQuery, text: str, kb) -> None:
     try:
         await q.message.edit_text(
             text,
@@ -1236,6 +1269,8 @@ async def _safe_edit(q: CallbackQuery, text: str, kb) -> None:
 
 _live_task: Optional[asyncio.Task] = None
 _last_refresh: Dict[int, float] = {}
+_panel_revisions: Dict[int, int] = {}
+_panel_locks: Dict[int, asyncio.Lock] = {}
 
 
 async def _live_loop() -> None:
@@ -1262,6 +1297,7 @@ async def _live_loop() -> None:
                     continue
 
                 chat_id = panel["chat_id"]
+                revision = _panel_revisions.get(msg_id, 0)
                 interval = _get_interval(chat_id)
                 if interval <= 0:
                     continue
@@ -1276,18 +1312,26 @@ async def _live_loop() -> None:
                     if not result:
                         continue
                     text, kb = result
-                    if text == panel.get("last_text"):
-                        continue
+                    lock = _panel_locks.setdefault(msg_id, asyncio.Lock())
+                    async with lock:
+                        if (
+                            _panels.get(msg_id) is not panel
+                            or _panel_revisions.get(msg_id, 0) != revision
+                            or panel.get("builder") is not builder
+                        ):
+                            continue
+                        if text == panel.get("last_text"):
+                            continue
 
-                    await _c.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=text,
-                        reply_markup=kb,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                    panel["last_text"] = text
+                        await _c.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=msg_id,
+                            text=text,
+                            reply_markup=kb,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                        panel["last_text"] = text
                 except Exception as e:
                     err = str(e).lower()
                     if "not modified" in err:
@@ -1340,5 +1384,6 @@ __all__ = [
     "is_admin",
     "register_panel",
     "unregister_panel",
+    "suspend_panel",
     "snapshot",
 ]

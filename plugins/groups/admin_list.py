@@ -68,9 +68,14 @@ async def _list_groups() -> List[Dict[str, Any]]:
             cid = d.get("chat_id")
             if not cid:
                 continue
+            title = str(d.get("title") or "").strip()
+            username = str(d.get("username") or "").strip().lstrip("@")
+            if (not title or title.lstrip("-").isdigit()
+                    or title.casefold() in {"group", "channel"}):
+                title = f"@{username}" if username else "Group"
             out.append({
                 "chat_id": int(cid),
-                "title": str(d.get("title") or cid)[:60],
+                "title": title[:60],
                 "username": d.get("username") or "",
                 "kind": "group",
                 "content_mode": str(
@@ -94,9 +99,14 @@ async def _list_channels() -> List[Dict[str, Any]]:
             cid = d.get("chat_id")
             if not cid:
                 continue
+            title = str(d.get("title") or "").strip()
+            username = str(d.get("username") or "").strip().lstrip("@")
+            if (not title or title.lstrip("-").isdigit()
+                    or title.casefold() in {"group", "channel"}):
+                title = f"@{username}" if username else "Channel"
             out.append({
                 "chat_id": int(cid),
-                "title": str(d.get("title") or cid)[:60],
+                "title": title[:60],
                 "username": d.get("username") or "",
                 "kind": "channel",
                 "enabled": bool(d.get("enabled", True)),
@@ -250,7 +260,6 @@ async def render_filter_list(mode: str) -> Tuple[str, InlineKeyboardMarkup]:
             }.get(g.get("content_mode"), "🎬📺")
 
             lines.append(f"{marker} {mode_icon} {F.sc(title)}")
-            lines.append(f"   <code>{cid}</code>")
 
             rows.append([InlineKeyboardButton(
                 f"{marker} {mode_icon} {title}",
@@ -300,7 +309,6 @@ async def _render_channels_list() -> Tuple[str, InlineKeyboardMarkup]:
             title = ch["title"][:36]
             marker = "🟢" if ch.get("enabled", True) else "🔴"
             lines.append(f"{marker} 📢 {F.sc(title)}")
-            lines.append(f"   <code>{cid}</code>")
             rows.append([InlineKeyboardButton(
                 f"{marker} 📢 {title}",
                 callback_data=f"glist:open:{cid}",

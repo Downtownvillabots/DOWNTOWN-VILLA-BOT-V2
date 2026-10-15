@@ -118,9 +118,14 @@ async def _list_groups() -> List[Dict[str, Any]]:
             cid = d.get("chat_id")
             if not cid:
                 continue
+            title = str(d.get("title") or "").strip()
+            username = str(d.get("username") or "").strip().lstrip("@")
+            if (not title or title.lstrip("-").isdigit()
+                    or title.casefold() in {"group", "channel"}):
+                title = f"@{username}" if username else "Group"
             out.append({
                 "chat_id": int(cid),
-                "title": str(d.get("title") or cid)[:60],
+                "title": title[:60],
             })
         return out
     except Exception:
@@ -136,9 +141,14 @@ async def _list_channels() -> List[Dict[str, Any]]:
             cid = d.get("chat_id")
             if not cid:
                 continue
+            title = str(d.get("title") or "").strip()
+            username = str(d.get("username") or "").strip().lstrip("@")
+            if (not title or title.lstrip("-").isdigit()
+                    or title.casefold() in {"group", "channel"}):
+                title = f"@{username}" if username else "Channel"
             out.append({
                 "chat_id": int(cid),
-                "title": str(d.get("title") or cid)[:60],
+                "title": title[:60],
                 "enabled": bool(d.get("enabled", True)),
             })
         return out
@@ -157,7 +167,12 @@ async def _target_label(cat: str, cid: int) -> str:
         for ch in await _list_channels():
             if ch["chat_id"] == cid:
                 return ch["title"]
-    return f"{cat}-{cid}"
+    return {
+        "group": "Group",
+        "channel": "Channel",
+        "pm": "PM Search",
+        "global": "Global Defaults",
+    }.get(cat, "Target")
 
 
 def _flows_for_category(cat: str) -> List[str]:
@@ -290,7 +305,6 @@ async def render_category(cat: str) -> Tuple[str, InlineKeyboardMarkup]:
             title = it["title"]
             marker = "🟢" if it.get("enabled", True) else "🔴"
             text_lines.append(f"{marker} <b>{i:02d}.</b> {F.sc(title[:45])}")
-            text_lines.append(f"   <code>{cid}</code>")
             rows.append([InlineKeyboardButton(
                 f"{marker} {title[:36]}",
                 callback_data=f"adm:flw_target:{cat}:{cid}",
@@ -310,7 +324,6 @@ async def render_target(cat: str, cid: int) -> Tuple[str, InlineKeyboardMarkup]:
 
     text_lines = [
         _header(emoji, f"{cat_label.upper()} · {target[:40]}"),
-        f"🆔 {F.sc('chat id')} · <code>{cid}</code>",
         "",
         f"📌 {F.sc('pick a flow to customize')}",
         "",
@@ -365,7 +378,6 @@ async def render_editor(
 
     text_lines = [
         _header(flow_icon, f"{flow_label.upper()} · {target[:30]}"),
-        f"🆔 <code>{cid}</code>",
         f"📊 {F.sc('enabled')} · <b>{enabled_count}</b> / {len(steps)}",
         "",
         f"📌 {F.sc('tap a step to configure')}",
@@ -934,11 +946,6 @@ async def render_preview(
             + (" · ⏭️" if auto else "")
         )
 
-    text_lines += [
-        "",
-        f"🆔 <code>{cid}</code>",
-    ]
-
     rows = [_back_close(f"adm:flw_edit:{cat}:{cid}:{flow_name}", "back")[0]]
     return "\n".join(text_lines)[:4000], InlineKeyboardMarkup(rows)
 
@@ -1102,6 +1109,7 @@ async def flow_admin_router(client: Client, q: CallbackQuery):
         if action == "cap_edit":
             cat = parts[2]
             cid = int(parts[3])
+            target = await _target_label(cat, cid)
             # Store session so text_input picks it up
             try:
                 from plugins.groups import router as GR
@@ -1109,7 +1117,7 @@ async def flow_admin_router(client: Client, q: CallbackQuery):
             except Exception:
                 pass
             text = "\n".join([
-                _header("✏️", "EDIT CAPTION"),
+                _header("✏️", f"EDIT CAPTION · {target[:30]}"),
                 f"📌 {F.sc('send the new caption')}",
                 f"📌 {F.sc('or send')} <code>-</code> {F.sc('to reset')}",
                 "",
@@ -1121,7 +1129,7 @@ async def flow_admin_router(client: Client, q: CallbackQuery):
             ])
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    f"{F.EMO['cross']} {F.sc('cancel')}",
+                    f"{F.EMO['cross']} {F.sc(f'cancel · {target[:20]}')}",
                     callback_data=f"adm:flw_cap:{cat}:{cid}",
                 ),
             ]])
@@ -1323,8 +1331,10 @@ async def flow_admin_router(client: Client, q: CallbackQuery):
             cat = parts[2]
             cid = int(parts[3])
             flow_name = parts[4]
+            target = await _target_label(cat, cid)
             text = "\n".join([
                 _header("⚠️", "RESET FLOW?"),
+                f"🎯 {F.sc('target')} · <b>{F.sc(target[:40])}</b>",
                 f"{F.EMO['warn']} {F.sc('all custom settings will be lost')}",
                 "",
                 F.DIV_S,
@@ -1335,7 +1345,7 @@ async def flow_admin_router(client: Client, q: CallbackQuery):
                     callback_data=f"adm:flw_rst_do:{cat}:{cid}:{flow_name}",
                 )],
                 [InlineKeyboardButton(
-                    f"{F.EMO['back']} {F.sc('cancel')}",
+                    f"{F.EMO['back']} {F.sc(f'cancel · {target[:20]}')}",
                     callback_data=f"adm:flw_edit:{cat}:{cid}:{flow_name}",
                 )],
             ])
