@@ -1,5 +1,13 @@
+# 🏨 DOWNTOWN VILLA — GROUPS SHARED DELIVERY
 # ============================================================
-# DOWNTOWN VILLA - GROUPS SHARED DELIVERY
+#
+# Builds the file-list message + keyboard with deep-links to PM.
+#
+# Used by:
+#   • groups/movie/handler.py
+#   • groups/series/handler.py
+#   • groups/shared/callbacks.py  (sr:more pagination)
+#
 # ============================================================
 
 from __future__ import annotations
@@ -71,7 +79,8 @@ def clean_display_name(hit: Dict[str, Any], max_len: int = 34) -> str:
     t = _RE_BRACKETS.sub(" ", t)
     t = _RE_JUNK.sub(" ", t)
     t = _RE_SEPARATORS.sub(" ", t)
-    t = _RE_SPACES.sub(" ", t).strip(" -_.|.")
+    t = _RE_SPACES.sub(" ", t).strip(" -_.|·")
+
     if not t:
         fallback = str(hit.get("file_name") or "file")
         t = fallback.split(".")[0]
@@ -198,6 +207,10 @@ def build_file_list_kb(
     return InlineKeyboardMarkup(rows), total_pages, page
 
 
+# ============================================================
+# SECTION 6 — SHOW FILE LIST
+# ============================================================
+
 async def show_file_list(
     target: Any,
     query: str,
@@ -292,8 +305,6 @@ async def show_file_list(
     except Exception as e:
         logger.debug(f"[DELIVERY] show_file_list: {e}")
         return False
-
-
 async def create_session(
     user_id: int,
     chat_id: int,
