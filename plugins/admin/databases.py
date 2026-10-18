@@ -28,6 +28,7 @@ from pyrogram.types import (
 
 from core import config
 from database import db_registry
+from services.atlas_storage import get_disk_space
 from utils import fonts as F
 from utils import format as FM
 from utils import progress as P
@@ -61,11 +62,6 @@ MAX_LAT = 30
 
 DIV = F.DIV
 DIV_S = F.DIV_S
-
-try:
-    DB_CAPACITY_MB = int(getattr(config, "DB_CAPACITY_MB", 512))
-except (TypeError, ValueError):
-    DB_CAPACITY_MB = 512
 
 _SENSITIVE = re.compile(
     r"(token|password|secret|api[_-]?key|api[_-]?hash|session|uri|database_uri|dsn|auth)",
@@ -381,6 +377,7 @@ class StatsManager:
             "collections": 0, "objects": 0,
             "data_size": 0, "storage_size": 0, "index_size": 0,
             "avg_obj": 0, "collection_names": [],
+            "atlas_disk": {"available": False, "reason": "Database is offline"},
         }
         p = await Diagnostics.ping(db)
         if p is None:
@@ -400,6 +397,7 @@ class StatsManager:
 
         out["collection_names"] = await Diagnostics.list_collections(db)
         out["version"] = await Diagnostics.build_version(db)
+        out["atlas_disk"] = await get_disk_space(entry)
         return out
 
     def _totals(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -742,6 +740,19 @@ def _status(items: List[Dict[str, Any]]) -> str:
     return f"🟡 {up}/{len(items)} {F.sc('online')}"
 
 
+def _atlas_disk_line(info: Dict[str, Any]) -> str:
+    disk = info.get("atlas_disk") or {}
+    if not disk.get("available"):
+        value = esc(f"unavailable · {disk.get('reason', 'not reported')}")
+    else:
+        value = (
+            f"{FM.size(disk['free_bytes'])} free · "
+            f"{FM.size(disk['used_bytes'])} used / "
+            f"{FM.size(disk['total_bytes'])} total"
+        )
+    return one_line("Atlas physical disk (not quota)", value, "💽")
+
+
 def _db_block(cat: str, d: Dict[str, Any],
               share_pct: Optional[float] = None) -> str:
     status = "🟢" if d["online"] else "🔴"
@@ -758,20 +769,8 @@ def _db_block(cat: str, d: Dict[str, Any],
         one_line("data", FM.size(d["data_size"]), "📄"),
         one_line("indexes", FM.size(d["index_size"]), "🧩"),
         one_line("collections", FM.num(d["collections"]), "🗂️"),
+        _atlas_disk_line(d),
     ]
-
-    storage = d.get("storage_size") or 0
-    used_mb = storage / (1024 * 1024)
-    cap_pct = min(100.0, (used_mb / DB_CAPACITY_MB) * 100.0) if DB_CAPACITY_MB else 0.0
-    color = P.storage_color(cap_pct)
-    bar = P.bar(cap_pct, "storage", width=BAR_W, show_percent=False)
-
-    lines.append("")
-    lines.append(
-        f"{color} <b>{F.sc('capacity')}</b> · "
-        f"<code>{FM.size(storage)}</code> / <code>{DB_CAPACITY_MB} MB</code>"
-    )
-    lines.append(f"<code>{bar}</code> {cap_pct:.1f}%")
 
     if share_pct is not None:
         lines.append("")
@@ -1049,12 +1048,6 @@ async def view_db(cat: str, index: int):
     overhead = (info["index_size"] / max(1, info["data_size"])) * 100
     eff = (info["data_size"] / max(1, info["storage_size"])) * 100
 
-    storage = info.get("storage_size") or 0
-    used_mb = storage / (1024 * 1024)
-    cap_pct = min(100.0, (used_mb / DB_CAPACITY_MB) * 100.0) if DB_CAPACITY_MB else 0.0
-    color = P.storage_color(cap_pct)
-    cap_bar = P.bar(cap_pct, "storage", width=BAR_W, show_percent=False)
-
     lines = [
         _header(), "",
         f"🗄️ <b>{F.fb(f'{cat.upper()} DATABASE {info['index']:02d}')}</b>",
@@ -1070,10 +1063,7 @@ async def view_db(cat: str, index: int):
         one_line("storage", FM.size(info['storage_size']), "💾"),
         one_line("indexes", FM.size(info['index_size']), "🧩"),
         one_line("avg object", FM.size(int(info['avg_obj'] or 0)), "📐"),
-        "",
-        f"<b>{F.fb('STORAGE CAPACITY')}</b>",
-        f"{color} <code>{FM.size(storage)}</code> / <code>{DB_CAPACITY_MB} MB</code>",
-        f"<code>{cap_bar}</code> {cap_pct:.1f}%",
+        _atlas_disk_line(info),
         "",
         f"<b>{F.fb('PERFORMANCE METRICS')}</b>",
         bar_line("index overhead", overhead, width=10),

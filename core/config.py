@@ -352,6 +352,14 @@ MAX_LIST_ELM: int = env_int("MAX_LIST_ELM", 10)
 # ============================================================
 
 DB_CAPACITY_MB: int = env_int("DB_CAPACITY_MB", 512)
+ATLAS_API_PUBLIC_KEY: str = env_str("ATLAS_API_PUBLIC_KEY")
+ATLAS_API_PRIVATE_KEY: str = env_str("ATLAS_API_PRIVATE_KEY")
+
+
+def atlas_project_id(pool: str, index: int) -> str:
+    """Return a per-shard Atlas project ID, falling back to the shared ID."""
+    specific = env_str(f"ATLAS_PROJECT_ID_{pool.upper()}_{index:02d}")
+    return specific or env_str("ATLAS_PROJECT_ID")
 
 
 # ============================================================
