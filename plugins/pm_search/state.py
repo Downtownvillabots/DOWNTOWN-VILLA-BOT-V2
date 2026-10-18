@@ -22,6 +22,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     "show_quality": True,
     "show_size": True,
     "show_languages": True,
+    "show_file_name": False,
 
     # ── Poster card ──
     "show_poster": True,

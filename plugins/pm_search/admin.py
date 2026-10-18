@@ -167,6 +167,10 @@ async def _render_main() -> tuple:
                 f"{'🟢' if cfg.get('show_languages') else '🔴'} L",
                 callback_data=f"{PFX}:tog:show_languages",
             ),
+            InlineKeyboardButton(
+                f"{'🟢' if cfg.get('show_file_name') else '🔴'} FN",
+                callback_data=f"{PFX}:tog:show_file_name",
+            ),
         ],
         [
             InlineKeyboardButton(
@@ -443,9 +447,14 @@ async def pmsa_router(client: Client, q: CallbackQuery):
                 f"📝 <b>{F.fb('EDIT CAPTION')}</b>",
                 DIV, "",
                 f"📌 {F.sc('placeholders')}:",
-                f"<code>{{title}} {{year}} {{quality}} {{codec}}</code>",
-                f"<code>{{audio}} {{subtitle}} {{size}}</code>",
+                f"<code>{{title}} {{file_name}} {{year}}</code>",
+                f"<code>{{quality}} {{codec}} {{audio}} {{subtitle}} {{size}}</code>",
                 f"<code>{{season}} {{episode}}</code>",
+                "",
+                f"📌 {F.sc('HTML formatting')}: "
+                f"<code>&lt;b&gt;</code> <code>&lt;i&gt;</code> "
+                f"<code>&lt;u&gt;</code> <code>&lt;s&gt;</code> "
+                f"<code>&lt;code&gt;</code> <code>&lt;pre&gt;</code>",
                 "",
                 f"📌 {F.sc('send')} <code>-</code> {F.sc('to reset')}",
             ]
@@ -463,6 +472,7 @@ async def pmsa_router(client: Client, q: CallbackQuery):
             tpl = cfg.get("caption_template") or ""
             sample = {
                 "title": "Karnan", "year": "2021",
+                "file_name": "Karnan.2021.1080p.mkv",
                 "quality": "1080P", "codec": "HEVC",
                 "audio": "Tamil", "subtitle": "English",
                 "size": "1.4 GB", "season": "", "episode": "",

@@ -100,6 +100,10 @@ def file_buttons(
     row: List[InlineKeyboardButton] = []
 
     for i, h in enumerate(hits):
+        file_name = (
+            h.get("file_name") if isinstance(h, dict)
+            else getattr(h, "file_name", "")
+        )
         quality = (
             h.get("quality") if isinstance(h, dict)
             else getattr(h, "quality", "")
@@ -110,11 +114,26 @@ def file_buttons(
         )
         q = str(quality or "").upper()
         s = FM.size_short(file_size)
-        label = f"📁 {offset + i + 1}"
-        if q:
+        label = (
+            f"📁 {str(file_name).strip()}"
+            if cfg.get("show_file_name") and str(file_name or "").strip()
+            else f"📁 {offset + i + 1}"
+        )
+        if cfg.get("show_quality") and q:
             label += f" · {q}"
-        if s:
+        if cfg.get("show_size") and s:
             label += f" · {s}"
+        if cfg.get("show_languages"):
+            languages = (
+                h.get("audio_languages") if isinstance(h, dict)
+                else getattr(h, "audio_languages", None)
+            ) or (
+                h.get("languages") if isinstance(h, dict)
+                else getattr(h, "languages", None)
+            ) or []
+            language_label = ", ".join(str(lang) for lang in languages)
+            if language_label:
+                label += f" · {language_label}"
         if len(label) > 60:
             label = label[:57] + "…"
         row.append(InlineKeyboardButton(

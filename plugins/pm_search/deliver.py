@@ -42,6 +42,7 @@ def _esc(s: Any) -> str:
 def build_caption(hit: Any, cfg: Dict[str, Any]) -> str:
     tpl = cfg.get("caption_template") or ""
     title = _get(hit, "title") or _get(hit, "series_title") or "?"
+    file_name = _get(hit, "file_name") or _get(hit, "filename") or ""
     year = _get(hit, "year") or "—"
     quality = (_get(hit, "quality") or "UNKNOWN").upper()
     codec = (_get(hit, "codec") or "—").upper()
@@ -54,6 +55,8 @@ def build_caption(hit: Any, cfg: Dict[str, Any]) -> str:
     try:
         return tpl.format(
             title=_esc(str(title)[:80]),
+            file_name=_esc(str(file_name)[:160]),
+            filename=_esc(str(file_name)[:160]),
             year=_esc(year),
             quality=_esc(quality),
             codec=_esc(codec),
