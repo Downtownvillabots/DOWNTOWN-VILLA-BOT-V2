@@ -9,8 +9,8 @@
 #   • plugins/indexing/pipeline.py
 #   • plugins/indexing/worker.py
 #
-# Duplicate decisions query file_id and file_unique_id across every MEDIA
-# shard. The in-memory set is an optional cache, never an authority.
+# Duplicate decisions use Telegram's stable file_unique_id across every MEDIA
+# shard. file_id is retained in the public function signature for callers.
 #
 # ============================================================
 
@@ -85,10 +85,9 @@ async def find_exact_file_id(
     entries: Optional[Iterable[Any]] = None,
     file_unique_id: Optional[str] = None,
 ) -> bool:
-    """Search every MEDIA shard by Telegram file_id or stable unique ID."""
-    file_id = str(file_id or "")
+    """Search every MEDIA shard by Telegram's stable unique file ID only."""
     file_unique_id = str(file_unique_id or "")
-    if not file_id and not file_unique_id:
+    if not file_unique_id:
         return False
 
     if entries is None:
@@ -108,18 +107,11 @@ async def find_exact_file_id(
             + ", ".join(sorted(set(offline_labels)))
         )
 
-    queries = []
-    if file_id:
-        queries.extend(({"file_id": file_id}, {"_id": file_id}))
-    if file_unique_id:
-        queries.append({"file_unique_id": file_unique_id})
-    query = queries[0] if len(queries) == 1 else {"$or": queries}
-
     errors = []
     for entry in online_entries:
         try:
             existing = await entry.db["media_files"].find_one(
-                query, {"_id": 1},
+                {"file_unique_id": file_unique_id}, {"_id": 1},
             )
             if existing:
                 return True

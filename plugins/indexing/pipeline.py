@@ -46,6 +46,7 @@ _SUPPORTED = (
     enums.MessageMediaType.VIDEO_NOTE,
     enums.MessageMediaType.STICKER,
 )
+_PAID_MEDIA_TYPES = {"photo", "video", "animation"}
 
 SHARD_CACHE_TTL = 30.0
 
@@ -193,63 +194,94 @@ async def process_message(
     content_mode: str = "both",
 ) -> Dict[str, Any]:
     try:
-        mt = getattr(message, "media", None)
-        if not mt:
-            return {"status": "skipped", "reason": "no media"}
+        media_items = extract_media_items(message)
+        if not media_items:
+            return {"status": "skipped", "reason": "no supported media"}
 
-        if mt not in _SUPPORTED:
-            return {"status": "skipped", "reason": f"unsupported media: {mt}"}
-
-        media = getattr(message, mt.value, None)
-        if not media:
-            return {"status": "skipped", "reason": "no media object"}
-        if not getattr(media, "file_id", None):
-            return {"status": "skipped", "reason": "missing file_id"}
-
-        try:
-            media.file_type = mt.value
-        except Exception:
-            pass
-        try:
-            media.caption = getattr(message, "caption", None)
-        except Exception:
-            pass
-
-        from services.duplicate import file_identity_lock
-        async with file_identity_lock(
-            str(media.file_id),
-            str(getattr(media, "file_unique_id", None) or ""),
-        ):
-            ok, code = await save_file(
-                media,
-                message=message,
-                metadata_source=metadata_source,
-                content_mode=content_mode,
-            )
-
-        if ok and code == 1:
-            from services.duplicate import compute_fingerprint
-            record = _build_record(
-                media,
+        results = [
+            await _process_media_item(
                 message,
-                compute_fingerprint(str(media.file_id)),
+                media,
+                file_type,
                 metadata_source,
+                content_mode,
             )
-            return {"status": "saved", "record": record}
-
-        if ok and code == 0:
-            return {
-                "status": "duplicate",
-                "reason": "same file_id or file_unique_id",
-            }
-        if ok and code == -1:
-            return {"status": "skipped", "reason": "filtered by content mode"}
-
-        return {"status": "error", "reason": f"save_file code={code}"}
+            for media, file_type in media_items
+        ]
+        if len(results) == 1:
+            return results[0]
+        return {"status": "multiple", "results": results}
 
     except Exception as e:
         logger.exception(f"[PIPELINE] crash: {e}")
         return {"status": "error", "reason": str(e)[:200]}
+
+
+def extract_media_items(message) -> List[Tuple[Any, str]]:
+    """Return every indexable attachment, including media inside paid posts."""
+    media_type = getattr(message, "media", None)
+    if not media_type:
+        return []
+
+    if media_type == enums.MessageMediaType.PAID_MEDIA:
+        paid_media = getattr(message, "paid_media", None)
+        items = getattr(paid_media, "extended_media", None) or []
+        return [
+            (item, type(item).__name__.lower())
+            for item in items
+            if type(item).__name__.lower() in _PAID_MEDIA_TYPES
+        ]
+
+    if media_type not in _SUPPORTED:
+        return []
+    media = getattr(message, media_type.value, None)
+    if not media:
+        return []
+    return [(media, media_type.value)]
+
+
+async def _process_media_item(
+    message,
+    media,
+    file_type: str,
+    metadata_source: str,
+    content_mode: str,
+) -> Dict[str, Any]:
+    if not getattr(media, "file_id", None):
+        return {"status": "skipped", "reason": "missing file_id"}
+
+    try:
+        media.file_type = file_type
+        media.caption = getattr(message, "caption", None)
+    except Exception:
+        pass
+
+    from services.duplicate import file_identity_lock
+    async with file_identity_lock(
+        str(media.file_id),
+        str(getattr(media, "file_unique_id", None) or ""),
+    ):
+        ok, code = await save_file(
+            media,
+            message=message,
+            metadata_source=metadata_source,
+            content_mode=content_mode,
+        )
+
+    if ok and code == 1:
+        from services.duplicate import compute_fingerprint
+        record = _build_record(
+            media,
+            message,
+            compute_fingerprint(str(media.file_id)),
+            metadata_source,
+        )
+        return {"status": "saved", "record": record}
+    if ok and code == 0:
+        return {"status": "duplicate", "reason": "same file_unique_id"}
+    if ok and code == -1:
+        return {"status": "skipped", "reason": "filtered by content mode"}
+    return {"status": "error", "reason": f"save_file code={code}"}
 
 
 # ============================================================
@@ -331,7 +363,8 @@ async def save_file(
         document_fields = {
             key: value for key, value in record.items() if key != "_id"
         }
-        document_id = str(file_id)
+        file_unique_id = str(getattr(media, "file_unique_id", None) or "")
+        document_id = file_unique_id or str(file_id)
 
         try:
             await target_db["media_files"].update_one(
@@ -433,21 +466,26 @@ def _build_record(
         or ""
     ).strip()
 
-    if metadata_source == "filename":
+    filename_parsed = _parse(fname)
+    caption_parsed = _parse(caption)
+    source = str(metadata_source or "both").lower()
+    if source == "filename":
+        parsed = filename_parsed
         raw = fname
-    elif metadata_source == "caption":
+    elif source == "caption":
+        parsed = caption_parsed if caption else filename_parsed
         raw = caption or fname
     else:
+        parsed = _merge_parsed_metadata(filename_parsed, caption_parsed)
         raw = " ".join(p for p in (fname, caption) if p).strip()
-
-    parsed = _parse(raw)
 
     chat = getattr(message, "chat", None) if message else None
     source_channel_id = getattr(chat, "id", None) if chat else None
     source_msg_id = getattr(message, "id", None) if message else None
 
-    # ── Compute normalized fields for search ──
     title_clean = parsed["title"] or ""
+    if not title_clean and fname:
+        title_clean = _fallback_title(fname)
     normalized_title = _normalize(title_clean)
 
     # ── Guarantee type is set ──
@@ -463,13 +501,11 @@ def _build_record(
     series_title_val = title_clean if is_series else None
     normalized_series_title = normalized_title if is_series else None
 
-    # If no title could be extracted, fall back to cleaned file_name
-    if not title_clean and fname:
-        title_clean = _fallback_title(fname)
-        normalized_title = _normalize(title_clean)
-
     rec: Dict[str, Any] = {
-        "_id": str(getattr(media, "file_id", "")),
+        "_id": str(
+            getattr(media, "file_unique_id", None)
+            or getattr(media, "file_id", "")
+        ),
         "fingerprint": fingerprint,
 
         "file_id": getattr(media, "file_id", None),
@@ -506,11 +542,51 @@ def _build_record(
         "source_message_id": source_msg_id,
         "caption": caption[:1000],
         "raw_text": raw[:2000],
+        "metadata_source": source,
+        "filename_metadata": _metadata_fields(filename_parsed),
+        "caption_metadata": _metadata_fields(caption_parsed),
 
         "indexed_by": "pipeline",
         "created_at": datetime.utcnow(),
     }
     return rec
+
+
+def _metadata_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: parsed.get(key)
+        for key in (
+            "title", "type", "year", "season", "episode", "quality",
+            "codec", "audio_languages", "subtitle_languages", "has_subtitle",
+        )
+    }
+
+
+def _merge_parsed_metadata(
+    filename: Dict[str, Any],
+    caption: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Prefer filename values, filling missing fields from caption metadata."""
+    merged: Dict[str, Any] = {}
+    for key in ("title", "year", "season", "episode", "quality", "codec"):
+        merged[key] = filename.get(key) or caption.get(key)
+
+    types = {filename.get("type"), caption.get("type")}
+    if "series" in types:
+        merged["type"] = "series"
+    elif "movie" in types:
+        merged["type"] = "movie"
+    else:
+        merged["type"] = "unknown"
+
+    for key in ("languages", "audio_languages", "subtitle_languages"):
+        merged[key] = list(dict.fromkeys(
+            (filename.get(key) or []) + (caption.get(key) or [])
+        ))
+    merged["has_subtitle"] = bool(
+        filename.get("has_subtitle") or caption.get("has_subtitle")
+    )
+    return merged
 
 
 def _fallback_title(fname: str) -> str:

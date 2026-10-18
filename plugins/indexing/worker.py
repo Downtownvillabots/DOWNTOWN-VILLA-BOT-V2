@@ -5,8 +5,7 @@
 # Bots cannot use messages.GetHistory (BOT_METHOD_INVALID).
 # We walk message IDs via get_messages(...) — bot-safe.
 #
-# Duplicate detection checks EVERY online shard directly by
-# the Telegram file_id stored as both _id and file_id.
+# Duplicate detection checks every online shard by file_unique_id.
 #
 # Indexes are auto-created on first run.
 #
@@ -75,9 +74,13 @@ STATE: Dict[str, Any] = {
     "started_at": None,
     "finished_at": None,
     "total_messages": 0,
+    "total_files": 0,
     "current_message_id": 0,
     "end_message_id": 0,
     "scanned_ids": 0,
+    "precounted_ids": 0,
+    "precounting": False,
+    "precount_complete": False,
     "scan_complete": False,
 
     "processed": 0,
@@ -130,8 +133,12 @@ def status() -> Dict[str, Any]:
         "metadata_source": STATE["metadata_source"],
         "job_id": STATE["job_id"],
         "total_messages": STATE["total_messages"],
+        "total_files": STATE["total_files"],
         "current_message_id": STATE["current_message_id"],
         "scanned_ids": STATE["scanned_ids"],
+        "precounted_ids": STATE["precounted_ids"],
+        "precounting": STATE["precounting"],
+        "precount_complete": STATE["precount_complete"],
         "scan_complete": STATE["scan_complete"],
         "processed": STATE["processed"],
         "files_found": STATE["files_found"],
@@ -223,9 +230,13 @@ async def start_worker(
             "started_at": time.time(),
             "finished_at": None,
             "total_messages": 0,
+            "total_files": 0,
             "current_message_id": 0,
             "end_message_id": 0,
             "scanned_ids": 0,
+            "precounted_ids": 0,
+            "precounting": False,
+            "precount_complete": False,
             "scan_complete": False,
             "processed": 0,
             "files_found": 0,
@@ -424,9 +435,28 @@ async def _run() -> None:
                     "start_message_id": start_id,
                     "current_message_id": start_id,
                     "end_message_id": end_id,
+                    "total_messages": total_ids,
                 })
             except Exception as e:
                 logger.warning(f"[INDEX-WORKER] save scan range: {e}")
+
+        if not await _count_files(C, start_id, end_id):
+            await _finalize()
+            return
+
+        logger.info(
+            f"[INDEX-WORKER] 📁 pre-count complete: "
+            f"{STATE['total_files']} media files"
+        )
+        if STATE["run_id"]:
+            try:
+                from plugins.indexing import state as ST
+                await ST.update_job(STATE["run_id"], {
+                    "total_files": STATE["total_files"],
+                    "precount_complete": True,
+                })
+            except Exception as e:
+                logger.warning(f"[INDEX-WORKER] save file count: {e}")
 
         await _walk_messages(C, start_id, end_id)
         await _finalize()
@@ -442,6 +472,7 @@ async def _run() -> None:
     finally:
         STATE["running"] = False
         STATE["paused"] = False
+        STATE["precounting"] = False
         STATE["finished_at"] = time.time()
         logger.info(
             f"[INDEX-WORKER] 🏁 DONE — "
@@ -473,6 +504,102 @@ def _resolve_range() -> Tuple[int, int]:
     return (start, end)
 
 
+async def _count_files(C: Client, start_id: int, end_id: int) -> bool:
+    """Count media-bearing messages before indexing so progress has a real total."""
+    direction = STATE["direction"]
+    step = 1 if direction == "forward" else -1
+
+    if direction == "forward":
+        def stop_when(message_id): return message_id > end_id
+    else:
+        def stop_when(message_id): return message_id < end_id
+
+    STATE["precounting"] = True
+    STATE["precount_complete"] = False
+    STATE["precounted_ids"] = 0
+    STATE["total_files"] = 0
+    next_id = start_id
+    consecutive_failures = 0
+    start_time = time.time()
+    _start_speed_sample()
+
+    while not stop_when(next_id):
+        if time.time() - start_time > MAX_RUNTIME:
+            STATE["last_error"] = "runtime cap reached while counting files"
+            STATE["precounting"] = False
+            return False
+        if STATE["stop_requested"]:
+            STATE["precounting"] = False
+            return False
+
+        while STATE["paused"] and not STATE["stop_requested"]:
+            fu = float(STATE.get("flood_until") or 0.0)
+            if fu and fu <= time.time():
+                STATE["flood_until"] = 0.0
+                STATE["paused"] = False
+                break
+            await asyncio.sleep(1.0)
+
+        if STATE["stop_requested"]:
+            STATE["precounting"] = False
+            return False
+        if STATE["flood_until"] > time.time():
+            await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
+            continue
+
+        batch = []
+        for _ in range(STATE["batch_size"]):
+            if stop_when(next_id):
+                break
+            batch.append(next_id)
+            next_id += step
+        if not batch:
+            break
+
+        messages = await _fetch_messages(C, batch)
+        if messages is None:
+            next_id -= step * len(batch)
+            if STATE["stop_requested"]:
+                fetch_error = str(STATE.get("fetch_error") or "")
+                if fetch_error.startswith("flood too long"):
+                    raise RuntimeError(fetch_error)
+                STATE["precounting"] = False
+                return False
+            consecutive_failures += 1
+            if consecutive_failures >= 5:
+                STATE["precounting"] = False
+                raise RuntimeError(
+                    STATE.get("fetch_error")
+                    or "five consecutive message-fetch failures while counting"
+                )
+            await asyncio.sleep(min(2 ** consecutive_failures, 30))
+            continue
+
+        consecutive_failures = 0
+        STATE["fetch_error"] = None
+        STATE["precounted_ids"] += len(batch)
+        for message in messages:
+            media_items = _pick_media(message)
+            STATE["total_files"] += sum(
+                1 for media in media_items if media.get("file_id")
+            )
+
+        if STATE["precounted_ids"] % max(STATE["batch_size"] * 10, 1) < len(batch):
+            _update_speed()
+            logger.info(
+                f"[INDEX-WORKER] 📊 counting files: "
+                f"{STATE['precounted_ids']}/{STATE['total_messages']} IDs, "
+                f"{STATE['total_files']} files found"
+            )
+        if STATE["delay"] > 0:
+            await asyncio.sleep(STATE["delay"])
+
+    STATE["precounting"] = False
+    STATE["precount_complete"] = True
+    _update_speed()
+    return True
+
+
 # ============================================================
 # WALK
 # ============================================================
@@ -494,9 +621,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
     last_checkpoint = start_id
     last_progress_update = time.time()
     start_time = time.time()
-    _scan_started_at = time.monotonic()
-    _speed_sample_at = _scan_started_at
-    _speed_sample_ids = STATE["scanned_ids"]
+    _start_speed_sample()
     batch_num = 0
     consecutive_failures = 0
 
@@ -597,6 +722,30 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 # ============================================================
 
 async def _process_batch(C: Client, batch: List[int]) -> Optional[bool]:
+    msgs = await _fetch_messages(C, batch)
+    if msgs is None:
+        return None
+
+    valid = [
+        m for m in msgs
+        if m is not None and not getattr(m, "empty", False)
+    ]
+    if not valid:
+        return False
+
+    sem = asyncio.Semaphore(STATE["concurrency"])
+    tasks = [_process_one(C, m, sem) for m in valid]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            STATE["failed"] += 1
+            STATE["last_error"] = str(result)[:200]
+            logger.error(f"[INDEX-WORKER] message task failed: {result}")
+
+    return True
+
+
+async def _fetch_messages(C: Client, batch: List[int]):
     try:
         msgs = await C.get_messages(STATE["channel_id"], message_ids=batch)
         if not isinstance(msgs, list):
@@ -621,23 +770,10 @@ async def _process_batch(C: Client, batch: List[int]) -> Optional[bool]:
         logger.exception(f"[INDEX-WORKER] get_messages failed: {e}")
         return None
 
-    valid = [
+    return [
         m for m in msgs
         if m is not None and not getattr(m, "empty", False)
     ]
-    if not valid:
-        return False
-
-    sem = asyncio.Semaphore(STATE["concurrency"])
-    tasks = [_process_one(C, m, sem) for m in valid]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for result in results:
-        if isinstance(result, Exception):
-            STATE["failed"] += 1
-            STATE["last_error"] = str(result)[:200]
-            logger.error(f"[INDEX-WORKER] message task failed: {result}")
-
-    return True
 
 
 async def _process_one(C: Client, msg, sem: asyncio.Semaphore) -> None:
@@ -649,22 +785,23 @@ async def _process_one(C: Client, msg, sem: asyncio.Semaphore) -> None:
 
 async def _handle_message(C: Client, msg) -> None:
     STATE["processed"] += 1
-    tracked_file = False
+    tracked_files = 0
 
     try:
-        media = _pick_media(msg)
-        if not media:
+        media_items = _pick_media(msg)
+        if not media_items:
             STATE["skipped_no_media"] += 1
             return
 
-        file_id = media.get("file_id")
-        if not file_id:
+        tracked_files = sum(
+            1 for media in media_items if media.get("file_id")
+        )
+        if not tracked_files:
             STATE["skipped_no_file_id"] += 1
             return
 
-        tracked_file = True
-        STATE["files_found"] += 1
-        STATE["dups_checked"] += 1
+        STATE["files_found"] += tracked_files
+        STATE["dups_checked"] += tracked_files
 
         try:
             from plugins.indexing.pipeline import process_message
@@ -680,46 +817,13 @@ async def _handle_message(C: Client, msg) -> None:
             STATE["last_error"] = str(e)[:200]
             return
 
-        status = result.get("status")
-
-        if status == "saved":
-            STATE["saved"] += 1
-            rec = result.get("record") or {}
-            rtype = str(rec.get("type") or "").lower()
-            title_dbg = (
-                rec.get("title")
-                or rec.get("series_title")
-                or rec.get("file_name")
-                or "?"
-            )
-            if rtype == "movie":
-                STATE["movies"] += 1
-            elif rtype == "series":
-                STATE["series"] += 1
-            logger.info(
-                f"[INDEX-WORKER] ✅ SAVED msg={msg.id} "
-                f"type={rtype or 'unknown'} "
-                f"title='{str(title_dbg)[:60]}'"
-            )
-        elif status == "duplicate":
-            STATE["duplicate_id"] += 1
-            logger.info(
-                f"[INDEX-WORKER] ♻️ DUP msg={msg.id} "
-                f"file_id={file_id[:30]}..."
-            )
-        elif status == "skipped":
-            reason = str(result.get("reason") or "")
-            if "file_id" in reason:
-                STATE["skipped_no_file_id"] += 1
-            elif "content mode" not in reason:
-                STATE["skipped_no_media"] += 1
-        else:
-            STATE["failed"] += 1
-            STATE["last_error"] = str(result.get("reason") or "?")[:200]
-            logger.error(
-                f"[INDEX-WORKER] ❌ save failed msg={msg.id}: "
-                f"{STATE['last_error']}"
-            )
+        results = (
+            result.get("results", [])
+            if result.get("status") == "multiple"
+            else [result]
+        )
+        for item_result in results:
+            _record_result(msg, item_result)
 
         if STATE["processed"] % SUMMARY_EVERY == 0:
             logger.info(
@@ -734,31 +838,74 @@ async def _handle_message(C: Client, msg) -> None:
         STATE["last_error"] = str(e)[:200]
         logger.exception(f"[INDEX-WORKER] message handler failed: {e}")
     finally:
-        if tracked_file:
-            STATE["files_completed"] += 1
+        STATE["files_completed"] += tracked_files
+
+
+def _record_result(msg, result: Dict[str, Any]) -> None:
+    status = result.get("status")
+    if status == "saved":
+        STATE["saved"] += 1
+        rec = result.get("record") or {}
+        rtype = str(rec.get("type") or "").lower()
+        title_dbg = (
+            rec.get("title")
+            or rec.get("series_title")
+            or rec.get("file_name")
+            or "?"
+        )
+        if rtype == "movie":
+            STATE["movies"] += 1
+        elif rtype == "series":
+            STATE["series"] += 1
+        logger.info(
+            f"[INDEX-WORKER] ✅ SAVED msg={msg.id} "
+            f"type={rtype or 'unknown'} "
+            f"title='{str(title_dbg)[:60]}'"
+        )
+    elif status == "duplicate":
+        STATE["duplicate_id"] += 1
+        logger.info(f"[INDEX-WORKER] ♻️ DUP msg={msg.id}")
+    elif status == "skipped":
+        reason = str(result.get("reason") or "")
+        if "file_id" in reason:
+            STATE["skipped_no_file_id"] += 1
+        elif "content mode" not in reason:
+            STATE["skipped_no_media"] += 1
+    else:
+        STATE["failed"] += 1
+        STATE["last_error"] = str(result.get("reason") or "?")[:200]
+        logger.error(
+            f"[INDEX-WORKER] ❌ save failed msg={msg.id}: "
+            f"{STATE['last_error']}"
+        )
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def _pick_media(msg) -> Optional[Dict[str, Any]]:
+def _pick_media(msg) -> List[Dict[str, Any]]:
     try:
-        for attr in (
-            "video", "document", "audio", "animation", "photo",
-            "voice", "video_note", "sticker",
-        ):
-            media = getattr(msg, attr, None)
-            if media:
-                return {"file_id": media.file_id}
+        from plugins.indexing.pipeline import extract_media_items
+        return [
+            {
+                "file_id": getattr(media, "file_id", None),
+                "file_unique_id": getattr(media, "file_unique_id", None),
+                "file_type": file_type,
+            }
+            for media, file_type in extract_media_items(msg)
+        ]
     except Exception:
-        pass
-    return None
+        logger.exception("[INDEX-WORKER] media extraction failed")
+        return []
 
 
-async def _is_exact_duplicate(file_id: str) -> bool:
+async def _is_exact_duplicate(
+    file_id: str,
+    file_unique_id: Optional[str] = None,
+) -> bool:
     from services.duplicate import find_exact_file_id
-    return await find_exact_file_id(file_id)
+    return await find_exact_file_id(file_id, file_unique_id=file_unique_id)
 
 
 def _update_speed() -> None:
@@ -769,21 +916,35 @@ def _update_speed() -> None:
             return
         now = time.monotonic()
         elapsed = max(0.001, now - _speed_sample_at)
-        scanned = int(STATE["scanned_ids"])
-        delta = max(0, scanned - _speed_sample_ids)
+        progress = (
+            int(STATE["precounted_ids"])
+            if STATE["precounting"]
+            else int(STATE["files_completed"])
+            if STATE["precount_complete"]
+            else int(STATE["scanned_ids"])
+        )
+        delta = max(0, progress - _speed_sample_ids)
         _speed_sample_at = now
-        _speed_sample_ids = scanned
+        _speed_sample_ids = progress
 
-        total_ids = int(STATE["total_messages"])
-        remaining_ids = max(0, total_ids - int(STATE["scanned_ids"]))
         STATE["speed"] = delta / elapsed
+        if STATE["precounting"]:
+            total = int(STATE["total_messages"])
+            completed = int(STATE["precounted_ids"])
+        elif STATE["precount_complete"]:
+            total = int(STATE["total_files"])
+            completed = int(STATE["files_completed"])
+        else:
+            total = int(STATE["total_messages"])
+            completed = int(STATE["scanned_ids"])
+        remaining = max(0, total - completed)
         if STATE["scan_complete"]:
             STATE["eta_seconds"] = 0.0
             STATE["eta_text"] = "done"
         elif STATE["paused"] or STATE["flood_until"] > time.time():
             STATE["eta_text"] = "paused"
-        elif remaining_ids > 0 and STATE["speed"] > 0:
-            eta_seconds = remaining_ids / STATE["speed"]
+        elif remaining > 0 and STATE["speed"] > 0:
+            eta_seconds = remaining / STATE["speed"]
             STATE["eta_seconds"] = eta_seconds
             STATE["eta_text"] = FM.duration_short(max(1, int(eta_seconds)))
         else:
@@ -791,6 +952,19 @@ def _update_speed() -> None:
             STATE["eta_text"] = "estimating scan rate…"
     except Exception:
         logger.exception("[INDEX-WORKER] progress estimate failed")
+
+
+def _start_speed_sample() -> None:
+    global _scan_started_at, _speed_sample_at, _speed_sample_ids
+    _scan_started_at = time.monotonic()
+    _speed_sample_at = _scan_started_at
+    _speed_sample_ids = (
+        int(STATE["precounted_ids"])
+        if STATE["precounting"]
+        else int(STATE["files_completed"])
+        if STATE["precount_complete"]
+        else int(STATE["scanned_ids"])
+    )
 
 
 async def _save_checkpoint(current_msg_id: int) -> None:
@@ -820,6 +994,7 @@ async def _finalize(status: Optional[str] = None) -> None:
         await ST.set_status(STATE["run_id"], status, STATE["last_error"])
         await ST.update_stats(STATE["run_id"], {
             "processed": STATE["processed"],
+            "total_files": STATE["total_files"],
             "files_found": STATE["files_found"],
             "files_completed": STATE["files_completed"],
             "saved": STATE["saved"],

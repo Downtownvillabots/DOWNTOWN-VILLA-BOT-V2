@@ -552,12 +552,11 @@ confirms = Confirmations()
 # ============================================================
 
 async def _scan_media_file_identity_duplicates(entries, remove: bool = False):
-    """Find repeated file_id/file_unique_id identities across all MEDIA shards."""
+    """Find repeated Telegram file_unique_id values across MEDIA shards."""
     offline = [entry.label for entry in entries if not entry.online]
     if offline:
         raise RuntimeError(f"MEDIA shard(s) offline: {', '.join(offline)}")
 
-    seen_file_ids = set()
     seen_unique_ids = set()
     duplicate_ids: Dict[int, List[Any]] = {}
     per_shard: Dict[int, Dict[str, Any]] = {}
@@ -567,26 +566,16 @@ async def _scan_media_file_identity_duplicates(entries, remove: bool = False):
         collection = entry.db["media_files"]
         cursor = collection.find(
             {},
-            {"_id": 1, "file_id": 1, "file_unique_id": 1},
+            {"_id": 1, "file_unique_id": 1},
         ).sort("_id", 1)
         async for doc in cursor:
-            file_id = doc.get("file_id")
             unique_id = doc.get("file_unique_id")
-            file_id = file_id if isinstance(file_id, str) else ""
-            document_id = doc.get("_id")
-            document_id = document_id if isinstance(document_id, str) else ""
             unique_id = unique_id if isinstance(unique_id, str) else ""
-            file_id_values = {identity for identity in (file_id, document_id) if identity}
-            if not file_id_values and not unique_id:
+            if not unique_id:
                 continue
 
-            is_duplicate = (
-                bool(file_id_values & seen_file_ids)
-                or (bool(unique_id) and unique_id in seen_unique_ids)
-            )
-            seen_file_ids.update(file_id_values)
-            if unique_id:
-                seen_unique_ids.add(unique_id)
+            is_duplicate = unique_id in seen_unique_ids
+            seen_unique_ids.add(unique_id)
 
             if not is_duplicate:
                 continue
@@ -646,7 +635,7 @@ async def duplicate_scan(cat: str, index: int) -> Dict[str, Any]:
         "ok": True,
         "total": result["duplicates"],
         "per_collection": result["per_shard"],
-        "key_used": ["file_id", "file_unique_id"],
+        "key_used": ["file_unique_id"],
     }
 
 
@@ -1589,9 +1578,9 @@ async def view_dups(cat: str, index: int):
         F.DIV_S,
         "",
         f"Press <b>{F.sc('start scan')}</b> to scan media_files across all online MEDIA shards.",
-        f"Keys checked · <code>file_id</code> OR <code>file_unique_id</code>",
+        f"Key checked · <code>file_unique_id</code>",
         "",
-        f"⚠️ {F.sc('scan is read-only. Clear removes extra media_files records matching file_id OR file_unique_id across all online MEDIA shards, keeping one record per Telegram file identity, after 3-step confirmation.')}",
+        f"⚠️ {F.sc('scan is read-only. Clear removes extra media_files records with a matching file_unique_id across all online MEDIA shards, after 3-step confirmation.')}",
     ]
     return "\n".join(lines), kb_dups(cat, index)
 
@@ -1631,7 +1620,7 @@ async def view_dup_scan(cat: str, index: int):
 async def remove_file_identity_duplicates(
     cat: str, index: int, actor_id: int = 0,
 ) -> Dict[str, Any]:
-    """Keep one record per Telegram file identity across all MEDIA shards."""
+    """Keep one record per Telegram file_unique_id across all MEDIA shards."""
     if cat != "media":
         return {
             "ok": False,
@@ -2220,7 +2209,7 @@ async def db_router(client: Client, q: CallbackQuery):
                 f"⚠️ <b>{F.fb('DUPLICATE REMOVAL — STEP 1/3')}</b>\n"
                 f"{F.DIV}\n\n"
                 f"🎯 {F.sc('target')} · all online MEDIA shards\n\n"
-                f"{F.sc('duplicate records in media_files matching file_id OR file_unique_id will be deleted across all online MEDIA shards; one record per Telegram file identity will be kept.')}\n\n"
+                f"{F.sc('duplicate records in media_files with a matching file_unique_id will be deleted across all online MEDIA shards; one record per unique file ID will be kept.')}\n\n"
                 f"{F.sc('continue?')}"
             )
             kb = InlineKeyboardMarkup([
@@ -2360,7 +2349,7 @@ async def db_router(client: Client, q: CallbackQuery):
                     q,
                     f"🧹 <b>{F.fb('TELEGRAM FILE DEDUPLICATION IN PROGRESS')}</b>\n"
                     f"{F.DIV}\n\n"
-                    f"{F.sc('checking media_files across all online MEDIA shards using file_id OR file_unique_id; one record per Telegram file identity will be kept.')}",
+                    f"{F.sc('checking media_files across all online MEDIA shards by file_unique_id; one record per unique file ID will be kept.')}",
                     None,
                 )
                 result = await remove_file_identity_duplicates(
@@ -2376,7 +2365,7 @@ async def db_router(client: Client, q: CallbackQuery):
                         f"🗑️ {F.sc('extra records removed')} · "
                         f"<b>{FM.num(result['deleted'])}</b>",
                         "",
-                        f"✅ {F.sc('one record was retained per Telegram file identity')}",
+                        f"✅ {F.sc('one record was retained per Telegram file_unique_id')}",
                     ]
                     for item in result["per_collection"][:20]:
                         text_lines.append(

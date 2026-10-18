@@ -109,8 +109,8 @@ async def cmd_dbg(client: Client, message: Message):
                 f"   fp(sample.file_id) = <code>{real_fp}</code>"
             )
             lines.append(
-                f"   sample._id == file_id? "
-                f"<b>{str(sample.get('_id')) == str(sample.get('file_id'))}</b>"
+                f"   sample._id == file_unique_id? "
+                f"<b>{str(sample.get('_id')) == str(sample.get('file_unique_id'))}</b>"
             )
             lines.append(
                 f"   fingerprint matches? "
@@ -122,18 +122,21 @@ async def cmd_dbg(client: Client, message: Message):
     # ── 5. Dedup test
     lines.append("")
     lines.append("♻️ <b>DEDUP TEST</b>")
-    if sample.get("file_id"):
+    if sample.get("file_id") and sample.get("file_unique_id"):
         try:
             from plugins.indexing.worker import _is_exact_duplicate
-            result = await _is_exact_duplicate(str(sample["file_id"]))
+            result = await _is_exact_duplicate(
+                str(sample["file_id"]),
+                str(sample["file_unique_id"]),
+            )
             lines.append(
-                f"   _is_exact_duplicate(sample) = "
+                f"   file_unique_id duplicate = "
                 f"<b>{result}</b> (expect: True)"
             )
         except Exception as e:
             lines.append(f"   ❌ {e}")
     else:
-        lines.append("   ⚪ no sample to test")
+        lines.append("   ⚪ sample has no file_unique_id")
 
     # ── 6. Bloom stats
     lines.append("")

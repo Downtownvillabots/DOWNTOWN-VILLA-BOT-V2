@@ -39,6 +39,7 @@ def _coll():
 def _empty_stats() -> Dict[str, int]:
     return {
         "processed": 0,
+        "total_files": 0,
         "files_found": 0,
         "files_completed": 0,
         "saved": 0,

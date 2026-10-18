@@ -5,7 +5,7 @@
 # Runs when new messages arrive in watched channels.
 #
 # RULE (LOCKED):
-#   • Only skip if SAME file_id exists
+#   • Only skip if the same file_unique_id exists
 #   • Everything else is imported silently
 #
 # Metadata source is read from bot_settings.indexing_default.
@@ -248,8 +248,8 @@ async def auto_index_handler(client: Client, message):
 
 async def _handle(client: Client, message) -> None:
     try:
-        file_id = _extract_file_id(message)
-        if not file_id:
+        media_items = _extract_media_items(message)
+        if not any(item.get("file_id") for item in media_items):
             STATE["skipped_no_file_id"] += 1
             return
 
@@ -268,35 +268,13 @@ async def _handle(client: Client, message) -> None:
             STATE["last_error"] = str(e)[:200]
             return
 
-        status = result.get("status")
-
-        if status == "saved":
-            STATE["saved"] += 1
-            rec = result.get("record") or {}
-            rtype = str(rec.get("type") or "").lower()
-            if rtype == "movie":
-                STATE["movies"] += 1
-            elif rtype == "series":
-                STATE["series"] += 1
-            logger.info(
-                f"[AUTO-INDEX] ✅ msg={getattr(message, 'id', '?')} "
-                f"title='{rec.get('title') or rec.get('series_title') or '?'}'"
-            )
-        elif status == "duplicate":
-            STATE["duplicate_id"] += 1
-        elif status == "skipped":
-            reason = str(result.get("reason") or "")
-            if "file_id" in reason:
-                STATE["skipped_no_file_id"] += 1
-            else:
-                STATE["skipped_no_media"] += 1
-        else:
-            STATE["failed"] += 1
-            STATE["last_error"] = str(result.get("reason") or "?")[:200]
-            logger.error(
-                f"[AUTO-INDEX] failed msg={getattr(message, 'id', '?')}: "
-                f"{STATE['last_error']}"
-            )
+        results = (
+            result.get("results", [])
+            if result.get("status") == "multiple"
+            else [result]
+        )
+        for item_result in results:
+            _record_result(message, item_result)
     except Exception as e:
         STATE["failed"] += 1
         STATE["last_error"] = str(e)[:200]
@@ -334,37 +312,75 @@ def _is_recent(message) -> bool:
 
 def _has_media(message) -> bool:
     try:
-        return bool(
-            getattr(message, "video", None)
-            or getattr(message, "document", None)
-            or getattr(message, "audio", None)
-            or getattr(message, "animation", None)
-            or getattr(message, "photo", None)
-            or getattr(message, "voice", None)
-            or getattr(message, "video_note", None)
-            or getattr(message, "sticker", None)
-        )
+        return bool(_extract_media_items(message))
     except Exception:
         return False
 
 
 def _extract_file_id(message) -> Optional[str]:
     try:
-        for attr in (
-            "video", "document", "audio", "animation", "photo",
-            "voice", "video_note", "sticker",
-        ):
-            media = getattr(message, attr, None)
-            if media:
-                return media.file_id
+        return next(
+            (
+                item["file_id"]
+                for item in _extract_media_items(message)
+                if item.get("file_id")
+            ),
+            None,
+        )
     except Exception:
-        pass
+        logger.exception("[AUTO-INDEX] media extraction failed")
     return None
 
 
-async def _is_exact_duplicate(file_id: str) -> bool:
+def _extract_media_items(message) -> List[Dict[str, Any]]:
+    from plugins.indexing.pipeline import extract_media_items
+    return [
+        {
+            "file_id": getattr(media, "file_id", None),
+            "file_unique_id": getattr(media, "file_unique_id", None),
+            "file_type": file_type,
+        }
+        for media, file_type in extract_media_items(message)
+    ]
+
+
+def _record_result(message, result: Dict[str, Any]) -> None:
+    status = result.get("status")
+    if status == "saved":
+        STATE["saved"] += 1
+        rec = result.get("record") or {}
+        rtype = str(rec.get("type") or "").lower()
+        if rtype == "movie":
+            STATE["movies"] += 1
+        elif rtype == "series":
+            STATE["series"] += 1
+        logger.info(
+            f"[AUTO-INDEX] ✅ msg={getattr(message, 'id', '?')} "
+            f"title='{rec.get('title') or rec.get('series_title') or '?'}'"
+        )
+    elif status == "duplicate":
+        STATE["duplicate_id"] += 1
+    elif status == "skipped":
+        reason = str(result.get("reason") or "")
+        if "file_id" in reason:
+            STATE["skipped_no_file_id"] += 1
+        else:
+            STATE["skipped_no_media"] += 1
+    else:
+        STATE["failed"] += 1
+        STATE["last_error"] = str(result.get("reason") or "?")[:200]
+        logger.error(
+            f"[AUTO-INDEX] failed msg={getattr(message, 'id', '?')}: "
+            f"{STATE['last_error']}"
+        )
+
+
+async def _is_exact_duplicate(
+    file_id: str,
+    file_unique_id: Optional[str] = None,
+) -> bool:
     from services.duplicate import find_exact_file_id
-    return await find_exact_file_id(file_id)
+    return await find_exact_file_id(file_id, file_unique_id=file_unique_id)
 
 
 def snapshot() -> Dict[str, Any]:

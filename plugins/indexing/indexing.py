@@ -230,6 +230,10 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     checked = int(w.get("dups_checked", 0))
     files_found = int(w.get("files_found", 0))
     files_completed = int(w.get("files_completed", 0))
+    total_files = int(w.get("total_files", 0))
+    precounting = bool(w.get("precounting"))
+    precount_complete = bool(w.get("precount_complete"))
+    precounted_ids = int(w.get("precounted_ids", 0))
     skipped = int(w.get("skipped_no_media", 0))
     failed = int(w.get("failed", 0))
     movies = int(w.get("movies", 0))
@@ -242,12 +246,36 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     if started:
         elapsed_str = FM.duration_short(time.time() - started)
 
-    pct = (
-        min(100.0, scanned / total_ids * 100)
-        if total_ids else 0.0
-    )
+    if precounting:
+        pct = min(100.0, precounted_ids / total_ids * 100) if total_ids else 0.0
+        progress_label = "counting files"
+        progress_detail = (
+            f"{FM.num(precounted_ids)} / {FM.num(total_ids)} "
+            f"{F.sc('message IDs checked')}"
+        )
+    elif precount_complete and total_files:
+        pct = min(100.0, files_completed / total_files * 100)
+        progress_label = "indexing files"
+        progress_detail = (
+            f"{FM.num(files_completed)} / {FM.num(total_files)} "
+            f"{F.sc('files completed')}"
+        )
+    elif w.get("scan_complete"):
+        pct = 100.0
+        progress_label = "indexing files"
+        progress_detail = (
+            f"{FM.num(files_completed)} / {FM.num(total_files)} "
+            f"{F.sc('files completed')}"
+        )
+    else:
+        pct = min(100.0, scanned / total_ids * 100) if total_ids else 0.0
+        progress_label = "indexing files"
+        progress_detail = (
+            f"{FM.num(scanned)} / {FM.num(total_ids)} "
+            f"{F.sc('message IDs checked')}"
+        )
 
-    bar = P.bar(pct, "indexing", width=14, show_percent=False)
+    bar = P.bar(pct, progress_label, width=14, show_percent=False)
     last_error = str(w.get("last_error") or w.get("fetch_error") or "")
 
     return [
@@ -255,8 +283,10 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
         F.DIV_S, "",
         f"<code>{bar}</code> {pct:.0f}%",
-        f"📁 {F.sc('files completed')} · <b>{FM.num(files_completed)}</b>",
+        f"📁 {F.sc('files completed')} · "
+        f"<b>{FM.num(files_completed)} / {FM.num(total_files)}</b>",
         f"🔎 {F.sc('files found')} · <b>{FM.num(files_found)}</b>",
+        f"📊 {F.sc('progress')} · {progress_detail}",
         f"📍 {F.sc('current message id')} · <code>{current_id:,}</code>",
         f"🗺️ {F.sc('channel scan')} · "
         f"<b>{FM.num(scanned)}</b> / <b>{FM.num(total_ids)}</b> "
@@ -283,7 +313,8 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
         f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
         "",
-        f"⚡ {F.sc('scan rate')} · <b>{w.get('speed', 0):.1f} IDs/s</b>",
+        f"⚡ {F.sc('scan rate')} · <b>{w.get('speed', 0):.1f} "
+        f"{'IDs/s' if precounting else 'files/s'}</b>",
         f"⏱️ {F.sc('eta')} · <b>{eta_text}</b>",
         *([f"⚠️ {F.sc('last error')} · "
            f"<code>{html_escape(last_error[:180])}</code>"] if last_error else []),
@@ -305,6 +336,8 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     series = int(w.get("series", 0))
     processed = int(w.get("processed", 0))
     scanned = int(w.get("scanned_ids", 0))
+    total_files = int(w.get("total_files", 0))
+    files_completed = int(w.get("files_completed", 0))
 
     started = w.get("started_at") or 0
     finished = w.get("finished_at") or time.time()
@@ -316,11 +349,10 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     scanned = int(w.get("scanned_ids", 0))
     pct = (
         100.0 if w.get("scan_complete")
-        else min(100.0, scanned / total_ids * 100) if total_ids else 0.0
+        else min(100.0, files_completed / total_files * 100)
+        if total_files else 0.0
     )
     bar = P.bar(pct, "indexing", width=14, show_percent=False)
-
-    total_files = int(w.get("files_completed", saved + dup + failed))
 
     lines = [
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
@@ -339,8 +371,9 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         f"<b>{FM.num(scanned)}</b> / <b>{FM.num(total_ids)}</b> "
         f"{F.sc('message IDs')}",
         f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
-        f"📁 {F.sc('files found')} · "
-        f"<b>{FM.num(int(w.get('files_found', total_files)))}</b>",
+        f"📁 {F.sc('files to index')} · <b>{FM.num(total_files)}</b>",
+        f"📁 {F.sc('files completed')} · "
+        f"<b>{FM.num(files_completed)} / {FM.num(total_files)}</b>",
         "",
         F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
@@ -349,7 +382,8 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
         "",
-        f"📁 {F.sc('total files')} · <b>{FM.num(total_files)}</b>",
+        f"📁 {F.sc('files found')} · "
+        f"<b>{FM.num(int(w.get('files_found', total_files)))}</b>",
         "",
         F.DIV_S,
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
@@ -658,7 +692,7 @@ async def _build_step_metadata_source(uid: int) -> Tuple[str, InlineKeyboardMark
         f"📄📝 {F.sc('both')}          — merge (recommended)",
         "",
         F.DIV_S,
-        f"📌 {F.sc('both: filename first, caption fills gaps')}",
+        f"📌 {F.sc('both: compare and merge filename + caption metadata')}",
         "",
         f"🎯 {F.sc('current')} · <b>{current}</b>",
     ]
@@ -714,7 +748,7 @@ async def _build_step_advanced(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"⚡ {F.sc('concurrency')} · <b>{conc}</b>",
         f"⏱️ {F.sc('delay')} · <b>{delay}s</b>",
         f"📄 {F.sc('metadata')} · <b>{meta_src}</b>",
-        f"🧹 {F.sc('skip same Telegram file identity (file_id or file_unique_id)')} · 🟢",
+        f"🧹 {F.sc('skip duplicates only when file_unique_id matches')} · 🟢",
         f"🛡️ {F.sc('auto-pause flood')} · "
         f"{'🟢' if auto_pause else '🔴'}",
         "",
@@ -820,7 +854,7 @@ async def _build_confirm(uid: int) -> Tuple[str, InlineKeyboardMarkup]:
         f"📦 {F.sc('batch')} · <b>{data.get('batch_size', 100)}</b>",
         f"⚡ {F.sc('conc')} · <b>{data.get('concurrency', 20)}</b>",
         f"⏱️ {F.sc('delay')} · <b>{data.get('delay', 0.3)}s</b>",
-        f"🧹 {F.sc('skip same Telegram file identity (file_id or file_unique_id)')} · 🟢",
+        f"🧹 {F.sc('skip duplicates only when file_unique_id matches')} · 🟢",
         "",
         F.DIV_S,
         f"{F.EMO['spark']} <b>{F.sc('ready to start')}</b>",
@@ -978,7 +1012,7 @@ async def _build_duplicates() -> Tuple[str, InlineKeyboardMarkup]:
         "",
         F.DIV_S,
         f"✅ {F.sc('import every file')}",
-        f"⏭️ {F.sc('check file_id and file_unique_id across every media shard')}",
+        f"⏭️ {F.sc('check matching file_unique_id across every media shard')}",
         f"🚫 {F.sc('never skip for missing metadata')}",
     ]
     rows = [[
@@ -1220,7 +1254,7 @@ async def router_handler(client: Client, q: CallbackQuery):
             text, kb = await _build_step_advanced(uid)
             await _safe_edit(q, text, kb)
             return await q.answer(
-                "Same file_id entries are always skipped.",
+                "Only matching file_unique_id entries are skipped.",
                 show_alert=True,
             )
 
@@ -1392,7 +1426,7 @@ async def router_handler(client: Client, q: CallbackQuery):
 
             bar = P.bar(100, "indexing", width=14, show_percent=False)
 
-            total_files = saved + dup + failed
+            total_files = int(w.get("total_files", saved + dup + failed))
 
             report_lines = [
                 f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
