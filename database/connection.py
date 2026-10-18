@@ -88,7 +88,11 @@ def _pool_config(pool: str) -> PoolConfig:
     prefix = pool.upper()
     threshold = config.env_int(
         f"{prefix}_THRESHOLD_MB",
-        DEFAULT_THRESHOLDS.get(pool, 400),
+        (
+            config.INDEXING_THRESHOLD_MB
+            if pool == "media"
+            else DEFAULT_THRESHOLDS.get(pool, 400)
+        ),
     )
     db_name = getattr(
         config.DatabaseConfig,
