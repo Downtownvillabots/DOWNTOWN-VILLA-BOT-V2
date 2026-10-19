@@ -12,6 +12,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from utils import fonts as F
 from utils import format as FM
+from utils.file_names import file_button_label
 from plugins.pm_search import enrich as IE
 
 logger = logging.getLogger(__name__)
@@ -104,38 +105,11 @@ def file_buttons(
             h.get("file_name") if isinstance(h, dict)
             else getattr(h, "file_name", "")
         )
-        quality = (
-            h.get("quality") if isinstance(h, dict)
-            else getattr(h, "quality", "")
-        )
         file_size = (
             h.get("file_size", 0) if isinstance(h, dict)
             else getattr(h, "file_size", 0)
         )
-        q = str(quality or "").upper()
-        s = FM.size_short(file_size)
-        label = (
-            f"📁 {str(file_name).strip()}"
-            if cfg.get("show_file_name") and str(file_name or "").strip()
-            else f"📁 {offset + i + 1}"
-        )
-        if cfg.get("show_quality") and q:
-            label += f" · {q}"
-        if cfg.get("show_size") and s:
-            label += f" · {s}"
-        if cfg.get("show_languages"):
-            languages = (
-                h.get("audio_languages") if isinstance(h, dict)
-                else getattr(h, "audio_languages", None)
-            ) or (
-                h.get("languages") if isinstance(h, dict)
-                else getattr(h, "languages", None)
-            ) or []
-            language_label = ", ".join(str(lang) for lang in languages)
-            if language_label:
-                label += f" · {language_label}"
-        if len(label) > 60:
-            label = label[:57] + "…"
+        label = file_button_label(file_name, file_size)
         row.append(InlineKeyboardButton(
             label,
             callback_data=f"pms:get:{sid}:{offset + i}",

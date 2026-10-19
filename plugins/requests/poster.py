@@ -13,6 +13,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from core import config
 from plugins.requests import state as RS
 from utils import fonts as F
+from utils.file_names import clean_request_title
 
 logger = logging.getLogger(__name__)
 DIV = "━" * 26
@@ -68,9 +69,7 @@ async def post_request(
         if not token:
             return None
 
-    title_disp = _esc(movie_name)
-    if year:
-        title_disp += f" ({_esc(year)})"
+    title_disp = _esc(clean_request_title(movie_name, year))
 
     is_series = (kind or "").lower() == "series"
     kind_icon = "📺" if is_series else "🎬"
@@ -80,7 +79,7 @@ async def post_request(
         f"{F.EMO['brand']} <b>{F.fb('DOWNTOWN VILLA')}</b>",
         f"{kind_icon} <b>{F.fb(f'NEW {kind_label} REQUEST')}</b>",
         DIV, "",
-        f"{kind_icon} {F.sc(kind_label.lower())} · <b>{title_disp}</b>",
+        f"{kind_icon} {F.sc(kind_label.lower())} · <code>{title_disp}</code>",
     ]
     if imdb_id:
         lines.append(f"{F.EMO['id']} ɪᴍᴅʙ · <code>{_esc(imdb_id)}</code>")

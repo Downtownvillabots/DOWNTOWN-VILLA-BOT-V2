@@ -26,6 +26,7 @@ from plugins.groups import state as S
 from plugins.groups.shared import search as SEARCH
 from utils import fonts as F
 from utils import format as FM
+from utils.file_names import file_button_label
 
 logger = logging.getLogger(__name__)
 
@@ -94,17 +95,10 @@ def clean_display_name(hit: Dict[str, Any], max_len: int = 34) -> str:
 
 
 def build_button_label(hit: Dict[str, Any]) -> str:
-    size = FM.size_short(hit.get("file_size") or 0)
-    quality = str(hit.get("quality") or "").upper()
-    name = clean_display_name(hit, max_len=34)
-    parts = [f"📦 {size}"]
-    if quality and quality != "UNKNOWN":
-        parts.append(quality)
-    parts.append(name)
-    label = " · ".join(parts)
-    if len(label) > 60:
-        label = label[:57] + "..."
-    return label
+    return file_button_label(
+        hit.get("file_name") or hit.get("title") or hit.get("series_title"),
+        hit.get("file_size") or 0,
+    )
 
 
 def build_file_list_text(
