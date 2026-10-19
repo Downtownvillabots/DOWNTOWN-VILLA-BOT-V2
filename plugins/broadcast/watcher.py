@@ -9,7 +9,6 @@
 from __future__ import annotations
 import asyncio
 import logging
-import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -147,8 +146,6 @@ def _build_batch_view(
     conf: Optional[Dict[str, Any]] = None,
     extra: Optional[str] = None,
 ) -> Any:
-    if conf is not None:
-        conf["stage"] = stage
     files = batch["files"]
     sid = batch["sid"]
     selected = [f for f in files if f["selected"]]
@@ -194,8 +191,6 @@ def _build_batch_view(
         f"🎯 {sc('destination')} · <b>{dest}</b>",
         f"📢 {sc('target')} · <code>{ch_label}</code>",
         f"📝 {sc('caption')} · <b>{cap_mode}</b>",
-        f"🔘 {sc('one-time buttons')} · "
-        f"<b>{len(conf.get('one_time_buttons') or [])}</b>",
         f"⏱️ {sc('timer')} · <b>{timer_label}</b>",
     ]
     if extra:
@@ -249,18 +244,8 @@ def _build_batch_view(
         ])
 
     elif stage == "caption":
-        if conf.get("input_await"):
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "❌ CANCEL",
-                    callback_data=f"bcconf:{sid}:cancel",
-                )
-            ]])
-        else:
-            has_ch = bool(ch_id)
-            kb = KB.kb_conf_caption(
-                sid, has_ch, len(conf.get("one_time_buttons") or [])
-            )
+        has_ch = bool(ch_id)
+        kb = KB.kb_conf_caption(sid, has_ch)
 
     elif stage == "timer":
         kb = KB.kb_conf_timer(sid)
@@ -374,8 +359,6 @@ async def cb_batch_bcast(client, q):
         "destination": None,
         "channel_id": None,
         "caption_mode": None,
-        "custom_caption": None,
-        "one_time_buttons": [],
         "timer_days": 0,
         "manual_await": False,
         "created": time.time(),
@@ -494,29 +477,6 @@ async def cb_conf_ch(client, q):
 
 
 @Client.on_callback_query(
-    filters.regex(r"^bcconf:([a-f0-9]+):button:add$"), group=-500
-)
-async def cb_conf_button_add(client, q):
-    sid = q.matches[0].group(1)
-    conf = _get_conf(sid)
-    if not conf:
-        return await q.answer("⏱️ Expired", show_alert=True)
-    if not _is_admin(q.from_user.id):
-        return await q.answer("⛔", show_alert=True)
-    if len(conf.get("one_time_buttons") or []) >= 8:
-        return await q.answer("⚠️ Maximum 8 one-time buttons", show_alert=True)
-
-    conf["input_return_stage"] = conf.get("stage", "caption")
-    conf["input_await"] = "button"
-    batch = ST.find_batch_by_sid(sid)
-    text, kb = _build_batch_view(
-        batch, stage="caption", conf=conf,
-        extra=f"🔘 {sc('send one button as')} <code>Name | URL</code>",
-    )
-    await _edit_or_answer(q, text, kb)
-
-
-@Client.on_callback_query(
     filters.regex(r"^bcconf:([a-f0-9]+):chall$"), group=-500
 )
 async def cb_conf_chall(client, q):
@@ -593,15 +553,6 @@ async def cb_conf_cap(client, q):
         return await q.answer("⛔", show_alert=True)
 
     batch = ST.find_batch_by_sid(sid)
-    if mode == "custom":
-        conf["input_await"] = "caption"
-        text, kb = _build_batch_view(
-            batch, stage="caption", conf=conf,
-            extra=f"✏️ {sc('send the one-time caption as your next message')}",
-        )
-        await _edit_or_answer(q, text, kb)
-        return
-
     conf["caption_mode"] = mode
 
     text, kb = _build_batch_view(
@@ -824,6 +775,40 @@ async def _execute_batch(client, q, sid, conf):
         if not src_msg or src_msg.empty:
             continue
 
+        # ─── Build caption per mode ───
+        if cap_mode == "own":
+            own_clean = TPL.clean_caption(
+                f.get("original_caption") or ""
+            )
+            caption = own_clean if own_clean else ""
+            kb = None
+        elif cap_mode == "global":
+            caption = TPL.build_caption(src_msg, global_cap)
+            kb = TPL.build_buttons_kb(global_btns)
+        elif cap_mode == "channel":
+            ch = None
+            if isinstance(ch_id, int):
+                ch = await DB.get_channel(int(ch_id))
+            if ch:
+                cap_tpl = (
+                    ch.get("caption")
+                    if ch.get("caption") is not None
+                    else global_cap
+                )
+                btns = (
+                    ch.get("buttons")
+                    if ch.get("buttons") is not None
+                    else global_btns
+                )
+            else:
+                cap_tpl = global_cap
+                btns = global_btns
+            caption = TPL.build_caption(src_msg, cap_tpl)
+            kb = TPL.build_buttons_kb(btns)
+        else:
+            caption = TPL.build_caption(src_msg, global_cap)
+            kb = TPL.build_buttons_kb(global_btns)
+
         # ─── Live progress header ───
         try:
             await client.edit_message_text(
@@ -862,58 +847,6 @@ async def _execute_batch(client, q, sid, conf):
         async def _one(tid):
             async with sem:
                 try:
-                    ch = await DB.get_channel(int(tid))
-                    channel_cap = (
-                        ch.get("caption")
-                        if ch and ch.get("caption") is not None
-                        else global_cap
-                    )
-                    channel_btns = (
-                        ch.get("buttons")
-                        if ch and ch.get("buttons") is not None
-                        else global_btns
-                    )
-
-                    if cap_mode == "own":
-                        caption = TPL.clean_caption(
-                            f.get("original_caption") or ""
-                        )
-                        btns = []
-                    elif cap_mode == "custom":
-                        caption = TPL.build_caption(
-                            src_msg, conf.get("custom_caption") or ""
-                        )
-                        btns = channel_btns if ch else global_btns
-                    elif cap_mode == "channel":
-                        caption = TPL.build_caption(src_msg, channel_cap)
-                        btns = channel_btns
-                    elif cap_mode == "random":
-                        options = [
-                            TPL.build_caption(src_msg, global_cap),
-                        ]
-                        own_caption = TPL.clean_caption(
-                            f.get("original_caption") or ""
-                        )
-                        if own_caption:
-                            options.append(own_caption)
-                        if channel and channel.get("caption") is not None:
-                            options.append(
-                                TPL.build_caption(src_msg, channel_cap)
-                            )
-                        if conf.get("custom_caption"):
-                            options.append(TPL.build_caption(
-                                src_msg, conf["custom_caption"]
-                            ))
-                        caption = random.choice(options)
-                        btns = channel_btns if ch else global_btns
-                    else:
-                        caption = TPL.build_caption(src_msg, global_cap)
-                        btns = global_btns
-
-                    btns = list(btns or []) + list(
-                        conf.get("one_time_buttons") or []
-                    )
-                    kb = TPL.build_buttons_kb(btns)
                     sent = None
                     try:
                         sent = await client.copy_message(
@@ -1019,7 +952,7 @@ if BROADCAST_CHANNEL_ID:
         # find any conf waiting for manual target
         target_sid = None
         for sid, conf in list(_CONF.items()):
-            if not (conf.get("manual_await") or conf.get("input_await")):
+            if not conf.get("manual_await"):
                 continue
             target_sid = sid
             break
@@ -1028,100 +961,6 @@ if BROADCAST_CHANNEL_ID:
 
         conf = _CONF[target_sid]
         text = (message.text or "").strip()
-        input_await = conf.get("input_await")
-        if input_await:
-            try:
-                message.stop_propagation()
-            except Exception:
-                pass
-            batch = ST.find_batch_by_sid(target_sid)
-            if not batch:
-                _CONF.pop(target_sid, None)
-                await message.reply_text("⏱️ Broadcast session expired.")
-                return
-            if input_await == "caption":
-                if not text:
-                    await message.reply_text(
-                        "❌ Caption cannot be empty.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
-                if len(text) > 1024:
-                    await message.reply_text(
-                        "❌ Caption must be 1024 characters or fewer.",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
-                conf["custom_caption"] = text
-                conf["caption_mode"] = "custom"
-                conf["input_await"] = None
-                text_view, kb = _build_batch_view(
-                    batch, stage="timer", conf=conf,
-                    extra=f"⏱️ {sc('pick a timer')}",
-                )
-            elif input_await == "button":
-                if "|" not in text:
-                    await message.reply_text(
-                        "❌ Format: <code>Name | URL</code>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
-                name, url = [part.strip() for part in text.split("|", 1)]
-                if not name or not url:
-                    await message.reply_text(
-                        "❌ Button name and URL are required."
-                    )
-                    return
-                if url.startswith("@"):
-                    url = f"https://t.me/{url[1:]}"
-                elif not (
-                    url.startswith("http://")
-                    or url.startswith("https://")
-                    or url.startswith("tg://")
-                ):
-                    if "." in url and " " not in url:
-                        url = f"https://{url}"
-                    else:
-                        await message.reply_text("❌ Invalid button URL.")
-                        return
-                conf.setdefault("one_time_buttons", []).append({
-                    "name": name[:60],
-                    "url": url,
-                })
-                conf["input_await"] = None
-                return_stage = conf.pop("input_return_stage", "caption")
-                if return_stage == "preview":
-                    extra = await _render_preview(client, batch, conf)
-                elif return_stage == "final":
-                    extra = None
-                else:
-                    return_stage = "caption"
-                    extra = f"📝 {sc('choose caption mode')}"
-                text_view, kb = _build_batch_view(
-                    batch, stage=return_stage, conf=conf, extra=extra,
-                )
-            else:
-                conf["input_await"] = None
-                return
-
-            if batch and batch.get("reply_msg_id"):
-                try:
-                    await client.edit_message_text(
-                        chat_id=batch["chat_id"],
-                        message_id=batch["reply_msg_id"],
-                        text=text_view,
-                        reply_markup=kb,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e:
-                    logger.warning(f"[BC-CONF] input update failed: {e}")
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            return
-
         try:
             if text.startswith("@"):
                 chat = await client.get_chat(text)
@@ -1209,12 +1048,6 @@ async def _render_preview(client, batch, conf) -> str:
         else:
             caption_display = cap_tpl
 
-    elif cap_mode == "custom":
-        caption_display = TPL.build_caption(
-            src_msg, conf.get("custom_caption") or ""
-        )
-    elif cap_mode == "random":
-        caption_display = "<i>Randomly selected from the available file, global, channel, and custom captions for each delivery.</i>"
     else:  # global
         cap_tpl = await DB.get_global_caption()
         if src_msg:
