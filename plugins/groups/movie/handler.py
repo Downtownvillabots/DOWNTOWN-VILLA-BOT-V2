@@ -2,8 +2,7 @@
 # 🏨 DOWNTOWN VILLA — MOVIE GROUP HANDLER
 # ============================================================
 #
-# Entry point for text messages in MOVIE groups
-# (any group that is NOT SERIES_GROUP_ID).
+# Entry point for text messages in movie and mixed-content groups.
 #
 # Flow:
 #   1. Gate: not series group · enabled · content_mode · cooldown
@@ -18,9 +17,7 @@
 # Handles ONLY movie / movie+series groups.
 # Series group is handled by plugins.groups.series.handler.
 #
-# Handler group: -510 (runs AFTER series handler at -9999)
-# This means SERIES_GROUP_ID is claimed first, and any other
-# group falls through here.
+# Handler group: -510 (runs after the series handler's mode gate).
 #
 # ============================================================
 
@@ -100,12 +97,7 @@ async def movie_group_entry(client: Client, message: Message):
         if not message.from_user:
             return
 
-        # ── GATE 1: series group ──
-        series_gid = getattr(config, "SERIES_GROUP_ID", None)
-        if series_gid and int(message.chat.id) == int(series_gid):
-            return  # series handler owns this group
-
-        # ── GATE 2: query validation ──
+        # ── GATE 1: query validation ──
         txt = (message.text or "").strip()
         if len(txt) < MIN_QUERY_LEN or len(txt) > MAX_QUERY_LEN:
             return
@@ -115,7 +107,7 @@ async def movie_group_entry(client: Client, message: Message):
         if txt.startswith("/"):
             return
 
-        # ── GATE 3: group enabled + content_mode ──
+        # ── GATE 2: group enabled + content_mode ──
         chat_id = message.chat.id
         cfg = await S.get_config(chat_id)
 
@@ -126,10 +118,16 @@ async def movie_group_entry(client: Client, message: Message):
 
         content_mode = str(cfg.get("content_mode", "both")).lower()
         if content_mode == "series":
-            # This group is series-only; do not respond here
+            return
+        series_gid = getattr(config, "SERIES_GROUP_ID", None)
+        if (
+            series_gid
+            and int(chat_id) == int(series_gid)
+            and content_mode != "movie"
+        ):
             return
 
-        # ── GATE 4: cooldown (per-group) ──
+        # ── GATE 3: cooldown (per-group) ──
         uid = message.from_user.id
         cd_secs = await SEARCH.get_cooldown_seconds(chat_id, default=COOLDOWN)
 
@@ -205,9 +203,11 @@ async def _run_pipeline(
     """
     uid = message.from_user.id
     chat_id = message.chat.id
+    content_mode = str(cfg.get("content_mode", "both")).lower()
+    search_kind = "movie" if content_mode == "movie" else "any"
 
     # ── 1. DB search ──
-    hits, complete = await SEARCH.quick_search(query)
+    hits, complete = await SEARCH.quick_search(query, kind=search_kind)
 
     if hits:
         await _deliver_files(
@@ -228,12 +228,16 @@ async def _run_pipeline(
     # ── 2. Spell check ──
     corrected: Optional[str] = None
     try:
-        corrected = await SUGG.ai_spell_check(query)
+        corrected = await SUGG.ai_spell_check_for_group(
+            chat_id, query, kind=search_kind,
+        )
     except Exception as e:
         logger.debug(f"[MOVIE-H] spell: {e}")
 
     if corrected and corrected.strip().lower() != query.strip().lower():
-        corrected_hits, _ = await SEARCH.quick_search(corrected)
+        corrected_hits, _ = await SEARCH.quick_search(
+            corrected, kind=search_kind,
+        )
         if corrected_hits:
             await _deliver_files(
                 client=client,
@@ -251,7 +255,7 @@ async def _run_pipeline(
     try:
         items = await SUGG.suggestions(
             query,
-            kind="any",
+            kind=search_kind,
             limit=int(cfg.get("suggestion_count", 6)),
         )
     except Exception as e:

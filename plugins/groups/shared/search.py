@@ -142,6 +142,7 @@ async def quick_search(
     query: str,
     year: Optional[int] = None,
     is_series: bool = False,
+    kind: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Cache-first DB search.
@@ -156,7 +157,14 @@ async def quick_search(
 
         norm, parsed_year, parsed_series = parse_query(query)
         use_year = year if year is not None else parsed_year
-        use_series = is_series or parsed_series
+        requested_kind = (
+            kind if kind in ("movie", "series", "any") else None
+        )
+        use_series = (
+            requested_kind == "series"
+            if requested_kind is not None
+            else is_series or parsed_series
+        )
 
         if not norm:
             return [], True
@@ -165,7 +173,10 @@ async def quick_search(
         cache_key: Optional[str] = None
         try:
             from media_search import instant_cache as IC
-            cache_key = IC.build_key(norm, use_year, use_series)
+            cache_kind = requested_kind or (
+                "series" if use_series else "default"
+            )
+            cache_key = IC.build_key(norm, use_year, cache_kind)
             cached = IC.get(cache_key)
             if cached is not None:
                 return (
@@ -184,8 +195,14 @@ async def quick_search(
 
         result = None
         try:
-            if use_series:
+            if requested_kind == "movie":
+                result = await engine.search_movie(norm, year=use_year)
+            elif requested_kind == "series" or (
+                requested_kind is None and use_series
+            ):
                 result = await engine.search_series(norm, year=use_year)
+            elif requested_kind == "any":
+                result = await engine.search_any(norm, year=use_year)
             else:
                 r_movie = await engine.search_movie(norm, year=use_year)
                 if r_movie and r_movie.hits:
@@ -250,6 +267,7 @@ async def search_by_title(
         title,
         year=year,
         is_series=is_series,
+        kind=kind if kind in ("movie", "series", "any") else None,
     )
 
     # Fallback: retry without year
@@ -258,6 +276,7 @@ async def search_by_title(
             title,
             year=None,
             is_series=is_series,
+            kind=kind if kind in ("movie", "series", "any") else None,
         )
 
     return hits
@@ -513,4 +532,3 @@ __all__ = [
     # Cooldown
     "get_cooldown_seconds",
 ]
-

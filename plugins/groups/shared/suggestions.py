@@ -32,9 +32,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 _CACHE_TTL = 3600.0
-_cache: Dict[str, Tuple[float, Any]] = {}
+_CACHE_MAX_ENTRIES = 1000
+_cache: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
 
 # ── Regex ──
 _RE_EXT = re.compile(
@@ -110,11 +113,15 @@ def _cache_get(key: str) -> Optional[Any]:
     if entry[0] < time.time():
         _cache.pop(key, None)
         return None
+    _cache.move_to_end(key)
     return entry[1]
 
 
 def _cache_set(key: str, value: Any) -> None:
     _cache[key] = (time.time() + _CACHE_TTL, value)
+    _cache.move_to_end(key)
+    while len(_cache) > _CACHE_MAX_ENTRIES:
+        _cache.popitem(last=False)
 
 
 # ============================================================
@@ -127,7 +134,14 @@ def clean_query(raw: str) -> str:
     try:
         t = str(raw).strip()
         t = _RE_EXT.sub("", t)
-        t = _RE_BRACKETS.sub(" ", t)
+        t = _RE_BRACKETS.sub(
+            lambda match: (
+                f" {match.group(0)} "
+                if re.search(r"\b(?:19[3-9]\d|20[0-4]\d)\b", match.group(0))
+                else " "
+            ),
+            t,
+        )
         t = _RE_JUNK.sub(" ", t)
         t = t.replace(".", " ").replace("_", " ").replace("-", " ")
         t = _RE_NON_WORD.sub(" ", t)
@@ -146,7 +160,15 @@ def _collapse_repeats(s: str) -> str:
 def _apply_ocr_map(s: str) -> str:
     if not s:
         return ""
-    return s.translate(_OCR_MAP)
+    words = []
+    for word in s.split():
+        if any(char.isalpha() for char in word) and any(
+            char.isdigit() for char in word
+        ):
+            words.append(word.translate(_OCR_MAP))
+        else:
+            words.append(word)
+    return " ".join(words)
 
 
 def _tokens(s: str) -> List[str]:
@@ -173,9 +195,7 @@ def _score_pair(query: str, candidate: str) -> float:
         from rapidfuzz import fuzz
         scores = [
             fuzz.ratio(q, c),
-            fuzz.partial_ratio(q, c),
             fuzz.token_sort_ratio(q, c),
-            fuzz.token_set_ratio(q, c),
             fuzz.WRatio(q, c),
         ]
         return float(max(scores))
@@ -227,23 +247,36 @@ def _fuzzy_score_variants(query: str, candidate: str) -> float:
 # SECTION 6 — PROVIDERS
 # ============================================================
 
-async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
+async def _tmdb_search(
+    query: str,
+    kind: str = "any",
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
         from providers import tmdb_provider as TP
     except Exception:
         return out
 
-    try:
-        movies = await TP.search_movie(query)
-    except Exception:
-        movies = []
-    try:
-        tv = await TP.search_tv(query)
-    except Exception:
-        tv = []
+    jobs = []
+    if kind in ("movie", "any"):
+        jobs.append(("movie", TP.search_movie(query)))
+    if kind in ("series", "any"):
+        jobs.append(("series", TP.search_tv(query)))
+    responses = await asyncio.gather(
+        *(job for _, job in jobs),
+        return_exceptions=True,
+    )
+    movie_result: List[Dict[str, Any]] = []
+    tv_result: List[Dict[str, Any]] = []
+    for (result_kind, _), response in zip(jobs, responses):
+        if isinstance(response, Exception):
+            continue
+        if result_kind == "movie":
+            movie_result = response
+        else:
+            tv_result = response
 
-    for r in list(movies or []):
+    for r in list(movie_result or []):
         out.append({
             "title": r.get("title") or "",
             "year": str(r.get("year") or ""),
@@ -256,7 +289,7 @@ async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
             "imdb_id": None,
             "source": "tmdb",
         })
-    for r in list(tv or []):
+    for r in list(tv_result or []):
         out.append({
             "title": r.get("title") or "",
             "year": str(r.get("year") or ""),
@@ -272,18 +305,16 @@ async def _tmdb_search(query: str) -> List[Dict[str, Any]]:
     return out
 
 
-async def _imdb_search(query: str) -> List[Dict[str, Any]]:
+async def _imdb_search(
+    query: str,
+    kind: str = "any",
+) -> List[Dict[str, Any]]:
     """
-    IMDb search via IMDBKit/cinemagoer (from requirements.txt).
-    Only imports if provider modules are installed.
+    IMDb-indexed title search through the configured OMDb API key.
     """
-    # Try providers.imdb_provider first
     try:
-        from providers import imdb_provider as IP  # type: ignore
-        try:
-            results = await IP.search(query)  # type: ignore
-        except Exception:
-            results = []
+        from providers import imdb_provider as IP
+        results = await IP.search(query, kind=kind)
         out = []
         for r in (results or []):
             t = r.get("title") or r.get("Title")
@@ -316,30 +347,67 @@ async def _imdb_search(query: str) -> List[Dict[str, Any]]:
         return []
 
 
+_DB_TITLE_CACHE: List[Tuple[str, str, str]] = []
+_DB_TITLE_CACHE_AT = 0.0
+_DB_TITLE_CACHE_TTL = 600.0
+_DB_TITLE_CACHE_LOCK = asyncio.Lock()
+
+
+async def _load_db_title_rows() -> List[Tuple[str, str, str]]:
+    global _DB_TITLE_CACHE, _DB_TITLE_CACHE_AT
+    now = time.monotonic()
+    if _DB_TITLE_CACHE_AT and now - _DB_TITLE_CACHE_AT < _DB_TITLE_CACHE_TTL:
+        return _DB_TITLE_CACHE
+
+    async with _DB_TITLE_CACHE_LOCK:
+        now = time.monotonic()
+        if _DB_TITLE_CACHE_AT and now - _DB_TITLE_CACHE_AT < _DB_TITLE_CACHE_TTL:
+            return _DB_TITLE_CACHE
+
+        try:
+            from database import db_registry
+        except Exception:
+            return _DB_TITLE_CACHE
+
+        titles: Set[Tuple[str, str, str]] = set()
+        for entry in db_registry.media_entries():
+            if not entry.online:
+                continue
+            remaining = 10000 - len(titles)
+            if remaining <= 0:
+                break
+            try:
+                cursor = entry.db["media_files"].find(
+                    {"title": {"$exists": True, "$ne": ""}},
+                    {"title": 1, "year": 1, "type": 1, "_id": 0},
+                ).limit(min(2000, remaining))
+                async for doc in cursor:
+                    title = doc.get("title")
+                    if not title:
+                        continue
+                    raw_kind = str(doc.get("type") or "").lower()
+                    title_kind = (
+                        "series"
+                        if raw_kind in ("series", "tv", "show", "episode")
+                        else "movie"
+                    )
+                    titles.add((
+                        str(title).strip(),
+                        str(doc.get("year") or ""),
+                        title_kind,
+                    ))
+            except Exception as e:
+                logger.debug("[SUGG] title cache %s: %s", entry.label, e)
+
+        _DB_TITLE_CACHE = list(titles)
+        _DB_TITLE_CACHE_AT = time.monotonic()
+        return _DB_TITLE_CACHE
+
+
 async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List[Dict[str, Any]]:
     if not query:
         return []
-    try:
-        from database import db_registry
-    except Exception:
-        return []
-
-    titles: Set[Tuple[str, str]] = set()
-    for entry in db_registry.media_entries():
-        if not entry.online:
-            continue
-        try:
-            cursor = entry.db["media_files"].find(
-                {"title": {"$exists": True, "$ne": ""}},
-                {"title": 1, "year": 1, "_id": 0},
-            ).limit(2000)
-            async for doc in cursor:
-                t = doc.get("title")
-                y = doc.get("year")
-                if t:
-                    titles.add((str(t).strip(), str(y) if y else ""))
-        except Exception:
-            continue
+    titles = await _load_db_title_rows()
 
     if not titles:
         return []
@@ -348,23 +416,23 @@ async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List
     if not q_clean or len(q_clean) < 3:
         return []
 
-    lookup: Dict[str, Tuple[str, str]] = {}
-    for t, y in titles:
+    lookup: Dict[str, Tuple[str, str, str]] = {}
+    for t, y, title_kind in titles:
         c = clean_query(t)
         if c and c not in lookup:
-            lookup[c] = (t, y)
+            lookup[c] = (t, y, title_kind)
 
-    scored: List[Tuple[float, str, str]] = []
-    for c_clean, (orig, year) in lookup.items():
+    scored: List[Tuple[float, str, str, str]] = []
+    for c_clean, (orig, year, title_kind) in lookup.items():
         s = _fuzzy_score_variants(q_clean, c_clean)
         if s >= min_score:
-            scored.append((s, orig, year))
+            scored.append((s, orig, year, title_kind))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     out: List[Dict[str, Any]] = []
     seen: Set[str] = set()
-    for s, title, year in scored[:limit]:
+    for s, title, year, title_kind in scored[:limit]:
         key = title.lower()
         if key in seen:
             continue
@@ -374,7 +442,7 @@ async def _db_fuzzy(query: str, limit: int = 6, min_score: float = 60.0) -> List
             "year": year,
             "rating": 0.0,
             "votes": 0,
-            "kind": "movie",
+            "kind": title_kind,
             "poster": None,
             "overview": "",
             "tmdb_id": None,
@@ -452,7 +520,20 @@ async def suggestions(
     if provider not in ("tmdb", "imdb", "both"):
         provider = "both"
 
-    key = f"sg:{query.lower()}|{year or ''}|{kind}|{limit}|{min_score}|{provider}"
+    try:
+        from media_search.normalizer import parse_query
+        _, parsed_year, parsed_series = parse_query(query)
+    except Exception:
+        parsed_year, parsed_series = None, False
+    use_year = year if year is not None else parsed_year
+    use_kind = "series" if kind == "any" and parsed_series else kind
+    if use_kind not in ("movie", "series", "any"):
+        use_kind = "any"
+
+    key = (
+        f"sg:{' '.join(query.lower().split())}|{use_year or ''}|"
+        f"{use_kind}|{limit}|{min_score}|{provider}"
+    )
     cached = _cache_get(key)
     if cached is not None:
         return list(cached)
@@ -461,50 +542,51 @@ async def suggestions(
     if not cleaned:
         return []
 
-    buffer: List[Dict[str, Any]] = []
+    async def _provider_results(search_query: str) -> List[Dict[str, Any]]:
+        jobs = []
+        if provider in ("tmdb", "both"):
+            jobs.append(_tmdb_search(search_query, kind=use_kind))
+        if provider in ("imdb", "both"):
+            jobs.append(_imdb_search(search_query, kind=use_kind))
+        responses = await asyncio.gather(*jobs, return_exceptions=True)
+        return [
+            item
+            for response in responses
+            if not isinstance(response, Exception)
+            for item in response
+        ]
 
-    # ── Provider: TMDB ──
-    if provider in ("tmdb", "both"):
-        buffer.extend(await _tmdb_search(query))
-
-        collapsed = _collapse_repeats(cleaned)
-        if collapsed and collapsed != cleaned:
-            buffer.extend(await _tmdb_search(collapsed))
-
-        tokens = _tokens(cleaned)
-        if len(tokens) > 1:
-            for n in range(len(tokens) - 1, 0, -1):
-                short = " ".join(tokens[:n])
-                if len(short) < 3:
-                    break
-                sub = await _tmdb_search(short)
-                if sub:
-                    buffer.extend(sub)
-
-        if len(buffer) < 4:
-            for tok in tokens:
-                if len(tok) < 4:
-                    continue
-                sub = await _tmdb_search(tok)
-                buffer.extend(sub[:3])
-                if len(buffer) >= 8:
-                    break
-
-    # ── Provider: IMDb ──
-    if provider in ("imdb", "both") and len(buffer) < 8:
-        buffer.extend(await _imdb_search(query))
-        tokens = _tokens(cleaned)
-        if len(tokens) >= 2:
-            short = " ".join(tokens[:2])
-            buffer.extend(await _imdb_search(short))
-
-    # ── Score + rank ──
+    buffer = await _provider_results(query)
     ranked = _dedupe_and_score(
         query, buffer, min_score=float(min_score), limit=limit * 2,
     )
 
+    if not ranked or ranked[0].get("score", 0) < 65:
+        alternate_queries: List[str] = []
+        collapsed = _collapse_repeats(cleaned)
+        ocr_query = _apply_ocr_map(cleaned)
+        for alternate in (collapsed, ocr_query):
+            if alternate and alternate != cleaned and alternate not in alternate_queries:
+                alternate_queries.append(alternate)
+        if not alternate_queries and not ranked:
+            tokens = _tokens(cleaned)
+            if len(tokens) > 2:
+                alternate_queries.append(" ".join(tokens[:2]))
+
+        if alternate_queries:
+            responses = await asyncio.gather(
+                *(_provider_results(alternate) for alternate in alternate_queries[:2]),
+                return_exceptions=True,
+            )
+            for response in responses:
+                if not isinstance(response, Exception):
+                    buffer.extend(response)
+            ranked = _dedupe_and_score(
+                query, buffer, min_score=float(min_score), limit=limit * 2,
+            )
+
     # ── DB fuzzy fallback if thin ──
-    if not ranked or ranked[0].get("score", 0) < 60:
+    if not ranked or ranked[0].get("score", 0) < 65:
         db_hits = await _db_fuzzy(query, limit=limit)
         seen = {f"{clean_query(x['title'])}|{x.get('year') or ''}"
                 for x in ranked}
@@ -514,7 +596,17 @@ async def suggestions(
                 ranked.append(d)
                 seen.add(k)
 
-    # ── Final sort + kind filter ──
+    # ── Final kind and year selection ──
+    if use_kind in ("movie", "series"):
+        ranked = [r for r in ranked if r.get("kind") == use_kind]
+
+    if use_year:
+        year_matches = [
+            r for r in ranked if str(r.get("year") or "")[:4] == str(use_year)
+        ]
+        if year_matches:
+            ranked = year_matches
+
     ranked.sort(
         key=lambda x: (
             x.get("score", 0),
@@ -524,15 +616,10 @@ async def suggestions(
         reverse=True,
     )
 
-    if kind == "movie":
-        ranked = [r for r in ranked if r.get("kind") == "movie"] or ranked
-    elif kind == "series":
-        ranked = [r for r in ranked if r.get("kind") == "series"] or ranked
-
     # ── Year boost ──
-    if year:
+    if use_year:
         try:
-            y = int(year)
+            y = int(use_year)
             boost = int(cfg.get("year_boost", 5))
             for r in ranked:
                 try:
@@ -560,6 +647,7 @@ async def ai_spell_check(
     text: str,
     is_series: bool = False,
     cfg: Optional[Dict[str, Any]] = None,
+    kind: Optional[str] = None,
 ) -> Optional[str]:
     """
     Return corrected title if confident, else None.
@@ -576,8 +664,10 @@ async def ai_spell_check(
     if not base or len(base) < 3:
         return None
 
-    kind = "series" if is_series else "any"
-    results = await suggestions(text, kind=kind, limit=3, cfg=cfg)
+    suggestion_kind = kind or ("series" if is_series else "any")
+    results = await suggestions(
+        text, kind=suggestion_kind, limit=3, cfg=cfg,
+    )
     if not results:
         return None
 
@@ -587,10 +677,25 @@ async def ai_spell_check(
 
     if not corrected_title:
         return None
-    if clean_query(corrected_title) == base:
+    input_year = re.search(r"\b(?:19[3-9]\d|20[0-4]\d)\b", base)
+    if input_year and str(top.get("year") or "")[:4] != input_year.group(0):
+        return None
+    query_title = re.sub(r"\b(?:19[3-9]\d|20[0-4]\d)\b", " ", base)
+    query_title = _RE_SPACES.sub(" ", query_title).strip()
+    candidate_title = clean_query(corrected_title)
+    if candidate_title == query_title:
         return None
     if score < threshold:
         return None
+    if len(query_title) <= 3 and len(candidate_title) > len(query_title) * 1.7:
+        return None
+    if len(results) > 1:
+        second = results[1]
+        if (
+            clean_query(second.get("title") or "") != candidate_title
+            and score - float(second.get("score", 0)) < 3
+        ):
+            return None
 
     year = top.get("year")
     if year:
@@ -648,10 +753,13 @@ async def ai_spell_check_for_group(
     chat_id: int,
     text: str,
     is_series: bool = False,
+    kind: Optional[str] = None,
 ) -> Optional[str]:
     """Read group config + run spell check."""
     cfg = await _load_group_cfg(chat_id)
-    return await ai_spell_check(text, is_series=is_series, cfg=cfg)
+    return await ai_spell_check(
+        text, is_series=is_series, cfg=cfg, kind=kind,
+    )
 
 
 async def get_max_corrections_for_group(chat_id: int) -> int:

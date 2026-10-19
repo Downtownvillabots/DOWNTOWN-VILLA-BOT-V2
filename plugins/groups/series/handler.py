@@ -1346,10 +1346,10 @@ async def advance(
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 16 — GROUP ENTRY HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
-if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
+if SERIES_GROUP_ENABLED:
 
     @Client.on_message(
-        filters.chat(SERIES_GROUP_ID)
+        filters.group
         & filters.text
         & ~filters.regex(r"^/")
         & ~filters.regex(r"^sg:"),
@@ -1381,6 +1381,12 @@ if SERIES_GROUP_ID and SERIES_GROUP_ENABLED:
                 return
             mode = str(cfg.get("content_mode", "both")).lower()
             if mode == "movie":
+                return
+            fixed_series_group = (
+                SERIES_GROUP_ID is not None
+                and int(chat_id) == int(SERIES_GROUP_ID)
+            )
+            if mode != "series" and not fixed_series_group:
                 return
 
             cd_secs = await SEARCH.get_cooldown_seconds(

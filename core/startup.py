@@ -593,6 +593,12 @@ async def start_bot() -> None:
     except Exception:
         pass
 
+    try:
+        from providers.http_client import close as close_provider_http
+        await close_provider_http()
+    except Exception:
+        logger.exception("[BOOT] provider HTTP shutdown failed")
+
     logger.info("[BOOT] ✅ Shutdown complete")
 
 

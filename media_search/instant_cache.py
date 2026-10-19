@@ -15,9 +15,12 @@ _cache: OrderedDict[str, tuple[float, Any]] = OrderedDict()
 def build_key(
     normalized_query: str,
     year: Optional[int],
-    is_series: bool,
+    is_series: bool | str,
 ) -> str:
-    kind = "series" if is_series else "movie"
+    if isinstance(is_series, str):
+        kind = is_series
+    else:
+        kind = "series" if is_series else "movie"
     return f"search|{kind}|{normalized_query}|{year or ''}"
 
 

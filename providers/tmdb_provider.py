@@ -39,6 +39,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from core import config
+from providers.http_client import get_json
 
 logger = logging.getLogger(__name__)
 
@@ -54,30 +55,15 @@ async def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[D
         logger.debug("[TMDB] no API key set")
         return None
 
-    try:
-        import aiohttp
-    except ImportError:
-        logger.warning("[TMDB] aiohttp not installed")
-        return None
-
     p = {"api_key": config.TMDB_API_KEY, "language": "en-US"}
     if params:
         p.update(params)
 
     url = f"{TMDB_BASE}{path}"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, params=p, timeout=HTTP_TIMEOUT) as r:
-                if r.status != 200:
-                    logger.debug(f"[TMDB] {path} → {r.status}")
-                    return None
-                return await r.json()
-    except asyncio.TimeoutError:
-        logger.debug(f"[TMDB] timeout: {path}")
-        return None
-    except Exception as e:
-        logger.debug(f"[TMDB] {path}: {e}")
-        return None
+    data = await get_json(url, p, timeout=HTTP_TIMEOUT)
+    if data is None:
+        logger.debug("[TMDB] request failed: %s", path)
+    return data
 
 
 # ── NORMALIZE ──
