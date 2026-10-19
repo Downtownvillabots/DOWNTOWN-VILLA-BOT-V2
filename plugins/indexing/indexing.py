@@ -231,9 +231,9 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     files_found = int(w.get("files_found", 0))
     files_completed = int(w.get("files_completed", 0))
     total_files = int(w.get("total_files", 0))
-    precounting = bool(w.get("precounting"))
-    precount_complete = bool(w.get("precount_complete"))
-    precounted_ids = int(w.get("precounted_ids", 0))
+    estimated_total_files = int(
+        w.get("estimated_total_files", total_files)
+    )
     skipped = int(w.get("skipped_no_media", 0))
     failed = int(w.get("failed", 0))
     movies = int(w.get("movies", 0))
@@ -246,34 +246,16 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     if started:
         elapsed_str = FM.duration_short(time.time() - started)
 
-    if precounting:
-        pct = min(100.0, precounted_ids / total_ids * 100) if total_ids else 0.0
-        progress_label = "counting files"
-        progress_detail = (
-            f"{FM.num(precounted_ids)} / {FM.num(total_ids)} "
-            f"{F.sc('message IDs checked')}"
-        )
-    elif precount_complete and total_files:
-        pct = min(100.0, files_completed / total_files * 100)
-        progress_label = "indexing files"
-        progress_detail = (
-            f"{FM.num(files_completed)} / {FM.num(total_files)} "
-            f"{F.sc('files completed')}"
-        )
-    elif w.get("scan_complete"):
-        pct = 100.0
-        progress_label = "indexing files"
-        progress_detail = (
-            f"{FM.num(files_completed)} / {FM.num(total_files)} "
-            f"{F.sc('files completed')}"
-        )
-    else:
-        pct = min(100.0, scanned / total_ids * 100) if total_ids else 0.0
-        progress_label = "indexing files"
-        progress_detail = (
-            f"{FM.num(scanned)} / {FM.num(total_ids)} "
-            f"{F.sc('message IDs checked')}"
-        )
+    pct = (
+        min(100.0, files_completed / estimated_total_files * 100)
+        if estimated_total_files else 0.0
+    )
+    progress_label = "indexing files"
+    progress_detail = (
+        f"{FM.num(files_completed)} / "
+        f"{FM.num(estimated_total_files)} "
+        f"{F.sc('files completed')}"
+    )
 
     bar = P.bar(pct, progress_label, width=14, show_percent=False)
     last_error = str(w.get("last_error") or w.get("fetch_error") or "")
@@ -284,8 +266,11 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         F.DIV_S, "",
         f"<code>{bar}</code> {pct:.0f}%",
         f"📁 {F.sc('files completed')} · "
-        f"<b>{FM.num(files_completed)} / {FM.num(total_files)}</b>",
-        f"🔎 {F.sc('files found')} · <b>{FM.num(files_found)}</b>",
+        f"<b>{FM.num(files_completed)} / "
+        f"{FM.num(estimated_total_files)}"
+        f"{'~' if not w.get('scan_complete') else ''}</b>",
+        f"🔎 {F.sc('files discovered')} · <b>{FM.num(total_files)}</b>",
+        f"🔎 {F.sc('files processed')} · <b>{FM.num(files_found)}</b>",
         f"📊 {F.sc('progress')} · {progress_detail}",
         f"📍 {F.sc('current message id')} · <code>{current_id:,}</code>",
         f"🗺️ {F.sc('channel scan')} · "
@@ -313,8 +298,9 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
         f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
         "",
-        f"⚡ {F.sc('scan rate')} · <b>{w.get('speed', 0):.1f} "
-        f"{'IDs/s' if precounting else 'files/s'}</b>",
+        f"⚡ {F.sc('scan rate')} · <b>{w.get('speed', 0):.1f} IDs/s</b>",
+        f"📚 {F.sc('index rate')} · "
+        f"<b>{w.get('processing_speed', 0):.1f} files/s</b>",
         f"⏱️ {F.sc('eta')} · <b>{eta_text}</b>",
         *([f"⚠️ {F.sc('last error')} · "
            f"<code>{html_escape(last_error[:180])}</code>"] if last_error else []),
@@ -337,6 +323,9 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     processed = int(w.get("processed", 0))
     scanned = int(w.get("scanned_ids", 0))
     total_files = int(w.get("total_files", 0))
+    estimated_total_files = int(
+        w.get("estimated_total_files", total_files)
+    )
     files_completed = int(w.get("files_completed", 0))
 
     started = w.get("started_at") or 0
@@ -348,9 +337,8 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     total_ids = int(w.get("total_messages", 0))
     scanned = int(w.get("scanned_ids", 0))
     pct = (
-        100.0 if w.get("scan_complete")
-        else min(100.0, files_completed / total_files * 100)
-        if total_files else 0.0
+        min(100.0, files_completed / estimated_total_files * 100)
+        if estimated_total_files else 0.0
     )
     bar = P.bar(pct, "indexing", width=14, show_percent=False)
 
@@ -373,7 +361,9 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
         f"📁 {F.sc('files to index')} · <b>{FM.num(total_files)}</b>",
         f"📁 {F.sc('files completed')} · "
-        f"<b>{FM.num(files_completed)} / {FM.num(total_files)}</b>",
+        f"<b>{FM.num(files_completed)} / "
+        f"{FM.num(estimated_total_files)}"
+        f"{'~' if not w.get('scan_complete') else ''}</b>",
         "",
         F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",

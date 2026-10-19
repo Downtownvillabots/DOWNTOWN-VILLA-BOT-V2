@@ -78,9 +78,7 @@ STATE: Dict[str, Any] = {
     "current_message_id": 0,
     "end_message_id": 0,
     "scanned_ids": 0,
-    "precounted_ids": 0,
-    "precounting": False,
-    "precount_complete": False,
+    "pending_messages": 0,
     "scan_complete": False,
 
     "processed": 0,
@@ -96,6 +94,7 @@ STATE: Dict[str, Any] = {
     "series": 0,
 
     "speed": 0.0,
+    "processing_speed": 0.0,
     "eta_seconds": 0.0,
     "eta_text": "—",
     "last_progress_at": 0.0,
@@ -110,6 +109,8 @@ _state_lock = asyncio.Lock()
 _scan_started_at = 0.0
 _speed_sample_at = 0.0
 _speed_sample_ids = 0
+_processing_sample_at = 0.0
+_processing_sample_files = 0
 
 
 # ============================================================
@@ -118,6 +119,20 @@ _speed_sample_ids = 0
 
 def is_running() -> bool:
     return bool(STATE["running"])
+
+
+def _estimated_total_files() -> int:
+    total_files = int(STATE["total_files"])
+    if STATE["scan_complete"]:
+        return total_files
+
+    total_messages = int(STATE["total_messages"])
+    scanned_ids = int(STATE["scanned_ids"])
+    if total_messages <= 0 or scanned_ids <= 0:
+        return total_files
+
+    projected = round(total_files * total_messages / scanned_ids)
+    return max(total_files, int(STATE["files_completed"]), projected)
 
 
 def status() -> Dict[str, Any]:
@@ -134,11 +149,10 @@ def status() -> Dict[str, Any]:
         "job_id": STATE["job_id"],
         "total_messages": STATE["total_messages"],
         "total_files": STATE["total_files"],
+        "estimated_total_files": _estimated_total_files(),
         "current_message_id": STATE["current_message_id"],
         "scanned_ids": STATE["scanned_ids"],
-        "precounted_ids": STATE["precounted_ids"],
-        "precounting": STATE["precounting"],
-        "precount_complete": STATE["precount_complete"],
+        "pending_messages": STATE["pending_messages"],
         "scan_complete": STATE["scan_complete"],
         "processed": STATE["processed"],
         "files_found": STATE["files_found"],
@@ -152,6 +166,7 @@ def status() -> Dict[str, Any]:
         "movies": STATE["movies"],
         "series": STATE["series"],
         "speed": STATE["speed"],
+        "processing_speed": STATE["processing_speed"],
         "eta_seconds": STATE["eta_seconds"],
         "eta_text": STATE["eta_text"],
         "started_at": STATE["started_at"],
@@ -234,9 +249,7 @@ async def start_worker(
             "current_message_id": 0,
             "end_message_id": 0,
             "scanned_ids": 0,
-            "precounted_ids": 0,
-            "precounting": False,
-            "precount_complete": False,
+            "pending_messages": 0,
             "scan_complete": False,
             "processed": 0,
             "files_found": 0,
@@ -250,6 +263,7 @@ async def start_worker(
             "movies": 0,
             "series": 0,
             "speed": 0.0,
+            "processing_speed": 0.0,
             "eta_seconds": 0.0,
             "eta_text": "—",
             "last_progress_at": 0.0,
@@ -440,25 +454,15 @@ async def _run() -> None:
             except Exception as e:
                 logger.warning(f"[INDEX-WORKER] save scan range: {e}")
 
-        if not await _count_files(C, start_id, end_id):
-            await _finalize()
-            return
-
-        logger.info(
-            f"[INDEX-WORKER] 📁 pre-count complete: "
-            f"{STATE['total_files']} media files"
-        )
+        await _walk_messages(C, start_id, end_id)
         if STATE["run_id"]:
             try:
                 from plugins.indexing import state as ST
                 await ST.update_job(STATE["run_id"], {
                     "total_files": STATE["total_files"],
-                    "precount_complete": True,
                 })
             except Exception as e:
                 logger.warning(f"[INDEX-WORKER] save file count: {e}")
-
-        await _walk_messages(C, start_id, end_id)
         await _finalize()
 
     except asyncio.CancelledError:
@@ -472,7 +476,6 @@ async def _run() -> None:
     finally:
         STATE["running"] = False
         STATE["paused"] = False
-        STATE["precounting"] = False
         STATE["finished_at"] = time.time()
         logger.info(
             f"[INDEX-WORKER] 🏁 DONE — "
@@ -504,111 +507,21 @@ def _resolve_range() -> Tuple[int, int]:
     return (start, end)
 
 
-async def _count_files(C: Client, start_id: int, end_id: int) -> bool:
-    """Count media-bearing messages before indexing so progress has a real total."""
-    direction = STATE["direction"]
-    step = 1 if direction == "forward" else -1
-
-    if direction == "forward":
-        def stop_when(message_id): return message_id > end_id
-    else:
-        def stop_when(message_id): return message_id < end_id
-
-    STATE["precounting"] = True
-    STATE["precount_complete"] = False
-    STATE["precounted_ids"] = 0
-    STATE["total_files"] = 0
-    next_id = start_id
-    consecutive_failures = 0
-    start_time = time.time()
-    _start_speed_sample()
-
-    while not stop_when(next_id):
-        if time.time() - start_time > MAX_RUNTIME:
-            STATE["last_error"] = "runtime cap reached while counting files"
-            STATE["precounting"] = False
-            return False
-        if STATE["stop_requested"]:
-            STATE["precounting"] = False
-            return False
-
-        while STATE["paused"] and not STATE["stop_requested"]:
-            fu = float(STATE.get("flood_until") or 0.0)
-            if fu and fu <= time.time():
-                STATE["flood_until"] = 0.0
-                STATE["paused"] = False
-                break
-            await asyncio.sleep(1.0)
-
-        if STATE["stop_requested"]:
-            STATE["precounting"] = False
-            return False
-        if STATE["flood_until"] > time.time():
-            await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
-            continue
-
-        batch = []
-        for _ in range(STATE["batch_size"]):
-            if stop_when(next_id):
-                break
-            batch.append(next_id)
-            next_id += step
-        if not batch:
-            break
-
-        messages = await _fetch_messages(C, batch)
-        if messages is None:
-            next_id -= step * len(batch)
-            if STATE["stop_requested"]:
-                fetch_error = str(STATE.get("fetch_error") or "")
-                if fetch_error.startswith("flood too long"):
-                    raise RuntimeError(fetch_error)
-                STATE["precounting"] = False
-                return False
-            consecutive_failures += 1
-            if consecutive_failures >= 5:
-                STATE["precounting"] = False
-                raise RuntimeError(
-                    STATE.get("fetch_error")
-                    or "five consecutive message-fetch failures while counting"
-                )
-            await asyncio.sleep(min(2 ** consecutive_failures, 30))
-            continue
-
-        consecutive_failures = 0
-        STATE["fetch_error"] = None
-        STATE["precounted_ids"] += len(batch)
-        for message in messages:
-            media_items = _pick_media(message)
-            STATE["total_files"] += sum(
-                1 for media in media_items if media.get("file_id")
-            )
-
-        if STATE["precounted_ids"] % max(STATE["batch_size"] * 10, 1) < len(batch):
-            _update_speed()
-            logger.info(
-                f"[INDEX-WORKER] 📊 counting files: "
-                f"{STATE['precounted_ids']}/{STATE['total_messages']} IDs, "
-                f"{STATE['total_files']} files found"
-            )
-        if STATE["delay"] > 0:
-            await asyncio.sleep(STATE["delay"])
-
-    STATE["precounting"] = False
-    STATE["precount_complete"] = True
-    _update_speed()
-    return True
-
-
 # ============================================================
 # WALK
 # ============================================================
 
 async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
     global _scan_started_at, _speed_sample_at, _speed_sample_ids
+    global _processing_sample_at, _processing_sample_files
 
     direction = STATE["direction"]
     batch_size = STATE["batch_size"]
+    concurrency = int(STATE["concurrency"])
+    queue: asyncio.Queue = asyncio.Queue(
+        maxsize=max(batch_size, concurrency * 4)
+    )
+    sem = asyncio.Semaphore(concurrency)
 
     if direction == "forward":
         step = 1
@@ -622,127 +535,158 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
     last_progress_update = time.time()
     start_time = time.time()
     _start_speed_sample()
+    _processing_sample_at = _scan_started_at
+    _processing_sample_files = int(STATE["files_completed"])
     batch_num = 0
     consecutive_failures = 0
+    consumers = [
+        asyncio.create_task(_consume_messages(C, queue, sem))
+        for _ in range(concurrency)
+    ]
 
-    while not stop_when(next_id):
-        if time.time() - start_time > MAX_RUNTIME:
-            STATE["last_error"] = "runtime cap reached"
-            break
-
-        if STATE["stop_requested"]:
-            break
-
-        while STATE["paused"] and not STATE["stop_requested"]:
-            fu = float(STATE.get("flood_until") or 0.0)
-            if fu and fu <= time.time():
-                STATE["flood_until"] = 0.0
-                STATE["paused"] = False
+    reached_end = False
+    try:
+        while not stop_when(next_id):
+            if time.time() - start_time > MAX_RUNTIME:
+                STATE["last_error"] = "runtime cap reached"
                 break
-            await asyncio.sleep(1.0)
 
-        if STATE["stop_requested"]:
-            break
-
-        if STATE["flood_until"] > time.time():
-            await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
-            continue
-
-        batch: List[int] = []
-        for _ in range(batch_size):
-            if stop_when(next_id):
-                break
-            batch.append(next_id)
-            next_id += step
-
-        if not batch:
-            break
-
-        batch_num += 1
-
-        got_any = await _process_batch(C, batch)
-        if got_any is None:
-            next_id -= step * len(batch)
             if STATE["stop_requested"]:
-                if str(STATE.get("fetch_error") or "").startswith(
-                    "flood too long"
-                ):
-                    raise RuntimeError(STATE["fetch_error"])
                 break
-            consecutive_failures += 1
-            if consecutive_failures >= 5:
-                raise RuntimeError(
-                    STATE.get("fetch_error")
-                    or "five consecutive message-fetch failures"
-                )
-            await asyncio.sleep(min(2 ** consecutive_failures, 30))
-            continue
 
-        if consecutive_failures:
+            while STATE["paused"] and not STATE["stop_requested"]:
+                fu = float(STATE.get("flood_until") or 0.0)
+                if fu and fu <= time.time():
+                    STATE["flood_until"] = 0.0
+                    STATE["paused"] = False
+                    break
+                await asyncio.sleep(1.0)
+
+            if STATE["stop_requested"]:
+                break
+
+            if STATE["flood_until"] > time.time():
+                await asyncio.sleep(min(5.0, STATE["flood_until"] - time.time()))
+                continue
+
+            batch: List[int] = []
+            for _ in range(batch_size):
+                if stop_when(next_id):
+                    break
+                batch.append(next_id)
+                next_id += step
+
+            if not batch:
+                break
+
+            batch_num += 1
+            messages = await _fetch_messages(C, batch)
+            if messages is None:
+                next_id -= step * len(batch)
+                if STATE["stop_requested"]:
+                    if str(STATE.get("fetch_error") or "").startswith(
+                        "flood too long"
+                    ):
+                        raise RuntimeError(STATE["fetch_error"])
+                    break
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    raise RuntimeError(
+                        STATE.get("fetch_error")
+                        or "five consecutive message-fetch failures"
+                    )
+                await asyncio.sleep(min(2 ** consecutive_failures, 30))
+                continue
+
+            consecutive_failures = 0
             STATE["fetch_error"] = None
-        consecutive_failures = 0
-        STATE["scanned_ids"] += len(batch)
-        STATE["current_message_id"] = batch[-1]
+            for message in messages:
+                media_items = _pick_media(message)
+                STATE["total_files"] += sum(
+                    1 for media in media_items if media.get("file_id")
+                )
+                await queue.put(message)
+                STATE["pending_messages"] += 1
 
-        if batch_num <= 3 or batch_num % 10 == 0:
-            logger.info(
-                f"[INDEX-WORKER] 📦 batch #{batch_num} "
-                f"ids={batch[0]}..{batch[-1]}"
-            )
+            STATE["scanned_ids"] += len(batch)
+            STATE["current_message_id"] = batch[-1]
 
-        if abs(next_id - last_checkpoint) >= CHECKPOINT_EVERY:
-            last_checkpoint = next_id
-            await _save_checkpoint(next_id)
+            if batch_num <= 3 or batch_num % 10 == 0:
+                logger.info(
+                    f"[INDEX-WORKER] 📦 batch #{batch_num} "
+                    f"ids={batch[0]}..{batch[-1]}"
+                )
 
-        if time.time() - last_progress_update >= PROGRESS_UPDATE_EVERY:
-            last_progress_update = time.time()
-            _update_speed()
-            logger.info(
-                f"[INDEX-WORKER] 📈 scanned_ids={STATE['scanned_ids']} "
-                f"files_completed={STATE['files_completed']} "
-                f"found={STATE['files_found']} saved={STATE['saved']} "
-                f"dup={STATE['duplicate_id']} "
-                f"checked={STATE['dups_checked']} "
-                f"failed={STATE['failed']}"
-            )
+            if abs(next_id - last_checkpoint) >= CHECKPOINT_EVERY:
+                last_checkpoint = next_id
+                await _save_checkpoint(next_id)
 
-        if STATE["delay"] > 0:
-            await asyncio.sleep(STATE["delay"])
+            if time.time() - last_progress_update >= PROGRESS_UPDATE_EVERY:
+                last_progress_update = time.time()
+                _update_speed()
+                logger.info(
+                    f"[INDEX-WORKER] 📈 scanned_ids={STATE['scanned_ids']} "
+                    f"files_completed={STATE['files_completed']} "
+                    f"found={STATE['files_found']} saved={STATE['saved']} "
+                    f"dup={STATE['duplicate_id']} "
+                    f"checked={STATE['dups_checked']} "
+                    f"failed={STATE['failed']}"
+                )
+
+            if STATE["delay"] > 0:
+                await asyncio.sleep(STATE["delay"])
+
+        reached_end = stop_when(next_id)
+    finally:
+        while int(STATE["pending_messages"]) > 0:
+            await asyncio.sleep(1.0)
+            if time.time() - last_progress_update >= PROGRESS_UPDATE_EVERY:
+                last_progress_update = time.time()
+                _update_speed()
+                logger.info(
+                    f"[INDEX-WORKER] 📈 draining queue: "
+                    f"pending={STATE['pending_messages']} "
+                    f"files_completed={STATE['files_completed']}"
+                )
+        await queue.join()
+        for _ in consumers:
+            await queue.put(None)
+        await asyncio.gather(*consumers)
+        STATE["pending_messages"] = 0
 
     STATE["scan_complete"] = (
-        stop_when(next_id)
+        reached_end
         and not STATE["stop_requested"]
-        and not STATE["last_error"]
     )
     _update_speed()
 
 
 # ============================================================
-# BATCH
+# MESSAGE CONSUMERS
 # ============================================================
 
-async def _process_batch(C: Client, batch: List[int]) -> Optional[bool]:
-    msgs = await _fetch_messages(C, batch)
-    if msgs is None:
-        return None
-
-    valid = [
-        m for m in msgs
-        if m is not None and not getattr(m, "empty", False)
-    ]
-    if not valid:
-        return False
-
-    sem = asyncio.Semaphore(STATE["concurrency"])
-    tasks = [_process_one(C, m, sem) for m in valid]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for result in results:
-        if isinstance(result, Exception):
-            STATE["failed"] += 1
-            STATE["last_error"] = str(result)[:200]
-            logger.error(f"[INDEX-WORKER] message task failed: {result}")
-
-    return True
+async def _consume_messages(
+    C: Client,
+    queue: asyncio.Queue,
+    sem: asyncio.Semaphore,
+) -> None:
+    while True:
+        message = await queue.get()
+        try:
+            if message is None:
+                return
+            try:
+                await _process_one(C, message, sem)
+            except Exception as e:
+                STATE["failed"] += 1
+                STATE["last_error"] = str(e)[:200]
+                logger.error(f"[INDEX-WORKER] message task failed: {e}")
+        finally:
+            if message is not None:
+                STATE["pending_messages"] = max(
+                    0, int(STATE["pending_messages"]) - 1
+                )
+            queue.task_done()
 
 
 async def _fetch_messages(C: Client, batch: List[int]):
@@ -910,61 +854,74 @@ async def _is_exact_duplicate(
 
 def _update_speed() -> None:
     global _speed_sample_at, _speed_sample_ids
+    global _processing_sample_at, _processing_sample_files
 
     try:
         if not _scan_started_at:
             return
         now = time.monotonic()
-        elapsed = max(0.001, now - _speed_sample_at)
-        progress = (
-            int(STATE["precounted_ids"])
-            if STATE["precounting"]
-            else int(STATE["files_completed"])
-            if STATE["precount_complete"]
-            else int(STATE["scanned_ids"])
-        )
-        delta = max(0, progress - _speed_sample_ids)
+        scan_elapsed = max(0.001, now - _speed_sample_at)
+        scanned = int(STATE["scanned_ids"])
+        STATE["speed"] = max(0, scanned - _speed_sample_ids) / scan_elapsed
         _speed_sample_at = now
-        _speed_sample_ids = progress
+        _speed_sample_ids = scanned
 
-        STATE["speed"] = delta / elapsed
-        if STATE["precounting"]:
-            total = int(STATE["total_messages"])
-            completed = int(STATE["precounted_ids"])
-        elif STATE["precount_complete"]:
-            total = int(STATE["total_files"])
-            completed = int(STATE["files_completed"])
-        else:
-            total = int(STATE["total_messages"])
-            completed = int(STATE["scanned_ids"])
-        remaining = max(0, total - completed)
+        processing_elapsed = max(0.001, now - _processing_sample_at)
+        files_completed = int(STATE["files_completed"])
+        STATE["processing_speed"] = max(
+            0, files_completed - _processing_sample_files
+        ) / processing_elapsed
+        _processing_sample_at = now
+        _processing_sample_files = files_completed
+
         if STATE["scan_complete"]:
             STATE["eta_seconds"] = 0.0
             STATE["eta_text"] = "done"
         elif STATE["paused"] or STATE["flood_until"] > time.time():
             STATE["eta_text"] = "paused"
-        elif remaining > 0 and STATE["speed"] > 0:
-            eta_seconds = remaining / STATE["speed"]
-            STATE["eta_seconds"] = eta_seconds
-            STATE["eta_text"] = FM.duration_short(max(1, int(eta_seconds)))
         else:
-            STATE["eta_seconds"] = 0.0
-            STATE["eta_text"] = "estimating scan rate…"
+            remaining_ids = max(
+                0,
+                int(STATE["total_messages"]) - int(STATE["scanned_ids"]),
+            )
+            discovered_files = int(STATE["total_files"])
+            if STATE["scanned_ids"]:
+                files_per_id = discovered_files / int(STATE["scanned_ids"])
+            else:
+                files_per_id = 0.0
+            remaining_files = max(
+                0, discovered_files - files_completed
+            ) + remaining_ids * files_per_id
+
+            scan_eta = (
+                remaining_ids / STATE["speed"]
+                if STATE["speed"] > 0 else 0.0
+            )
+            processing_eta = (
+                remaining_files / STATE["processing_speed"]
+                if STATE["processing_speed"] > 0 else 0.0
+            )
+            eta_seconds = max(scan_eta, processing_eta)
+            if eta_seconds > 0:
+                STATE["eta_seconds"] = eta_seconds
+                STATE["eta_text"] = FM.duration_short(
+                    max(1, int(eta_seconds))
+                )
+            else:
+                STATE["eta_seconds"] = 0.0
+                STATE["eta_text"] = "estimating scan rate…"
     except Exception:
         logger.exception("[INDEX-WORKER] progress estimate failed")
 
 
 def _start_speed_sample() -> None:
     global _scan_started_at, _speed_sample_at, _speed_sample_ids
+    global _processing_sample_at, _processing_sample_files
     _scan_started_at = time.monotonic()
     _speed_sample_at = _scan_started_at
-    _speed_sample_ids = (
-        int(STATE["precounted_ids"])
-        if STATE["precounting"]
-        else int(STATE["files_completed"])
-        if STATE["precount_complete"]
-        else int(STATE["scanned_ids"])
-    )
+    _speed_sample_ids = int(STATE["scanned_ids"])
+    _processing_sample_at = _scan_started_at
+    _processing_sample_files = int(STATE["files_completed"])
 
 
 async def _save_checkpoint(current_msg_id: int) -> None:
