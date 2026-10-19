@@ -227,7 +227,9 @@ async def _process_media_item(
     metadata_source: str,
     content_mode: str,
 ) -> Dict[str, Any]:
-    if not getattr(media, "file_id", None):
+    file_id = getattr(media, "file_id", None)
+    file_unique_id = getattr(media, "file_unique_id", None)
+    if not file_id:
         return {"status": "skipped", "reason": "missing file_id"}
 
     try:
@@ -239,7 +241,7 @@ async def _process_media_item(
     from services.duplicate import file_identity_lock
     async with file_identity_lock(
         str(media.file_id),
-        str(getattr(media, "file_unique_id", None) or ""),
+        str(file_unique_id or ""),
     ):
         ok, code = await save_file(
             media,
@@ -284,8 +286,13 @@ async def save_file(
         file_id = getattr(media, "file_id", None)
         if not file_id:
             return (False, 2)
+        file_unique_id = str(getattr(media, "file_unique_id", None) or "")
 
-        from services.duplicate import compute_fingerprint, find_exact_file_id
+        from services.duplicate import (
+            canonical_file_id,
+            compute_fingerprint,
+            find_exact_file_id,
+        )
         fingerprint = compute_fingerprint(str(file_id))
         if not fingerprint:
             logger.error("[PIPELINE] failed to compute file_id fingerprint")
@@ -307,7 +314,7 @@ async def save_file(
             if await find_exact_file_id(
                 str(file_id),
                 entries,
-                str(getattr(media, "file_unique_id", None) or ""),
+                file_unique_id,
             ):
                 return (True, 0)
         except Exception as e:
@@ -336,8 +343,11 @@ async def save_file(
         document_fields = {
             key: value for key, value in record.items() if key != "_id"
         }
-        file_unique_id = str(getattr(media, "file_unique_id", None) or "")
-        document_id = file_unique_id or str(file_id)
+        document_id = (
+            file_unique_id
+            or canonical_file_id(str(file_id))
+            or str(file_id)
+        )
 
         try:
             await target_db["media_files"].update_one(
@@ -352,7 +362,7 @@ async def save_file(
                     if await find_exact_file_id(
                         str(file_id),
                         entries,
-                        str(getattr(media, "file_unique_id", None) or ""),
+                        file_unique_id,
                     ):
                         return (True, 0)
                 except Exception as check_error:
@@ -370,7 +380,7 @@ async def save_file(
                 if await find_exact_file_id(
                     str(file_id),
                     entries,
-                    str(getattr(media, "file_unique_id", None) or ""),
+                    file_unique_id,
                 ):
                     return (True, 0)
                 entry, target_db = await _pick_shard_fill_first()
@@ -390,7 +400,7 @@ async def save_file(
                         if await find_exact_file_id(
                             str(file_id),
                             entries,
-                            str(getattr(media, "file_unique_id", None) or ""),
+                            file_unique_id,
                         ):
                             return (True, 0)
                     except Exception as check_error:
@@ -429,6 +439,8 @@ def _build_record(
     fingerprint: str,
     metadata_source: str,
 ) -> Dict[str, Any]:
+    from services.duplicate import canonical_file_id
+
     fname = str(getattr(media, "file_name", "") or "").strip()
     caption = str(
         getattr(media, "caption", None)
@@ -474,6 +486,7 @@ def _build_record(
     rec: Dict[str, Any] = {
         "_id": str(
             getattr(media, "file_unique_id", None)
+            or canonical_file_id(getattr(media, "file_id", None))
             or getattr(media, "file_id", "")
         ),
         "fingerprint": fingerprint,

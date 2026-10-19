@@ -10,18 +10,22 @@
 #   • plugins/indexing/worker.py
 #
 # Duplicate decisions use Telegram's stable file_unique_id across every MEDIA
-# shard. file_id is retained in the public function signature for callers.
+# shard, falling back to file_id only when Telegram does not provide one.
 #
 # ============================================================
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
+from struct import pack
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, Iterable, Optional, Set
+
+from pyrogram.file_id import FileId
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,37 @@ def compute_fingerprint(file_id: Optional[str]) -> str:
         return ""
 
 
+def canonical_file_id(file_id: Optional[str]) -> str:
+    """Normalize a Telegram file_id like the legacy media database did."""
+    if not file_id:
+        return ""
+    try:
+        decoded = FileId.decode(str(file_id))
+        raw = pack(
+            "<iiqq",
+            int(decoded.file_type),
+            decoded.dc_id,
+            decoded.media_id,
+            decoded.access_hash,
+        )
+        encoded = bytearray()
+        zero_count = 0
+        for byte in raw + bytes((22, 4)):
+            if byte == 0:
+                zero_count += 1
+                continue
+            if zero_count:
+                encoded.extend((0, zero_count))
+                zero_count = 0
+            encoded.append(byte)
+        return base64.urlsafe_b64encode(encoded).decode().rstrip("=")
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    except Exception:
+        logger.debug("Could not canonicalize Telegram file_id", exc_info=True)
+        return ""
+
+
 def file_id_lock(file_id: str) -> asyncio.Lock:
     """Serialize concurrent checks and writes for the same file ID."""
     digest = hashlib.sha256(file_id.encode("utf-8")).digest()
@@ -63,7 +98,11 @@ async def file_identity_lock(
 ):
     """Serialize indexing operations sharing either Telegram file identity."""
     lock_indexes = set()
-    for identity in (file_id, file_unique_id or ""):
+    for identity in (
+        file_id,
+        canonical_file_id(file_id),
+        file_unique_id or "",
+    ):
         if identity:
             digest = hashlib.sha256(identity.encode("utf-8")).digest()
             lock_indexes.add(
@@ -85,10 +124,23 @@ async def find_exact_file_id(
     entries: Optional[Iterable[Any]] = None,
     file_unique_id: Optional[str] = None,
 ) -> bool:
-    """Search every MEDIA shard by Telegram's stable unique file ID only."""
+    """Search shards by Telegram unique ID and legacy canonical file ID."""
     file_unique_id = str(file_unique_id or "")
-    if not file_unique_id:
+    raw_file_id = str(file_id or "")
+    stable_file_id = canonical_file_id(raw_file_id)
+    identity_clauses = []
+    if file_unique_id:
+        identity_clauses.extend(
+            ({"file_unique_id": file_unique_id}, {"_id": file_unique_id})
+        )
+    for identity in dict.fromkeys((stable_file_id, raw_file_id)):
+        if identity:
+            identity_clauses.extend(
+                ({"file_id": identity}, {"_id": identity})
+            )
+    if not identity_clauses:
         return False
+    identity_query = {"$or": identity_clauses}
 
     if entries is None:
         from database import db_registry
@@ -111,7 +163,8 @@ async def find_exact_file_id(
     for entry in online_entries:
         try:
             existing = await entry.db["media_files"].find_one(
-                {"file_unique_id": file_unique_id}, {"_id": 1},
+                identity_query,
+                {"_id": 1},
             )
             if existing:
                 return True
@@ -223,6 +276,7 @@ def stats() -> dict:
 
 __all__ = [
     "compute_fingerprint",
+    "canonical_file_id",
     "file_id_lock",
     "file_identity_lock",
     "find_exact_file_id",

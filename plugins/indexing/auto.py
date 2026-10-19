@@ -360,6 +360,10 @@ def _record_result(message, result: Dict[str, Any]) -> None:
         )
     elif status == "duplicate":
         STATE["duplicate_id"] += 1
+        logger.info(
+            f"[AUTO-INDEX] ♻️ Telegram file identity duplicate "
+            f"msg={getattr(message, 'id', '?')}"
+        )
     elif status == "skipped":
         reason = str(result.get("reason") or "")
         if "file_id" in reason:
