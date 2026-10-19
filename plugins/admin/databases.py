@@ -28,7 +28,6 @@ from pyrogram.types import (
 
 from core import config
 from database import db_registry
-from services.atlas_storage import get_disk_space
 from utils import fonts as F
 from utils import format as FM
 from utils import progress as P
@@ -53,6 +52,7 @@ def _is_admin(uid) -> bool:
 
 IST = timezone(timedelta(hours=5, minutes=30))
 BAR_W = 14
+DB_STORAGE_CAPACITY = 512 * 1024 * 1024
 CACHE_TTL = 8
 LIVE_DEFAULT = 3
 LIVE_OPTIONS = [3, 15, 30]
@@ -125,6 +125,25 @@ def bar_line(label: str, pct_val: float, width: int = BAR_W) -> str:
         f"{color} <b>{F.sc(label)}</b> · <code>{pct_val:.1f}%</code>\n"
         f"<code>{bar}</code>"
     )
+
+
+def storage_usage_block(
+    storage_size: int, width: int = 10, online: bool = True,
+) -> str:
+    if not online:
+        return f"⚪ {F.sc('storage usage unavailable while database is offline')}"
+
+    used = max(0, storage_size)
+    remaining = max(0, DB_STORAGE_CAPACITY - used)
+    pct = used / DB_STORAGE_CAPACITY * 100
+    return "\n".join([
+        bar_line("estimated storage used (512 MB cap)", pct, width),
+        one_line(
+            "used / remaining",
+            f"{FM.size(used)} / {FM.size(remaining)}",
+            "💾",
+        ),
+    ])
 
 
 def one_line(label: str, value: str, icon: str = "•") -> str:
@@ -377,7 +396,6 @@ class StatsManager:
             "collections": 0, "objects": 0,
             "data_size": 0, "storage_size": 0, "index_size": 0,
             "avg_obj": 0, "collection_names": [],
-            "atlas_disk": {"available": False, "reason": "Database is offline"},
         }
         p = await Diagnostics.ping(db)
         if p is None:
@@ -397,7 +415,6 @@ class StatsManager:
 
         out["collection_names"] = await Diagnostics.list_collections(db)
         out["version"] = await Diagnostics.build_version(db)
-        out["atlas_disk"] = await get_disk_space(entry)
         return out
 
     def _totals(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -740,21 +757,7 @@ def _status(items: List[Dict[str, Any]]) -> str:
     return f"🟡 {up}/{len(items)} {F.sc('online')}"
 
 
-def _atlas_disk_line(info: Dict[str, Any]) -> str:
-    disk = info.get("atlas_disk") or {}
-    if not disk.get("available"):
-        value = esc(f"unavailable · {disk.get('reason', 'not reported')}")
-    else:
-        value = (
-            f"{FM.size(disk['free_bytes'])} free · "
-            f"{FM.size(disk['used_bytes'])} used / "
-            f"{FM.size(disk['total_bytes'])} total"
-        )
-    return one_line("Atlas physical disk (not quota)", value, "💽")
-
-
-def _db_block(cat: str, d: Dict[str, Any],
-              share_pct: Optional[float] = None) -> str:
+def _db_block(cat: str, d: Dict[str, Any]) -> str:
     status = "🟢" if d["online"] else "🔴"
     ping = f"{d['ping_ms']}ms" if d["ping_ms"] is not None else "—"
     label = d.get("label") or f"{cat}-{d['index']:02d}"
@@ -769,12 +772,9 @@ def _db_block(cat: str, d: Dict[str, Any],
         one_line("data", FM.size(d["data_size"]), "📄"),
         one_line("indexes", FM.size(d["index_size"]), "🧩"),
         one_line("collections", FM.num(d["collections"]), "🗂️"),
-        _atlas_disk_line(d),
+        "",
+        storage_usage_block(d["storage_size"], online=d["online"]),
     ]
-
-    if share_pct is not None:
-        lines.append("")
-        lines.append(bar_line("share of category", share_pct, width=10))
 
     return "\n".join(lines)
 
@@ -962,7 +962,6 @@ async def view_category(cat: str):
     }
     icon, t = titles.get(cat, (F.EMO['db'], "DATABASE CONTROL"))
 
-    total_docs = max(1, data["totals"]["objects"])
     lines = [
         _header(), "",
         f"{icon} <b>{F.fb(t)}</b>",
@@ -972,8 +971,7 @@ async def view_category(cat: str):
         "",
     ]
     for item in data["items"]:
-        share = (item["objects"] / total_docs) * 100 if total_docs else 0
-        lines.append(_db_block(cat, item, share_pct=share))
+        lines.append(_db_block(cat, item))
         lines.append("")
         lines.append(F.DIV)
         lines.append("")
@@ -1063,7 +1061,8 @@ async def view_db(cat: str, index: int):
         one_line("storage", FM.size(info['storage_size']), "💾"),
         one_line("indexes", FM.size(info['index_size']), "🧩"),
         one_line("avg object", FM.size(int(info['avg_obj'] or 0)), "📐"),
-        _atlas_disk_line(info),
+        "",
+        storage_usage_block(info["storage_size"], online=info["online"]),
         "",
         f"<b>{F.fb('PERFORMANCE METRICS')}</b>",
         bar_line("index overhead", overhead, width=10),
