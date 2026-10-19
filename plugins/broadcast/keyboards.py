@@ -415,8 +415,14 @@ def kb_conf_channels(
     return InlineKeyboardMarkup(rows)
 
 
-def kb_conf_caption(sid: str, has_channel: bool) -> InlineKeyboardMarkup:
+def kb_conf_caption(
+    sid: str, has_channel: bool, button_count: int = 0
+) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton(
+            "🎲 RANDOM CAPTION",
+            callback_data=f"bcconf:{sid}:cap:random",
+        )],
         [InlineKeyboardButton(
             "📄 USE FILE'S OWN CAPTION",
             callback_data=f"bcconf:{sid}:cap:own",
@@ -431,6 +437,16 @@ def kb_conf_caption(sid: str, has_channel: bool) -> InlineKeyboardMarkup:
             "📢 USE CHANNEL CAPTION",
             callback_data=f"bcconf:{sid}:cap:channel",
         )])
+    rows.extend([
+        [InlineKeyboardButton(
+            "✏️ WRITE ONE-TIME CAPTION",
+            callback_data=f"bcconf:{sid}:cap:custom",
+        )],
+        [InlineKeyboardButton(
+            f"🔘 ADD ONE-TIME BUTTON ({button_count})",
+            callback_data=f"bcconf:{sid}:button:add",
+        )],
+    ])
     rows.append([InlineKeyboardButton(
         "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel",
     )])
@@ -471,6 +487,10 @@ def kb_conf_confirm(sid: str) -> InlineKeyboardMarkup:
             callback_data=f"bcconf:{sid}:chtimer",
         )],
         [InlineKeyboardButton(
+            "🔘 ADD ONE-TIME BUTTON",
+            callback_data=f"bcconf:{sid}:button:add",
+        )],
+        [InlineKeyboardButton(
             "❌ CANCEL", callback_data=f"bcconf:{sid}:cancel",
         )],
     ])
@@ -489,6 +509,10 @@ def kb_conf_preview(sid: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(
             "⏱️ CHANGE TIMER",
             callback_data=f"bcconf:{sid}:chtimer",
+        )],
+        [InlineKeyboardButton(
+            "🔘 ADD ONE-TIME BUTTON",
+            callback_data=f"bcconf:{sid}:button:add",
         )],
         [InlineKeyboardButton(
             "◀️ BACK",

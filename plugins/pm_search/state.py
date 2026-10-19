@@ -40,6 +40,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     # ── Delivered caption ──
     "caption_template": (
         "🎬 <b>{title}</b>\n"
+        "📁 {file_name}\n"
         "📅 {year}\n"
         "🎞️ {quality}\n"
         "🧬 {codec}\n"
