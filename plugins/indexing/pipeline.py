@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import logging
 import re
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from pyrogram import enums
+
+from core import config
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +37,49 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ============================================================
 
-_SUPPORTED = (
-    enums.MessageMediaType.PHOTO,
-    enums.MessageMediaType.VIDEO,
-    enums.MessageMediaType.AUDIO,
-    enums.MessageMediaType.DOCUMENT,
-    enums.MessageMediaType.ANIMATION,
-    enums.MessageMediaType.VOICE,
-    enums.MessageMediaType.VIDEO_NOTE,
-    enums.MessageMediaType.STICKER,
+_ALLOWED_MEDIA_TYPES = {
+    "document", "video", "audio", "photo",
+    "animation", "voice", "video_note", "sticker",
+}
+_configured_media_types = {
+    str(media_type).strip().lower()
+    for media_type in config.INDEX_MEDIA_TYPES
+    if str(media_type).strip()
+}
+_invalid_media_types = _configured_media_types - _ALLOWED_MEDIA_TYPES
+if _invalid_media_types:
+    logger.warning(
+        "[PIPELINE] ignoring unsupported INDEX_MEDIA_TYPES: %s",
+        ", ".join(sorted(_invalid_media_types)),
+    )
+_configured_media_types &= _ALLOWED_MEDIA_TYPES
+if not _configured_media_types:
+    logger.warning(
+        "[PIPELINE] INDEX_MEDIA_TYPES has no supported values; "
+        "falling back to all supported media types"
+    )
+    _configured_media_types = set(_ALLOWED_MEDIA_TYPES)
+
+_SUPPORTED = tuple(
+    media_type
+    for media_type in enums.MessageMediaType
+    if media_type.value in _configured_media_types
+)
+_dedup_mode = str(config.INDEX_DEDUP_MODE or "both").strip().lower()
+if _dedup_mode not in {"file_id", "name_size", "both"}:
+    logger.warning(
+        "[PIPELINE] invalid INDEX_DEDUP_MODE=%r; using both",
+        _dedup_mode,
+    )
+    _dedup_mode = "both"
+
+_SAVE_COMMIT_ERROR: ContextVar[bool] = ContextVar(
+    "index_save_commit_error",
+    default=False,
+)
+_SAVE_DUPLICATE_REASON: ContextVar[str] = ContextVar(
+    "index_save_duplicate_reason",
+    default="",
 )
 _PAID_MEDIA_TYPES = {"photo", "video", "animation"}
 
@@ -209,7 +246,10 @@ def extract_media_items(message) -> List[Tuple[Any, str]]:
         return [
             (item, type(item).__name__.lower())
             for item in items
-            if type(item).__name__.lower() in _PAID_MEDIA_TYPES
+            if (
+                type(item).__name__.lower() in _PAID_MEDIA_TYPES
+                and type(item).__name__.lower() in _configured_media_types
+            )
         ]
 
     if media_type not in _SUPPORTED:
@@ -237,6 +277,25 @@ async def _process_media_item(
         media.caption = getattr(message, "caption", None)
     except Exception:
         pass
+    file_name = getattr(media, "file_name", None)
+    if not file_name:
+        identity = str(file_unique_id or file_id)[:12]
+        file_name = f"{file_type}_{identity}"
+        try:
+            media.file_name = file_name
+        except Exception as e:
+            logger.warning(
+                "[PIPELINE] could not set synthetic file_name "
+                "for %s: %s",
+                file_type,
+                e,
+            )
+    if not getattr(media, "file_size", 0):
+        logger.debug(
+            "[PIPELINE] file size unavailable for %s file=%s; storing 0",
+            file_type,
+            file_name,
+        )
 
     from services.duplicate import file_identity_lock
     async with file_identity_lock(
@@ -260,10 +319,19 @@ async def _process_media_item(
         )
         return {"status": "saved", "record": record}
     if ok and code == 0:
-        return {"status": "duplicate", "reason": "same file_unique_id"}
+        return {
+            "status": "duplicate",
+            "reason": _SAVE_DUPLICATE_REASON.get() or "same file identity",
+            "file_name": file_name,
+        }
     if ok and code == -1:
         return {"status": "skipped", "reason": "filtered by content mode"}
-    return {"status": "error", "reason": f"save_file code={code}"}
+    return {
+        "status": "error",
+        "reason": f"save_file code={code}",
+        "file_name": file_name,
+        "commit_error": _SAVE_COMMIT_ERROR.get(),
+    }
 
 
 # ============================================================
@@ -282,9 +350,12 @@ async def save_file(
         (True, 0)  → duplicate
         (False, 2) → error
     """
+    _SAVE_COMMIT_ERROR.set(False)
+    _SAVE_DUPLICATE_REASON.set("")
     try:
         file_id = getattr(media, "file_id", None)
         if not file_id:
+            logger.warning("[PIPELINE] save_file skipped: missing file_id")
             return (False, 2)
         file_unique_id = str(getattr(media, "file_unique_id", None) or "")
 
@@ -295,7 +366,7 @@ async def save_file(
         )
         fingerprint = compute_fingerprint(str(file_id))
         if not fingerprint:
-            logger.error("[PIPELINE] failed to compute file_id fingerprint")
+            logger.warning("[PIPELINE] failed to compute file_id fingerprint")
             return (False, 2)
 
         # ── 1. Exact duplicate check across all configured MEDIA shards ──
@@ -303,29 +374,31 @@ async def save_file(
             from database import db_registry
             entries = list(db_registry.media_entries())
         except Exception as e:
-            logger.error(f"[PIPELINE] registry error: {e}")
+            logger.warning(f"[PIPELINE] registry error: {e}")
             return (False, 2)
 
         if not entries:
-            logger.error("[PIPELINE] no media shards")
+            logger.warning("[PIPELINE] no media shards configured")
             return (False, 2)
 
-        try:
-            if await find_exact_file_id(
-                str(file_id),
-                entries,
-                file_unique_id,
-            ):
-                return (True, 0)
-        except Exception as e:
-            logger.error(f"[PIPELINE] duplicate check failed: {e}")
-            return (False, 2)
+        if _dedup_mode in {"file_id", "both"}:
+            try:
+                if await find_exact_file_id(
+                    str(file_id),
+                    entries,
+                    file_unique_id,
+                ):
+                    _SAVE_DUPLICATE_REASON.set("file_id")
+                    return (True, 0)
+            except Exception as e:
+                logger.warning(f"[PIPELINE] file_id duplicate check failed: {e}")
+                return (False, 2)
 
         # ── 2. Pick target shard using current usage (fill-first) ──
         try:
             entry, target_db = await _pick_shard_fill_first()
         except Exception as e:
-            logger.error(f"[PIPELINE] no shard available: {e}")
+            logger.warning(f"[PIPELINE] no shard available: {e}")
             return (False, 2)
 
         shard_label = entry.label
@@ -343,6 +416,27 @@ async def save_file(
         document_fields = {
             key: value for key, value in record.items() if key != "_id"
         }
+        file_name = record["file_name"]
+        file_size = record["file_size"]
+        if _dedup_mode in {"name_size", "both"}:
+            try:
+                existing = await target_db["media_files"].find_one(
+                    {"file_name": file_name, "file_size": file_size},
+                    {"_id": 1},
+                )
+            except Exception as e:
+                logger.warning(
+                    "[PIPELINE] name+size duplicate check failed "
+                    "file=%r size=%s: %s",
+                    file_name,
+                    file_size,
+                    e,
+                )
+                return (False, 2)
+            if existing:
+                _SAVE_DUPLICATE_REASON.set("name+size")
+                logger.info("[DUP] name+size %s %s", file_name, file_size)
+                return (True, 0)
         document_id = (
             file_unique_id
             or canonical_file_id(str(file_id))
@@ -358,18 +452,22 @@ async def save_file(
         except Exception as e:
             from pymongo.errors import DuplicateKeyError
             if isinstance(e, DuplicateKeyError):
-                try:
-                    if await find_exact_file_id(
-                        str(file_id),
-                        entries,
-                        file_unique_id,
-                    ):
-                        return (True, 0)
-                except Exception as check_error:
-                    logger.error(
-                        f"[PIPELINE] duplicate recheck failed: {check_error}"
-                    )
-                logger.exception("[PIPELINE] duplicate-key write failed")
+                if _dedup_mode in {"file_id", "both"}:
+                    try:
+                        if await find_exact_file_id(
+                            str(file_id),
+                            entries,
+                            file_unique_id,
+                        ):
+                            _SAVE_DUPLICATE_REASON.set("file_id")
+                            return (True, 0)
+                    except Exception as check_error:
+                        logger.warning(
+                            "[PIPELINE] duplicate recheck failed: %s",
+                            check_error,
+                        )
+                _SAVE_COMMIT_ERROR.set(True)
+                logger.warning("[PIPELINE] duplicate-key write failed: %s", e)
                 return (False, 2)
 
             # The selected shard failed; re-check all shards and retry.
@@ -377,12 +475,14 @@ async def save_file(
                 f"[PIPELINE] write failed, re-picking shard: {e}"
             )
             try:
-                if await find_exact_file_id(
-                    str(file_id),
-                    entries,
-                    file_unique_id,
-                ):
-                    return (True, 0)
+                if _dedup_mode in {"file_id", "both"}:
+                    if await find_exact_file_id(
+                        str(file_id),
+                        entries,
+                        file_unique_id,
+                    ):
+                        _SAVE_DUPLICATE_REASON.set("file_id")
+                        return (True, 0)
                 entry, target_db = await _pick_shard_fill_first()
                 shard_label = entry.label
                 shard_index = entry.index
@@ -395,19 +495,24 @@ async def save_file(
                 )
             except Exception as e2:
                 from pymongo.errors import DuplicateKeyError
-                if isinstance(e2, DuplicateKeyError):
+                if (
+                    isinstance(e2, DuplicateKeyError)
+                    and _dedup_mode in {"file_id", "both"}
+                ):
                     try:
                         if await find_exact_file_id(
                             str(file_id),
                             entries,
                             file_unique_id,
                         ):
+                            _SAVE_DUPLICATE_REASON.set("file_id")
                             return (True, 0)
                     except Exception as check_error:
-                        logger.error(
+                        logger.warning(
                             f"[PIPELINE] duplicate recheck failed: {check_error}"
                         )
-                logger.exception(f"[PIPELINE] retry save failed: {e2}")
+                _SAVE_COMMIT_ERROR.set(True)
+                logger.warning(f"[PIPELINE] retry save failed: {e2}")
                 return (False, 2)
 
         # ── 4. Best-effort bloom add ──
@@ -425,7 +530,7 @@ async def save_file(
         return (True, 1)
 
     except Exception as e:
-        logger.exception(f"[PIPELINE] save_file: {e}")
+        logger.warning(f"[PIPELINE] save_file failed: {e}")
         return (False, 2)
 
 
@@ -442,6 +547,28 @@ def _build_record(
     from services.duplicate import canonical_file_id
 
     fname = str(getattr(media, "file_name", "") or "").strip()
+    if not fname:
+        media_type = str(
+            getattr(media, "file_type", None)
+            or getattr(getattr(message, "media", None), "value", None)
+            or "media"
+        )
+        identity = str(
+            getattr(media, "file_unique_id", None)
+            or getattr(media, "file_id", "")
+        )[:12]
+        fname = f"{media_type}_{identity}"
+
+    raw_size = getattr(media, "file_size", 0) or 0
+    try:
+        file_size = int(raw_size)
+    except (TypeError, ValueError):
+        file_size = 0
+        logger.debug(
+            "[PIPELINE] invalid file size %r for %s; storing 0",
+            raw_size,
+            fname,
+        )
     caption = str(
         getattr(media, "caption", None)
         or getattr(message, "caption", "")
@@ -494,7 +621,7 @@ def _build_record(
         "file_id": getattr(media, "file_id", None),
         "file_unique_id": getattr(media, "file_unique_id", None),
         "file_name": fname,
-        "file_size": int(getattr(media, "file_size", 0) or 0),
+        "file_size": file_size,
         "mime_type": getattr(media, "mime_type", None),
         "duration": int(getattr(media, "duration", 0) or 0),
         "file_type": (

@@ -145,7 +145,7 @@ async def get_suggestions(
     limit: int = 8,
 ) -> List[Dict[str, Any]]:
     """
-    Return TMDB suggestion list for a query.
+    Return TMDB suggestions, falling back to IMDb when TMDB has no match.
 
     Used when the DB returns no hits.
     """
@@ -156,51 +156,51 @@ async def get_suggestions(
     if not base or len(base) < 2:
         return []
 
+    raw: List[Dict[str, Any]] = []
     try:
         from providers import tmdb_provider as TP
-    except Exception as e:
-        logger.debug(f"[SUGGEST] provider: {e}")
-        return []
 
-    items: List[Dict[str, Any]] = []
-
-    try:
         if is_series:
             raw = await TP.search_tv(base)
         else:
-            # Try both; movie results first for non-series queries
             raw_movies = await TP.search_movie(base)
             raw_series = await TP.search_tv(base)
-
-            # Interleave by popularity
-            merged = []
-            for m in raw_movies[:6]:
-                merged.append(m)
-            for s in raw_series[:4]:
-                merged.append(s)
-            raw = merged
+            raw = [*raw_movies[:6], *raw_series[:4]]
     except Exception as e:
         logger.debug(f"[SUGGEST] search: {e}")
-        return []
+
+    if not raw:
+        try:
+            from providers import imdb_provider as IP
+            raw = await IP.search(base, kind="series" if is_series else "any")
+        except Exception as e:
+            logger.debug(f"[SUGGEST] imdb: {e}")
+            return []
 
     # Normalize to suggestion shape
+    items: List[Dict[str, Any]] = []
     seen = set()
     for item in raw:
         tmdb_id = item.get("tmdb_id")
-        if not tmdb_id or tmdb_id in seen:
+        imdb_id = item.get("imdb_id") or item.get("imdbID")
+        provider_id = tmdb_id or imdb_id
+        if not provider_id or provider_id in seen:
             continue
-        seen.add(tmdb_id)
+        seen.add(provider_id)
 
-        items.append({
+        suggestion = {
             "title": item.get("title") or "",
             "year": item.get("year") or "",
             "rating": item.get("rating") or 0,
             "kind": item.get("kind") or "movie",
-            "tmdb_id": int(tmdb_id),
+            "tmdb_id": int(tmdb_id) if tmdb_id else None,
+            "imdb_id": imdb_id,
+            "source": "tmdb" if tmdb_id else "imdb",
             "poster": item.get("poster"),
             "overview": item.get("overview") or "",
             "popularity": item.get("popularity") or 0,
-        })
+        }
+        items.append(suggestion)
 
         if len(items) >= limit:
             break

@@ -124,6 +124,7 @@ async def _setup_all_indexes() -> None:
         ("requests", _setup_requests_indexes),
         ("flow_engine", _setup_flow_indexes),
         ("premium", _setup_premium_indexes),
+        ("indexing", _setup_indexing_indexes),
     ]
 
     for name, fn in tasks:
@@ -132,6 +133,12 @@ async def _setup_all_indexes() -> None:
             logger.info(f"[BOOT] ✅ {name} indexes")
         except Exception as e:
             logger.warning(f"[BOOT] {name} indexes failed: {e}")
+
+
+async def _setup_indexing_indexes() -> None:
+    """Ensure indexing indexes, including the name-and-size lookup index."""
+    from plugins.indexing import worker as indexing_worker
+    await indexing_worker._ensure_indexes()
 
 
 async def _setup_series_indexes():
@@ -249,6 +256,13 @@ async def _start_all_loops(bot) -> None:
     except Exception as e:
         logger.debug(f"[BOOT] sessions cleanup: {e}")
 
+    # ── Media database health and recovery ──
+    try:
+        loop.create_task(_media_db_health_loop())
+        started.append("media_db_health")
+    except Exception as e:
+        logger.debug(f"[BOOT] media DB health loop: {e}")
+
     # ── Requests delivery-token cleanup ──
     try:
         from plugins.requests import cleanup as _req_cleanup
@@ -324,6 +338,18 @@ async def _start_all_loops(bot) -> None:
         f"[BOOT] ✅ Started {len(started)} background loops: "
         f"{', '.join(started)}"
     )
+
+
+async def _media_db_health_loop() -> None:
+    """Keep media-shard health current and retry unavailable shards."""
+    while True:
+        try:
+            await db_manager.check_media_shards()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[DB] media shard health check failed")
+        await asyncio.sleep(30)
 
 
 async def _requests_cleanup_loop() -> None:

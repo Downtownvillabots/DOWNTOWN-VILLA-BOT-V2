@@ -373,9 +373,10 @@ def _record_result(message, result: Dict[str, Any]) -> None:
     else:
         STATE["failed"] += 1
         STATE["last_error"] = str(result.get("reason") or "?")[:200]
-        logger.error(
-            f"[AUTO-INDEX] failed msg={getattr(message, 'id', '?')}: "
-            f"{STATE['last_error']}"
+        logger.warning(
+            "[CHANNEL] save failed reason=%s file=%s",
+            STATE["last_error"],
+            result.get("file_name") or "?",
         )
 
 

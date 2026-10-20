@@ -82,6 +82,7 @@ STATE: Dict[str, Any] = {
     "scan_complete": False,
 
     "processed": 0,
+    "total_fetched": 0,
     "files_found": 0,
     "files_completed": 0,
     "saved": 0,
@@ -90,6 +91,7 @@ STATE: Dict[str, Any] = {
     "skipped_no_media": 0,
     "skipped_no_file_id": 0,
     "failed": 0,
+    "commit_errors": 0,
     "movies": 0,
     "series": 0,
 
@@ -148,6 +150,7 @@ def status() -> Dict[str, Any]:
         "metadata_source": STATE["metadata_source"],
         "job_id": STATE["job_id"],
         "total_messages": STATE["total_messages"],
+        "batch_size": STATE["batch_size"],
         "total_files": STATE["total_files"],
         "estimated_total_files": _estimated_total_files(),
         "current_message_id": STATE["current_message_id"],
@@ -155,6 +158,7 @@ def status() -> Dict[str, Any]:
         "pending_messages": STATE["pending_messages"],
         "scan_complete": STATE["scan_complete"],
         "processed": STATE["processed"],
+        "total_fetched": STATE["total_fetched"],
         "files_found": STATE["files_found"],
         "files_completed": STATE["files_completed"],
         "saved": STATE["saved"],
@@ -163,6 +167,7 @@ def status() -> Dict[str, Any]:
         "skipped_no_media": STATE["skipped_no_media"],
         "skipped_no_file_id": STATE["skipped_no_file_id"],
         "failed": STATE["failed"],
+        "commit_errors": STATE["commit_errors"],
         "movies": STATE["movies"],
         "series": STATE["series"],
         "speed": STATE["speed"],
@@ -252,6 +257,7 @@ async def start_worker(
             "pending_messages": 0,
             "scan_complete": False,
             "processed": 0,
+            "total_fetched": 0,
             "files_found": 0,
             "files_completed": 0,
             "saved": 0,
@@ -260,6 +266,7 @@ async def start_worker(
             "skipped_no_media": 0,
             "skipped_no_file_id": 0,
             "failed": 0,
+            "commit_errors": 0,
             "movies": 0,
             "series": 0,
             "speed": 0.0,
@@ -340,9 +347,14 @@ async def _ensure_indexes() -> None:
             await coll.create_index("created_at",
                                     name="created_at_idx",
                                     background=True)
+            await coll.create_index(
+                [("file_name", 1), ("file_size", 1)],
+                name="name_size_lookup",
+                background=True,
+            )
             logger.info(f"[INDEX-WORKER] 🧩 indexes ok on {e.label}")
         except Exception as ex:
-            logger.debug(f"[INDEX-WORKER] index {e.label}: {ex}")
+            logger.warning(f"[INDEX-WORKER] index {e.label} failed: {ex}")
 
     _indexes_ready = True
 
@@ -600,6 +612,7 @@ async def _walk_messages(C: Client, start_id: int, end_id: int) -> None:
 
             consecutive_failures = 0
             STATE["fetch_error"] = None
+            STATE["total_fetched"] += len(messages)
             for message in messages:
                 media_items = _pick_media(message)
                 STATE["total_files"] += sum(
@@ -819,8 +832,10 @@ def _record_result(msg, result: Dict[str, Any]) -> None:
             STATE["skipped_no_media"] += 1
     else:
         STATE["failed"] += 1
+        if result.get("commit_error"):
+            STATE["commit_errors"] += 1
         STATE["last_error"] = str(result.get("reason") or "?")[:200]
-        logger.error(
+        logger.warning(
             f"[INDEX-WORKER] ❌ save failed msg={msg.id}: "
             f"{STATE['last_error']}"
         )
@@ -962,6 +977,7 @@ async def _finalize(status: Optional[str] = None) -> None:
             "skipped_no_media": STATE["skipped_no_media"],
             "skipped_no_file_id": STATE["skipped_no_file_id"],
             "failed": STATE["failed"],
+            "commit_errors": STATE["commit_errors"],
             "movies": STATE["movies"],
             "series": STATE["series"],
         })

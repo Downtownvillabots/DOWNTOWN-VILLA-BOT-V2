@@ -304,6 +304,14 @@ AUTO_DELETE_ENABLED: bool = env_bool("AUTO_DELETE_ENABLED", True)
 AUTO_DELETE_MINUTES: int = env_int("AUTO_DELETE_MINUTES", 10)
 AUTO_INDEXING_ENABLED: bool = env_bool("AUTO_INDEXING_ENABLED", True)
 INDEXING_THRESHOLD_MB: int = env_int("INDEXING_THRESHOLD_MB", 400)
+INDEX_DEDUP_MODE: str = env_str("INDEX_DEDUP_MODE", "both").lower()
+INDEX_MEDIA_TYPES: List[str] = env_list(
+    "INDEX_MEDIA_TYPES",
+    sep=",",
+) or [
+    "document", "video", "audio", "photo",
+    "animation", "voice", "video_note", "sticker",
+]
 
 BACKUP_AUTO_START: bool = env_bool("BACKUP_AUTO_START", False)
 BACKUP_WATCH_INTERVAL: int = env_int("BACKUP_WATCH_INTERVAL", 5)
@@ -395,6 +403,8 @@ def snapshot() -> Dict[str, Any]:
         },
         "metadata_provider": METADATA_PROVIDER,
         "db_capacity_mb": DB_CAPACITY_MB,
+        "index_dedup_mode": INDEX_DEDUP_MODE,
+        "index_media_types": INDEX_MEDIA_TYPES,
     }
 
 
@@ -444,6 +454,7 @@ __all__ = [
     # Flags
     "FORCE_SUB_ENABLED", "AUTO_DELETE_ENABLED", "AUTO_DELETE_MINUTES",
     "AUTO_INDEXING_ENABLED", "INDEXING_THRESHOLD_MB",
+    "INDEX_DEDUP_MODE", "INDEX_MEDIA_TYPES",
     "BACKUP_AUTO_START", "BACKUP_WATCH_INTERVAL",
     "BACKUP_UPLOAD_DELAY", "BACKUP_MAX_RETRIES", "BACKUP_RETRY_DELAY",
     "MAINTENANCE_MODE", "PM_SEARCH_ENABLED",

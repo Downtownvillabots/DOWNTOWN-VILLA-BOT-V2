@@ -224,11 +224,18 @@ async def _build_live_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarku
 async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     scanned = int(w.get("scanned_ids", 0))
     total_ids = int(w.get("total_messages", 0))
+    batch_size = max(1, int(w.get("batch_size", 1) or 1))
+    current_batch = min(
+        (scanned + batch_size - 1) // batch_size,
+        (total_ids + batch_size - 1) // batch_size,
+    )
+    total_batches = (
+        (total_ids + batch_size - 1) // batch_size if total_ids else 0
+    )
     current_id = int(w.get("current_message_id", 0))
     saved = int(w.get("saved", 0))
     dup = int(w.get("duplicate_id", 0))
     checked = int(w.get("dups_checked", 0))
-    files_found = int(w.get("files_found", 0))
     files_completed = int(w.get("files_completed", 0))
     total_files = int(w.get("total_files", 0))
     estimated_total_files = int(
@@ -239,73 +246,87 @@ async def _render_live_progress(w: Dict[str, Any]) -> List[str]:
     movies = int(w.get("movies", 0))
     series = int(w.get("series", 0))
     processed = int(w.get("processed", 0))
-    eta_text = "paused" if w.get("paused") else w.get("eta_text", "—")
-
     started = w.get("started_at") or 0
-    elapsed_str = "—"
-    if started:
-        elapsed_str = FM.duration_short(time.time() - started)
-
-    pct = (
-        min(100.0, files_completed / estimated_total_files * 100)
-        if estimated_total_files else 0.0
-    )
-    progress_label = "indexing files"
-    progress_detail = (
-        f"{FM.num(files_completed)} / "
-        f"{FM.num(estimated_total_files)} "
-        f"{F.sc('files completed')}"
-    )
-
-    bar = P.bar(pct, progress_label, width=14, show_percent=False)
+    pct = min(100.0, processed / total_ids * 100) if total_ids else 0.0
+    filled_blocks = round(14 * pct / 100)
+    bar = "⬛" * filled_blocks + "⬛" * (14 - filled_blocks)
     last_error = str(w.get("last_error") or w.get("fetch_error") or "")
+    channel_name = html_escape(str(w.get("channel_title") or "?")[:100])
+    mode = html_escape(str(w.get("mode") or "?"))
+    direction = html_escape(str(w.get("direction") or "?"))
+    elapsed_seconds = max(0, int(time.time() - started)) if started else 0
+    elapsed_str = _duration_with_seconds(elapsed_seconds)
+    eta_seconds = max(0, int(w.get("eta_seconds", 0) or 0))
+    eta_text = (
+        "paused" if w.get("paused")
+        else _duration_with_seconds(eta_seconds)
+        if eta_seconds
+        else str(w.get("eta_text") or "—")
+    )
+    total_fetched = int(w.get("total_fetched", processed))
+    no_file_id = int(w.get("skipped_no_file_id", 0))
+    commit_errors = int(w.get("commit_errors", 0))
 
     return [
+        f"📦 {F.sc('batch')} · {current_batch} / {total_batches}",
+        "",
         F.DIV_S,
         f"{F.EMO['chart']} <b>{F.fb('LIVE PROGRESS')}</b>",
         F.DIV_S, "",
         f"<code>{bar}</code> {pct:.0f}%",
+        f"📊 {F.sc('progress')} · "
+        f"{FM.num(processed)} / {FM.num(total_ids)} {F.sc('files processed')}",
+        f"📁 {F.sc('total messages')} · {FM.num(total_ids)}",
+        f"📥 {F.sc('total fetched')} · {FM.num(total_fetched)}",
+        f"🔎 {F.sc('files discovered')} · {FM.num(total_files)}",
+        f"📍 {F.sc('current message id')} · <code>{current_id:,}</code>",
+        f"🗺️ {F.sc('channel scan')} · "
+        f"{FM.num(scanned)} / {FM.num(total_ids)} {F.sc('message IDs')}",
+        "",
+        f"📡 {F.sc('channel')} · <code>{channel_name}</code>",
+        f"🎬 {F.sc('mode')} · {mode}",
+        f"⬇️ {F.sc('direction')} · {direction}",
+        f"⏱️ {F.sc('elapsed')} · {elapsed_str}",
+        "",
+        f"📥 {F.sc('message IDs checked')} · {FM.num(scanned)}",
+        f"🔢 {F.sc('processed')} · {FM.num(processed)}",
+        "",
         f"📁 {F.sc('files completed')} · "
         f"<b>{FM.num(files_completed)} / "
         f"{FM.num(estimated_total_files)}"
-        f"{'~' if not w.get('scan_complete') else ''}</b>",
-        f"🔎 {F.sc('files discovered')} · <b>{FM.num(total_files)}</b>",
-        f"🔎 {F.sc('files processed')} · <b>{FM.num(files_found)}</b>",
-        f"📊 {F.sc('progress')} · {progress_detail}",
-        f"📍 {F.sc('current message id')} · <code>{current_id:,}</code>",
-        f"🗺️ {F.sc('channel scan')} · "
-        f"<b>{FM.num(scanned)}</b> / <b>{FM.num(total_ids)}</b> "
-        f"{F.sc('message IDs')}",
+        f"{'~' if not w.get('scan_complete') else ''}",
         "",
-        f"📡 {F.sc('channel')} · "
-        f"<code>{str(w.get('channel_title', '?'))[:30]}</code>",
-        f"🎬 {F.sc('mode')} · <b>{str(w.get('mode', '?'))}</b>",
-        f"⬇️ {F.sc('direction')} · <b>{str(w.get('direction', '?'))}</b>",
-        f"⏱️ {F.sc('elapsed')} · <b>{elapsed_str}</b>",
-        "",
-        f"📥 {F.sc('message IDs checked')} · <b>{FM.num(scanned)}</b>",
-        f"🔢 {F.sc('processed')} · <b>{FM.num(processed)}</b>",
-        "",
-        F.DIV_S,
         f"✅ {F.sc('saved')} · <b>{FM.num(saved)}</b>",
         f"♻️ {F.sc('duplicate')} · <b>{FM.num(dup)}</b>",
         f"🔍 {F.sc('checked')} · <b>{FM.num(checked)}</b>",
+        f"🗑️ {F.sc('deleted')} · <b>{FM.num(int(w.get('deleted', 0)))}</b>",
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
-        f"🪪 {F.sc('no file id')} · "
-        f"<b>{FM.num(int(w.get('skipped_no_file_id', 0)))}</b>",
+        f"🪪 {F.sc('no file id')} · <b>{FM.num(no_file_id)}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
+        f"⚠️ {F.sc('commit errors')} · <b>{FM.num(commit_errors)}</b>",
         "",
         f"🎬 {F.sc('movies')} · <b>{FM.num(movies)}</b>",
         f"📺 {F.sc('series')} · <b>{FM.num(series)}</b>",
         "",
-        f"⚡ {F.sc('scan rate')} · <b>{w.get('speed', 0):.1f} IDs/s</b>",
-        f"📚 {F.sc('index rate')} · "
-        f"<b>{w.get('processing_speed', 0):.1f} files/s</b>",
+        f"⚡ {F.sc('scan rate')} · {w.get('speed', 0):.1f} IDs/s",
+        f"📚 {F.sc('index rate')} · {w.get('processing_speed', 0):.1f} files/s",
         f"⏱️ {F.sc('eta')} · <b>{eta_text}</b>",
         *([f"⚠️ {F.sc('last error')} · "
            f"<code>{html_escape(last_error[:180])}</code>"] if last_error else []),
         "",
     ]
+
+
+def _duration_with_seconds(seconds: int) -> str:
+    """Format elapsed time and ETA without dropping sub-hour seconds."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 # ============================================================
@@ -318,6 +339,7 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
     checked = int(w.get("dups_checked", 0))
     skipped = int(w.get("skipped_no_media", 0))
     failed = int(w.get("failed", 0))
+    commit_errors = int(w.get("commit_errors", 0))
     movies = int(w.get("movies", 0))
     series = int(w.get("series", 0))
     processed = int(w.get("processed", 0))
@@ -371,6 +393,7 @@ async def _build_report_panel(w: Dict[str, Any]) -> Tuple[str, InlineKeyboardMar
         f"🔍 {F.sc('checked')} · <b>{FM.num(checked)}</b>",
         f"🚫 {F.sc('no media')} · <b>{FM.num(skipped)}</b>",
         f"❌ {F.sc('failed')} · <b>{FM.num(failed)}</b>",
+        f"⚠️ {F.sc('commit errors')} · <b>{FM.num(commit_errors)}</b>",
         "",
         f"📁 {F.sc('files found')} · "
         f"<b>{FM.num(int(w.get('files_found', total_files)))}</b>",

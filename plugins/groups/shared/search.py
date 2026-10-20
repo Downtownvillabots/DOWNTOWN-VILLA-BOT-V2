@@ -179,10 +179,8 @@ async def quick_search(
             cache_key = IC.build_key(norm, use_year, cache_kind)
             cached = IC.get(cache_key)
             if cached is not None:
-                return (
-                    list(cached.get("hits") or []),
-                    bool(cached.get("complete", True)),
-                )
+                if cached.get("complete", True):
+                    return list(cached.get("hits") or []), True
         except Exception as e:
             logger.debug(f"[GROUPS-SEARCH] cache: {e}")
 
@@ -226,7 +224,7 @@ async def quick_search(
         hits = [h for h in hits if h.get("file_id")]
 
         # ── Cache store ──
-        if cache_key and hits:
+        if cache_key and hits and complete:
             try:
                 from media_search import instant_cache as IC
                 IC.set(cache_key, {

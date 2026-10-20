@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -203,6 +204,14 @@ class DatabaseManager:
         if not entry.uri:
             entry.error = "no uri"
             return False
+        old_client = entry.client
+        entry.client = None
+        entry.db = None
+        entry.online = False
+        if old_client is not None:
+            old_client.close()
+
+        client: Optional[AsyncIOMotorClient] = None
         try:
             client = AsyncIOMotorClient(
                 entry.uri,
@@ -230,13 +239,40 @@ class DatabaseManager:
             )
             return True
         except Exception as e:
+            if client is not None:
+                client.close()
             entry.online = False
+            entry.client = None
+            entry.db = None
             entry.error = str(e)[:200]
             logger.warning(
                 f"[DB] {entry.pool.upper()} #{entry.index} "
                 f"connect failed: {e}"
             )
             return False
+
+    async def check_media_shards(self) -> None:
+        """Ping online media shards and reconnect shards that are offline."""
+        async def _check(entry: PoolEntry) -> None:
+            if not entry.is_ready():
+                await self._connect_one(entry)
+                return
+
+            try:
+                await asyncio.wait_for(entry.db.command("ping"), timeout=8)
+                entry.last_ping = time.time()
+                entry.error = ""
+            except Exception as e:
+                entry.online = False
+                entry.error = str(e)[:200]
+                logger.warning(
+                    f"[DB] MEDIA #{entry.index} health check failed: {e}"
+                )
+                await self._connect_one(entry)
+
+        await asyncio.gather(
+            *(_check(entry) for entry in self.pools.get("media", []))
+        )
 
     # ────────── ACCESSORS ──────────
 

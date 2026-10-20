@@ -177,20 +177,6 @@ async def _do_search(
         await PN.send_panel(client, uid, chat_id, query, hits, sid, cfg, meta)
         return
 
-    if not complete:
-        try:
-            await client.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"{F.EMO['warn']} <b>{F.fb('ONE OR MORE DBs OFFLINE')}</b>\n"
-                    f"{F.EMO['info']} {F.sc('try again in a moment')}"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        return
-
     # ── 2. Spell check → retry DB ──
     corrected: Optional[str] = None
     try:
@@ -222,10 +208,6 @@ async def _do_search(
             return
 
     # ── 3. Suggestions ──
-    if not cfg.get("suggestion_enabled", True):
-        await _send_request_flow(client, message, query, None, cfg)
-        return
-
     items: List[Dict[str, Any]] = []
     try:
         raw = await SUGG.suggestions(
@@ -241,6 +223,19 @@ async def _do_search(
         sid = _new_session(uid, query, [], extra={"suggestions": items})
         await PN.send_suggestions(client, chat_id, query, items, sid)
         return
+
+    if not complete:
+        try:
+            await client.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"{F.EMO['warn']} <b>{F.fb('ONE OR MORE DBs OFFLINE')}</b>\n"
+                    f"{F.EMO['info']} {F.sc('try again in a moment')}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception("[PM-SEARCH] failed to report incomplete search")
 
     # ── 4. No suggestions → request ──
     await _send_request_flow(client, message, query, None, cfg)

@@ -109,29 +109,38 @@ class SearchEngine:
             from media_search import instant_cache as IC
             cached = IC.get(cache_key)
             if cached:
-                result.hits = [
-                    FileHit.from_dict(h) for h in cached.get("hits") or []
-                ]
-                result.complete = bool(cached.get("complete", True))
-                result.cached = True
-                result.elapsed_ms = (time.time() - t0) * 1000
-                return result
+                if cached.get("complete", True):
+                    result.hits = [
+                        FileHit.from_dict(h) for h in cached.get("hits") or []
+                    ]
+                    result.complete = True
+                    result.cached = True
+                    result.elapsed_ms = (time.time() - t0) * 1000
+                    return result
         except Exception:
             pass
 
         # ── Shard list ──
-        shards = self._online_shards()
-        result.shard_count = len(shards)
+        all_shards = self._all_shards()
+        shards = [
+            entry for entry in all_shards
+            if entry.online and entry.db is not None
+        ]
+        result.shard_count = len(all_shards)
+        result.shard_failed = len(all_shards) - len(shards)
         if not shards:
-            result.complete = True
+            result.complete = False
             result.elapsed_ms = (time.time() - t0) * 1000
-            logger.warning("[ENGINE] no online shards")
+            logger.warning(
+                "[ENGINE] no online media shards (%d configured)",
+                len(all_shards),
+            )
             return result
 
         # ── Parallel query ──
         sem = self._get_sem()
 
-        async def _one(entry):
+        async def _one(entry) -> Optional[List[FileHit]]:
             async with sem:
                 try:
                     return await asyncio.wait_for(
@@ -142,11 +151,15 @@ class SearchEngine:
                     logger.warning(
                         f"[ENGINE] shard timeout: {entry.label}"
                     )
+                    entry.online = False
+                    entry.error = "search timed out"
                     return None
                 except Exception as e:
                     logger.exception(
                         f"[ENGINE] shard error {entry.label}: {e}"
                     )
+                    entry.online = False
+                    entry.error = str(e)[:200]
                     return None
 
         raw = await asyncio.gather(
@@ -182,7 +195,7 @@ class SearchEngine:
         result.elapsed_ms = (time.time() - t0) * 1000
 
         # ── Cache store ──
-        if deduped:
+        if deduped and result.complete:
             try:
                 from media_search import instant_cache as IC
                 IC.set(
@@ -211,12 +224,15 @@ class SearchEngine:
         norm: str,
         year: Optional[int],
         kind: str,
-    ) -> List[FileHit]:
+    ) -> Optional[List[FileHit]]:
         """Query one media shard — matches title, file_name, caption."""
         try:
             coll = entry.db["media_files"]
-        except Exception:
-            return []
+        except Exception as e:
+            logger.exception(f"[ENGINE] {entry.label} collection: {e}")
+            entry.online = False
+            entry.error = str(e)[:200]
+            return None
 
         query = self._build_query(norm, year, kind)
 
@@ -226,7 +242,9 @@ class SearchEngine:
             docs = await cursor.to_list(length=MAX_RESULTS)
         except Exception as e:
             logger.exception(f"[ENGINE] {entry.label} find: {e}")
-            return []
+            entry.online = False
+            entry.error = str(e)[:200]
+            return None
 
         for doc in docs:
             h = self._doc_to_hit(doc, entry)
@@ -388,16 +406,19 @@ class SearchEngine:
 
     # ── SHARD LIST ──
 
-    def _online_shards(self) -> List[Any]:
+    def _all_shards(self) -> List[Any]:
         try:
             from database import db_registry
-            return [
-                e for e in db_registry.media_entries()
-                if e.online and e.db is not None
-            ]
+            return db_registry.media_entries()
         except Exception as e:
             logger.warning(f"[ENGINE] shard list: {e}")
             return []
+
+    def _online_shards(self) -> List[Any]:
+        return [
+            entry for entry in self._all_shards()
+            if entry.online and entry.db is not None
+        ]
 
     # ── CACHE KEY ──
 
